@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use tempfile::NamedTempFile;
 
-use xgboost::parameters::BoosterParameters;
-use xgboost::{Booster, DMatrix};
+use xgb::parameters::BoosterParameters;
+use xgb::{Booster, DMatrix};
 
 // Thread-local storage to pass gradients/hessians to the strict function pointer callback
 thread_local! {
@@ -108,6 +108,8 @@ pub struct XGBoostDataset {
     n_rows: usize,
     n_cols: usize,
     features: Vec<f32>,
+    /// Full labels (may be longer than n_rows for multivariate targets)
+    full_labels: Vec<f64>,
 }
 
 impl std::fmt::Debug for XGBoostDataset {
@@ -126,14 +128,19 @@ impl BackendDataset for XGBoostDataset {
 
         // Convert to f32 for xgboost
         let features_f32: Vec<f32> = features.iter().map(|&x| x as f32).collect();
-        let labels_f32: Vec<f32> = labels.iter().map(|&x| x as f32).collect();
+
+        // For XGBoost with separate boosters per distribution parameter, we only use
+        // single-target labels. If labels has more elements than n_rows (multivariate case),
+        // only use the first n_rows labels. This prevents XGBoost from thinking it's a
+        // multi-output problem. The actual gradients are passed via update_custom.
+        let labels_f32: Vec<f32> = labels.iter().take(n_rows).map(|&x| x as f32).collect();
 
         // Create DMatrix from dense array (row-major)
         let mut dmatrix = DMatrix::from_dense(&features_f32, n_rows).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
         })?;
 
-        // Set labels
+        // Set labels (only n_rows labels to keep XGBoost in single-output mode)
         dmatrix
             .set_labels(&labels_f32)
             .map_err(|e| GradientLSSError::BackendError(format!("Failed to set labels: {}", e)))?;
@@ -143,14 +150,16 @@ impl BackendDataset for XGBoostDataset {
             n_rows,
             n_cols,
             features: features_f32,
+            full_labels: labels.to_vec(),
         })
     }
 
-    fn set_init_score(&mut self, init_score: &Array1<f64>) -> Result<()> {
-        let init_f32: Vec<f32> = init_score.iter().map(|&x| x as f32).collect();
-        self.dmatrix.set_base_margin(&init_f32).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to set base margin: {}", e))
-        })?;
+    fn set_init_score(&mut self, _init_score: &Array1<f64>) -> Result<()> {
+        // Note: We intentionally don't use base_margin here because:
+        // 1. The XGBoost backend trains separate boosters for each distribution parameter
+        // 2. Each booster expects base_margin of shape (n_samples, 1), not (n_samples * n_params)
+        // 3. The training loop already handles start values by adding them to predictions
+        // 4. Using base_margin with the wrong shape causes errors in newer XGBoost versions
         Ok(())
     }
 
@@ -159,11 +168,9 @@ impl BackendDataset for XGBoostDataset {
     }
 
     fn get_labels(&self) -> Result<Array1<f64>> {
-        let labels = self
-            .dmatrix
-            .get_labels()
-            .map_err(|e| GradientLSSError::BackendError(format!("Failed to get labels: {}", e)))?;
-        Ok(Array1::from_iter(labels.iter().map(|&x| x as f64)))
+        // Return the full labels (which may be longer than n_rows for multivariate targets)
+        // rather than the truncated labels stored in the DMatrix
+        Ok(Array1::from(self.full_labels.clone()))
     }
 }
 
@@ -315,8 +322,9 @@ impl BackendModel for XGBoostModel {
                     GradientLSSError::BackendError(format!("Prediction failed: {}", e))
                 })?;
 
-                for (i, &pred) in preds.iter().enumerate() {
-                    predictions[[i, param_idx]] = pred as f64;
+                // Only use first n_samples predictions (XGBoost may return more based on labels)
+                for i in 0..n_samples {
+                    predictions[[i, param_idx]] = preds[i] as f64;
                 }
             }
 
@@ -349,7 +357,11 @@ impl BackendModel for XGBoostModel {
 
                 // Update the booster
                 booster
-                    .update_custom(&train_data.dmatrix, objective_trampoline)
+                    .update_custom(
+                        &train_data.dmatrix,
+                        round as i32, // <--- Add this argument
+                        objective_trampoline
+                    )
                     .map_err(|e| {
                         GradientLSSError::BackendError(format!(
                             "Update failed for param {}: {}",
@@ -377,8 +389,9 @@ impl BackendModel for XGBoostModel {
                         GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
                     })?;
 
-                    for (i, &pred) in preds.iter().enumerate() {
-                        valid_preds[[i, param_idx]] = pred as f64;
+                    // Only use first vr predictions
+                    for i in 0..*vr {
+                        valid_preds[[i, param_idx]] = preds[i] as f64;
                     }
                 }
 
@@ -475,8 +488,9 @@ impl BackendModel for XGBoostModel {
                 .predict(&dmatrix)
                 .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
 
-            for (i, &pred) in preds.iter().enumerate() {
-                result[[i, param_idx]] = pred as f64;
+            // Only use first n_samples predictions
+            for i in 0..n_samples {
+                result[[i, param_idx]] = preds[i] as f64;
             }
         }
 
