@@ -65,3 +65,18 @@ xgb = { git = "https://github.com/agene0001/rust-xgboost", branch = "master" }
 [dev-dependencies]
 approx = "0.5.1"
 tempfile = "3.24"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+[profile.production]
+inherits = "release"
+# For even faster builds during development
+[profile.dev]
+opt-level = 1
+
+# Fast debug builds with some optimization
+[profile.dev.package."*"]
+opt-level = 2
