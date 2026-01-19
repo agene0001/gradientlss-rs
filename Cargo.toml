@@ -1,6 +1,6 @@
 [package]
 name = "gradientlss"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 description = "Distributional Gradient Boosting for Location, Scale, and Shape"
 license = "MIT"
