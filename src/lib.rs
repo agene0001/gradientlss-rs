@@ -27,6 +27,7 @@
 //! ```
 
 pub mod backend;
+pub mod constants;
 pub mod dist_select;
 pub mod distributions;
 pub mod error;

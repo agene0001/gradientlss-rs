@@ -4,11 +4,11 @@ use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Gamma as RandGamma, Poisson as RandPoisson};
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Discrete, NegativeBinomial as StatrsNegativeBinomial};
+use statrs::function::gamma::ln_gamma;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZINB {
@@ -43,7 +43,7 @@ impl ZINB {
     pub fn default() -> Self {
         Self::new(
             Stabilization::None,
-            ResponseFn::Exp,
+            ResponseFn::Relu,
             ResponseFn::Sigmoid,
             ResponseFn::Sigmoid,
             LossFn::Nll,
@@ -51,25 +51,30 @@ impl ZINB {
         )
     }
 
-    /// Helper method for scalar log probability
+    /// NB ln_pmf inlined: ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
+    fn nb_ln_pmf(r: f64, p: f64, k: u64) -> f64 {
+        let kf = k as f64;
+        ln_gamma(r + kf) - ln_gamma(r) - ln_gamma(kf + 1.0) + r * p.ln() + kf * (-p).ln_1p()
+    }
+
+    /// Helper method for scalar log probability (inlined formula)
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
-        let total_count = params[0];
+        let r = params[0]; // total_count
         let probs = params[1];
         let gate = params[2];
 
-        if total_count <= 0.0 || probs <= 0.0 || probs >= 1.0 || gate < 0.0 || gate > 1.0 {
+        if r <= 0.0 || probs <= 0.0 || probs >= 1.0 || gate < 0.0 || gate > 1.0 {
             return f64::NEG_INFINITY;
         }
 
-        match StatrsNegativeBinomial::new(total_count, probs) {
-            Ok(nb_dist) => {
-                if target == 0.0 {
-                    (gate + (1.0 - gate) * nb_dist.pmf(0)).ln()
-                } else {
-                    (1.0 - gate).ln() + nb_dist.ln_pmf(target as u64)
-                }
-            }
-            Err(_) => f64::NEG_INFINITY,
+        // PyTorch probs → statrs p = 1 - probs
+        let p = 1.0 - probs;
+
+        if target == 0.0 {
+            // NB pmf(0) = p^r, so gate + (1-gate)*p^r
+            (gate + (1.0 - gate) * p.powf(r)).ln()
+        } else {
+            (1.0 - gate).ln() + Self::nb_ln_pmf(r, p, target as u64)
         }
     }
 }
@@ -115,10 +120,12 @@ impl Distribution for ZINB {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let col0 = params.column(0);
+                let col1 = params.column(1);
+                let col2 = params.column(2);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p = vec![params[[i, 0]], params[[i, 1]], params[[i, 2]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y_val);
                 }
                 total
             }
@@ -138,8 +145,10 @@ impl Distribution for ZINB {
 
             if total_count > 0.0 && probs > 0.0 && probs < 1.0 && gate >= 0.0 && gate <= 1.0 {
                 // NegativeBinomial as Gamma-Poisson mixture
-                let rate = (1.0 - probs) / probs;
-                if let Ok(gamma_dist) = RandGamma::new(total_count, rate) {
+                // rand_distr::Gamma takes (shape, scale), where scale = 1/rate
+                // For NB(total_count, probs): Gamma(shape=total_count, scale=probs/(1-probs))
+                let scale = probs / (1.0 - probs);
+                if let Ok(gamma_dist) = RandGamma::new(total_count, scale) {
                     for i in 0..n_samples {
                         if rng.random_bool(gate) {
                             result[[i, j]] = 0.0;
@@ -173,14 +182,17 @@ mod tests {
     #[test]
     fn test_zinb_log_prob() {
         let dist = ZINB::default();
-        let nb_dist = StatrsNegativeBinomial::new(5.0, 0.5).unwrap();
+        // r=5, probs=0.5 → statrs p=0.5, pmf(0) = 0.5^5 = 0.03125
 
         let log_p_zero = dist.log_prob_scalar(&[5.0, 0.5, 0.1], 0.0);
-        let expected_zero = (0.1 + (1.0 - 0.1) * nb_dist.pmf(0)).ln();
+        let expected_zero = (0.1 + 0.9 * 0.5_f64.powi(5)).ln();
         assert_relative_eq!(log_p_zero, expected_zero, epsilon = 1e-10);
 
         let log_p_non_zero = dist.log_prob_scalar(&[5.0, 0.5, 0.1], 3.0);
-        let expected_non_zero = (1.0 - 0.1f64).ln() + nb_dist.ln_pmf(3);
+        // ln(0.9) + nb_ln_pmf(5, 0.5, 3)
+        let expected_non_zero = 0.9_f64.ln() + ln_gamma(8.0) - ln_gamma(5.0) - ln_gamma(4.0)
+            + 5.0 * 0.5_f64.ln()
+            + 3.0 * (-0.5_f64).ln_1p();
         assert_relative_eq!(log_p_non_zero, expected_non_zero, epsilon = 1e-10);
     }
 }

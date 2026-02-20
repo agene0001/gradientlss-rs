@@ -7,6 +7,7 @@ use argmin::core::{CostFunction, Error as ArgminError, Executor, Gradient, State
 use argmin::solver::linesearch::MoreThuenteLineSearch;
 use argmin::solver::quasinewton::LBFGS;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Loss function types for distributional regression.
@@ -147,8 +148,8 @@ pub trait Distribution: Send + Sync {
     /// * `seed` - Random seed
     ///
     /// # Returns
-    /// Samples with shape (n_observations * n_targets, n_samples) for multivariate,
-    /// or (n_observations, n_samples) for univariate
+    /// Samples with shape (n_samples, n_observations * n_targets) for multivariate,
+    /// or (n_samples, n_observations) for univariate
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64>;
 
     /// Transform raw predictions to the parameter space.
@@ -162,8 +163,8 @@ pub trait Distribution: Send + Sync {
         let mut result = Array2::zeros(predictions.dim());
         for (i, param) in self.params().iter().enumerate() {
             let col = predictions.column(i);
-            let transformed = param.response_fn.apply(&col);
-            result.column_mut(i).assign(&transformed);
+            let mut out_col = result.column_mut(i);
+            param.response_fn.apply_into(&col, &mut out_col);
         }
         result
     }
@@ -229,14 +230,11 @@ pub trait Distribution: Send + Sync {
         // Apply stabilization
         self.stabilize_derivatives(&mut gradients, &mut hessians);
 
-        // Apply weights if provided
+        // Apply weights if provided — broadcast column vector across columns
         if let Some(w) = weights {
-            for i in 0..n_params {
-                for j in 0..n_samples {
-                    gradients[[j, i]] *= w[j];
-                    hessians[[j, i]] *= w[j];
-                }
-            }
+            let w_col = w.to_owned().insert_axis(ndarray::Axis(1));
+            gradients *= &w_col;
+            hessians *= &w_col;
         }
 
         Ok(GradientsAndHessians {
@@ -255,49 +253,186 @@ pub trait Distribution: Send + Sync {
         let n_samples = predictions.nrows();
         let n_params = self.n_params();
         let eps = 1e-7;
+        let use_crps = self.loss_fn() == LossFn::Crps;
 
         let mut gradients = Array2::zeros((n_samples, n_params));
         let mut hessians = Array2::zeros((n_samples, n_params));
 
-        for i in 0..n_samples {
-            let y = self.get_target_for_observation(target, i);
-            let base_params: Vec<f64> = transformed.row(i).to_vec();
+        // Precompute column means for nan_to_num replacement,
+        // matching Python's torch.nanmean(predt) behavior.
+        // Single-pass mean computation avoids intermediate Vec allocation.
+        let col_means: Vec<f64> = (0..n_params)
+            .map(|p| {
+                let col = predictions.column(p);
+                let (sum, count) = col.iter().fold((0.0, 0usize), |(s, c), &v| {
+                    if v.is_finite() {
+                        (s + v, c + 1)
+                    } else {
+                        (s, c)
+                    }
+                });
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            })
+            .collect();
+
+        let n_targets = self.n_targets();
+        let params_list = self.params();
+
+        // Precompute reciprocals to avoid repeated division in hot loop
+        let inv_2eps = 1.0 / (2.0 * eps);
+        let inv_eps_sq = 1.0 / (eps * eps);
+
+        // Parallel threshold: for small sample counts, rayon overhead exceeds benefit.
+        let use_parallel = n_samples >= 256;
+
+        // Per-sample computation closure. Each sample is independent.
+        // Returns (grad_row, hess_row) for sample i.
+        let compute_sample = |i: usize| -> (Vec<f64>, Vec<f64>) {
+            let mut grad_row = vec![0.0f64; n_params];
+            let mut hess_row = vec![0.0f64; n_params];
+
+            // Thread-local buffers (stack-allocated for small n_params)
+            let mut params_buf = vec![0.0f64; n_params];
+            let mut y_buf = vec![0.0f64; n_targets];
+
+            // Copy transformed params for this sample
+            let row = transformed.row(i);
+            for (j, v) in row.iter().enumerate() {
+                params_buf[j] = *v;
+            }
+
+            // Fill target buffer
+            match target {
+                ResponseData::Univariate(arr) => {
+                    y_buf[0] = arr[i];
+                }
+                ResponseData::Multivariate(arr) => {
+                    let target_row = arr.row(i);
+                    for (j, &v) in target_row.iter().enumerate() {
+                        y_buf[j] = v;
+                    }
+                }
+            }
+
+            let y_slice = &y_buf[..n_targets];
+
+            // For NLL path, compute base loss once per sample (shared across params)
+            let loss_center = if !use_crps {
+                -self.log_prob(&params_buf, y_slice)
+            } else {
+                0.0
+            };
 
             for p in 0..n_params {
                 let pred_val = predictions[[i, p]];
-                let response_fn = &self.params()[p].response_fn;
+                let response_fn = &params_list[p].response_fn;
+                let nan_replacement = col_means[p];
 
-                // Compute gradient using chain rule: dL/dpred = dL/dparam * dparam/dpred
-                let mut params_plus = base_params.clone();
-                let mut params_minus = base_params.clone();
-
-                // Perturb in prediction space
                 let pred_plus = pred_val + eps;
                 let pred_minus = pred_val - eps;
 
-                params_plus[p] = response_fn.apply_scalar(pred_plus);
-                params_minus[p] = response_fn.apply_scalar(pred_minus);
+                let param_plus =
+                    response_fn.apply_scalar_with_nan_replacement(pred_plus, nan_replacement);
+                let param_minus =
+                    response_fn.apply_scalar_with_nan_replacement(pred_minus, nan_replacement);
 
-                let loss_plus = -self.log_prob(&params_plus, &y);
-                let loss_minus = -self.log_prob(&params_minus, &y);
+                // Save original and perturb in-place (avoids full copy_from_slice)
+                let original = params_buf[p];
+                params_buf[p] = param_plus;
 
-                let grad = (loss_plus - loss_minus) / (2.0 * eps);
-                gradients[[i, p]] = grad;
+                if use_crps {
+                    let n_crps_samples: usize = 30;
+                    let seed: u64 = 123;
 
-                // Compute hessian (second derivative)
-                let loss_center = -self.log_prob(&base_params, &y);
-                let hess = (loss_plus - 2.0 * loss_center + loss_minus) / (eps * eps);
+                    let loss_plus =
+                        self.crps_single_observation(&params_buf, y_slice, n_crps_samples, seed);
+                    params_buf[p] = param_minus;
+                    let loss_minus =
+                        self.crps_single_observation(&params_buf, y_slice, n_crps_samples, seed);
 
-                // For CRPS, we use constant hessian of 1.0
-                hessians[[i, p]] = if self.loss_fn() == LossFn::Crps {
-                    1.0
+                    grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
+                    hess_row[p] = 1.0;
                 } else {
-                    hess.max(1e-6) // Ensure positive hessian
-                };
+                    let loss_plus = -self.log_prob(&params_buf, y_slice);
+                    params_buf[p] = param_minus;
+                    let loss_minus = -self.log_prob(&params_buf, y_slice);
+
+                    grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
+                    let hess = (loss_plus - 2.0 * loss_center + loss_minus) * inv_eps_sq;
+                    hess_row[p] = hess.max(1e-6); // Ensure positive hessian
+                }
+
+                // Restore original value
+                params_buf[p] = original;
+            }
+
+            (grad_row, hess_row)
+        };
+
+        // Compute gradients/hessians, using parallel iteration for large sample counts
+        let results: Vec<(Vec<f64>, Vec<f64>)> = if use_parallel {
+            (0..n_samples).into_par_iter().map(compute_sample).collect()
+        } else {
+            (0..n_samples).map(compute_sample).collect()
+        };
+
+        // Assemble results into output arrays
+        for (i, (grad_row, hess_row)) in results.into_iter().enumerate() {
+            for p in 0..n_params {
+                gradients[[i, p]] = grad_row[p];
+                hessians[[i, p]] = hess_row[p];
             }
         }
 
         Ok((gradients, hessians))
+    }
+
+    /// Compute CRPS for a single observation using sampling.
+    /// This matches Python's approach of sampling from the distribution
+    /// and computing empirical CRPS.
+    fn crps_single_observation(
+        &self,
+        params: &[f64],
+        target: &[f64],
+        n_samples: usize,
+        seed: u64,
+    ) -> f64 {
+        // Create a 1-row params array for the sample method
+        let params_arr = Array2::from_shape_vec((1, params.len()), params.to_vec()).unwrap();
+
+        let samples = self.sample(&params_arr.view(), n_samples, seed);
+
+        // Compute empirical CRPS for the single observation
+        let y = target[0];
+        let mut obs_samples: Vec<f64> = samples.column(0).to_vec();
+        obs_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut crps = 0.0;
+        let mut yhat_prev = 0.0;
+        let mut yhat_cdf = 0.0;
+        let mut y_cdf = 0.0;
+
+        for &yhat in &obs_samples {
+            let flag = y_cdf == 0.0 && y < yhat;
+
+            if flag {
+                crps += (y - yhat_prev) * yhat_cdf * yhat_cdf;
+                crps += (yhat - y) * (yhat_cdf - 1.0) * (yhat_cdf - 1.0);
+                y_cdf = 1.0;
+            } else {
+                crps += (yhat - yhat_prev) * (yhat_cdf - y_cdf) * (yhat_cdf - y_cdf);
+            }
+
+            yhat_cdf += 1.0 / n_samples as f64;
+            yhat_prev = yhat;
+        }
+
+        // Handle case where y > all samples
+        if y_cdf == 0.0 {
+            crps += y - obs_samples.last().unwrap_or(&0.0);
+        }
+
+        crps
     }
 
     /// Get target values for a specific observation.
@@ -337,7 +472,8 @@ pub trait Distribution: Send + Sync {
     /// Calculate unconditional start values for distributional parameters.
     ///
     /// Uses L-BFGS optimization to match Python's torch.optim.LBFGS behavior.
-    /// This provides much better convergence than simple gradient descent.
+    /// This uses the actual distribution's log_prob for optimization, matching
+    /// the Python implementation which calls self.distribution(*params).log_prob(target).
     ///
     /// # Arguments
     /// * `target` - Target values
@@ -363,18 +499,17 @@ pub trait Distribution: Send + Sync {
         // Collect response functions info for the problem
         let response_fns: Vec<ResponseFn> = self.params().iter().map(|p| p.response_fn).collect();
 
-        // Create the optimization problem
+        // Use the actual distribution's log_prob via clone_box
+        let dist = self.clone_box();
+
+        // Create the optimization problem using the actual distribution
         let problem = StartValueProblem {
             target_data,
             is_multivariate,
             n_targets,
             n_params,
             response_fns,
-            log_prob_fn: |params: &[f64], target: &[f64], is_mv: bool, n_tgt: usize| {
-                // We need to compute log_prob here, but we can't call self.log_prob
-                // So we'll use a simpler approach with numerical differentiation
-                compute_log_prob_generic(params, target, is_mv, n_tgt)
-            },
+            dist,
         };
 
         // Initial guess
@@ -384,12 +519,18 @@ pub trait Distribution: Send + Sync {
         let linesearch = MoreThuenteLineSearch::new();
         let solver = LBFGS::new(linesearch, 7); // 7 is a common default for L-BFGS memory
 
+        // Python uses max_iter outer epochs x min(max_iter/4, 20) inner L-BFGS iterations.
+        // For the default max_iter=50, that's 50 * 12 = 600 total L-BFGS iterations.
+        // We match this total budget.
+        let inner_iters = (max_iter / 4).min(20);
+        let total_iters = max_iter * inner_iters;
+
         // Run the optimizer
         let result = Executor::new(problem, solver)
             .configure(|state| {
                 state
                     .param(init_params)
-                    .max_iters(max_iter as u64)
+                    .max_iters(total_iters as u64)
                     .target_cost(0.0)
             })
             .run();
@@ -558,12 +699,15 @@ pub trait Distribution: Send + Sync {
 /// Replace NaN values in array with column means.
 fn replace_nans_with_mean(arr: &mut Array2<f64>) {
     for mut col in arr.columns_mut() {
-        let valid: Vec<f64> = col.iter().filter(|v| v.is_finite()).copied().collect();
-        let mean = if valid.is_empty() {
-            0.0
-        } else {
-            valid.iter().sum::<f64>() / valid.len() as f64
-        };
+        // Single-pass mean computation avoids intermediate Vec allocation
+        let (sum, count) = col.iter().fold((0.0, 0usize), |(s, c), &v| {
+            if v.is_finite() {
+                (s + v, c + 1)
+            } else {
+                (s, c)
+            }
+        });
+        let mean = if count == 0 { 0.0 } else { sum / count as f64 };
         for v in col.iter_mut() {
             if !v.is_finite() {
                 *v = mean;
@@ -576,14 +720,43 @@ fn replace_nans_with_mean(arr: &mut Array2<f64>) {
 fn stabilize_mad(arr: &mut Array2<f64>) {
     replace_nans_with_mean(arr);
 
-    for mut col in arr.columns_mut() {
-        let median = compute_median(&col.to_vec());
-        let deviations: Vec<f64> = col.iter().map(|&v| (v - median).abs()).collect();
-        let mad = compute_median(&deviations).max(1e-4);
+    // Reuse a single buffer for deviations across columns
+    let n_rows = arr.nrows();
+    let mut buf = vec![0.0f64; n_rows];
 
-        for v in col.iter_mut() {
-            *v /= mad;
+    for mut col in arr.columns_mut() {
+        // Copy column to buffer and sort in-place (no allocation)
+        for (j, &v) in col.iter().enumerate() {
+            buf[j] = v;
         }
+        let median = median_of_sorted_buf(&mut buf);
+
+        // Compute deviations in-place in the buffer, then sort for MAD
+        for (j, &v) in col.iter().enumerate() {
+            buf[j] = (v - median).abs();
+        }
+        let mad = median_of_sorted_buf(&mut buf).max(1e-4);
+
+        let inv_mad = 1.0 / mad;
+        for v in col.iter_mut() {
+            *v *= inv_mad;
+        }
+    }
+}
+
+/// Compute median by sorting the buffer in-place. Zero-allocation.
+/// Uses lower median for even-length, matching torch.nanmedian behavior.
+/// Assumes all values are finite (NaNs already replaced by replace_nans_with_mean).
+fn median_of_sorted_buf(buf: &mut [f64]) -> f64 {
+    if buf.is_empty() {
+        return 0.0;
+    }
+    buf.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = buf.len() / 2;
+    if buf.len() % 2 == 0 {
+        buf[mid - 1]
+    } else {
+        buf[mid]
     }
 }
 
@@ -595,30 +768,10 @@ fn stabilize_l2(arr: &mut Array2<f64>) {
         let sum_sq: f64 = col.iter().map(|v| v * v).sum();
         let l2 = (sum_sq / col.len() as f64).sqrt().clamp(1e-4, 10000.0);
 
+        let inv_l2 = 1.0 / l2;
         for v in col.iter_mut() {
-            *v /= l2;
+            *v *= inv_l2;
         }
-    }
-}
-
-/// Compute median of a slice.
-fn compute_median(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let mut sorted: Vec<f64> = values.iter().filter(|v| v.is_finite()).copied().collect();
-    if sorted.is_empty() {
-        return 0.0;
-    }
-
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
-    } else {
-        sorted[mid]
     }
 }
 
@@ -628,37 +781,36 @@ fn compute_median(values: &[f64]) -> f64 {
 
 /// Optimization problem for finding start values using L-BFGS.
 /// This matches the behavior of Python's torch.optim.LBFGS with strong_wolfe line search.
-struct StartValueProblem<F>
-where
-    F: Fn(&[f64], &[f64], bool, usize) -> f64,
-{
+/// Uses the actual distribution's log_prob method for computing the cost,
+/// matching Python's loss_fn_start_values which calls self.distribution(*params).log_prob(target).
+struct StartValueProblem {
     target_data: Vec<f64>,
     is_multivariate: bool,
     n_targets: usize,
     n_params: usize,
     response_fns: Vec<ResponseFn>,
-    log_prob_fn: F,
+    dist: Box<dyn Distribution>,
 }
 
-impl<F> CostFunction for StartValueProblem<F>
-where
-    F: Fn(&[f64], &[f64], bool, usize) -> f64,
-{
+impl CostFunction for StartValueProblem {
     type Param = Vec<f64>;
     type Output = f64;
 
     fn cost(&self, params: &Self::Param) -> std::result::Result<Self::Output, ArgminError> {
-        // Transform parameters to response scale
-        let transformed: Vec<f64> = params
+        // Replace NaN/Inf with 0.5 (matches Python's nan_inf handling in loss_fn_start_values)
+        let safe_params: Vec<f64> = params
             .iter()
-            .zip(self.response_fns.iter())
-            .map(|(&p, response_fn)| {
-                let val = if p.is_finite() { p } else { 0.5 };
-                response_fn.apply_scalar(val)
-            })
+            .map(|&p| if p.is_finite() { p } else { 0.5 })
             .collect();
 
-        // Compute total negative log-likelihood
+        // Transform parameters to response scale using the actual response functions
+        let transformed: Vec<f64> = safe_params
+            .iter()
+            .zip(self.response_fns.iter())
+            .map(|(&p, response_fn)| response_fn.apply_scalar(p))
+            .collect();
+
+        // Compute total negative log-likelihood using the actual distribution's log_prob
         let loss: f64 = if self.is_multivariate {
             let n_obs = self.target_data.len() / self.n_targets;
             (0..n_obs)
@@ -666,13 +818,13 @@ where
                     let start = i * self.n_targets;
                     let end = start + self.n_targets;
                     let target_slice = &self.target_data[start..end];
-                    -(self.log_prob_fn)(&transformed, target_slice, true, self.n_targets)
+                    -self.dist.log_prob(&transformed, target_slice)
                 })
                 .sum()
         } else {
             self.target_data
                 .iter()
-                .map(|&y| -(self.log_prob_fn)(&transformed, &[y], false, 1))
+                .map(|&y| -self.dist.log_prob(&transformed, &[y]))
                 .sum()
         };
 
@@ -684,10 +836,7 @@ where
     }
 }
 
-impl<F> Gradient for StartValueProblem<F>
-where
-    F: Fn(&[f64], &[f64], bool, usize) -> f64,
-{
+impl Gradient for StartValueProblem {
     type Param = Vec<f64>;
     type Gradient = Vec<f64>;
 
@@ -695,70 +844,23 @@ where
         let eps = 1e-5;
         let mut grad = vec![0.0; self.n_params];
 
-        let base_cost = self.cost(params)?;
-
         for i in 0..self.n_params {
+            // Central difference: (f(x+h) - f(x-h)) / (2h)
+            // Better approximation of PyTorch autograd than forward difference
             let mut params_plus = params.clone();
+            let mut params_minus = params.clone();
             params_plus[i] += eps;
+            params_minus[i] -= eps;
             let cost_plus = self.cost(&params_plus)?;
-            grad[i] = (cost_plus - base_cost) / eps;
+            let cost_minus = self.cost(&params_minus)?;
+            grad[i] = (cost_plus - cost_minus) / (2.0 * eps);
 
-            // Clip gradient to prevent instability
             if !grad[i].is_finite() {
                 grad[i] = 0.0;
-            } else {
-                grad[i] = grad[i].clamp(-100.0, 100.0);
             }
         }
 
         Ok(grad)
-    }
-}
-
-/// Generic log probability computation for common distributions.
-/// This is used during start value optimization when we don't have access to
-/// the specific distribution's log_prob method.
-fn compute_log_prob_generic(
-    params: &[f64],
-    target: &[f64],
-    is_multivariate: bool,
-    n_targets: usize,
-) -> f64 {
-    if is_multivariate {
-        // For multivariate, assume MVN-like structure
-        // params: [loc_1, ..., loc_n, scale_tril_elements...]
-        if params.len() < n_targets {
-            return f64::NEG_INFINITY;
-        }
-
-        // Simple approximation: treat as independent normals for start value estimation
-        let mut log_prob = 0.0;
-        for i in 0..n_targets {
-            let loc = params[i];
-            // Find the diagonal scale element (simplified assumption)
-            let scale_idx = n_targets + i; // Diagonal elements come first in our tril ordering
-            let scale = if scale_idx < params.len() {
-                params[scale_idx].max(1e-6)
-            } else {
-                1.0
-            };
-
-            let z = (target[i] - loc) / scale;
-            log_prob += -0.5 * (2.0 * std::f64::consts::PI).ln() - scale.ln() - 0.5 * z * z;
-        }
-        log_prob
-    } else {
-        // Univariate case - assume Gaussian-like for start value estimation
-        if params.len() < 2 {
-            return f64::NEG_INFINITY;
-        }
-
-        let loc = params[0];
-        let scale = params[1].max(1e-6);
-        let y = target[0];
-
-        let z = (y - loc) / scale;
-        -0.5 * (2.0 * std::f64::consts::PI).ln() - scale.ln() - 0.5 * z * z
     }
 }
 
@@ -773,10 +875,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_median() {
-        assert_eq!(compute_median(&[1.0, 2.0, 3.0]), 2.0);
-        assert_eq!(compute_median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
-        assert_eq!(compute_median(&[]), 0.0);
+    fn test_median_of_sorted_buf() {
+        assert_eq!(median_of_sorted_buf(&mut [1.0, 2.0, 3.0]), 2.0);
+        // Even-length: lower median (matches torch.nanmedian)
+        assert_eq!(median_of_sorted_buf(&mut [1.0, 2.0, 3.0, 4.0]), 2.0);
+        assert_eq!(median_of_sorted_buf(&mut []), 0.0);
     }
 
     #[test]

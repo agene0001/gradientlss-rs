@@ -7,8 +7,9 @@ use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Poisson as RandPoisson};
+
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Discrete, Poisson as StatrsPoisson};
+use statrs::function::gamma::ln_gamma;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Poisson {
@@ -35,19 +36,18 @@ impl Poisson {
     }
 
     pub fn default() -> Self {
-        Self::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false)
+        Self::new(Stabilization::None, ResponseFn::Relu, LossFn::Nll, false)
     }
 
-    /// Helper method for scalar log probability
+    /// Helper method for scalar log probability (inlined formula, no statrs constructor)
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
         let rate = params[0];
         if rate <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        match StatrsPoisson::new(rate) {
-            Ok(dist) => dist.ln_pmf(target as u64),
-            Err(_) => f64::NEG_INFINITY,
-        }
+        let k = target as u64;
+        // ln_pmf = -λ + k*ln(λ) - ln(k!) = -λ + k*ln(λ) - ln_gamma(k+1)
+        -rate + (k as f64) * rate.ln() - ln_gamma(k as f64 + 1.0)
     }
 }
 
@@ -87,15 +87,69 @@ impl Distribution for Poisson {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let rate_col = params.column(0);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p = vec![params[[i, 0]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[rate_col[i]], y_val);
                 }
                 total
             }
             ResponseData::Multivariate(_) => panic!("Poisson is a univariate distribution."),
         }
+    }
+
+    /// Analytical gradients for Poisson distribution.
+    ///
+    /// NLL = λ - k*ln(λ) + ln_gamma(k+1)
+    ///
+    /// Gradients w.r.t. distribution parameter:
+    /// - dNLL/dλ = 1 - k/λ
+    ///
+    /// Hessian w.r.t. distribution parameter:
+    /// - d²NLL/dλ² = k/λ²
+    ///
+    /// Chain rule applied for response function: dNLL/dpred = dNLL/dλ * dλ/dpred
+    fn analytical_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
+        if self.loss_fn != LossFn::Nll {
+            return None;
+        }
+
+        let y = match target {
+            ResponseData::Univariate(arr) => arr,
+            ResponseData::Multivariate(_) => return None,
+        };
+
+        let n_samples = predictions.nrows();
+        let mut gradients = Array2::zeros((n_samples, 1));
+        let mut hessians = Array2::zeros((n_samples, 1));
+
+        let rate_response_fn = &self.params[0].response_fn;
+
+        for i in 0..n_samples {
+            let lambda = transformed[[i, 0]].max(1e-6);
+            let k = y[i];
+
+            if !k.is_finite() || k < 0.0 {
+                hessians[[i, 0]] = 1e-6;
+                continue;
+            }
+
+            let grad_lambda = 1.0 - k / lambda;
+            let hess_lambda = k / (lambda * lambda);
+
+            let pred = predictions[[i, 0]];
+            let rd = rate_response_fn.derivative(pred);
+            let rsd = rate_response_fn.second_derivative(pred);
+            gradients[[i, 0]] = grad_lambda * rd;
+            hessians[[i, 0]] = (hess_lambda * rd * rd + grad_lambda * rsd).max(1e-6);
+        }
+
+        Some((gradients, hessians))
     }
 
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64> {
@@ -135,8 +189,32 @@ mod tests {
     fn test_poisson_log_prob() {
         let dist = Poisson::default();
         let log_p = dist.log_prob_scalar(&[5.0], 3.0);
-        let expected = StatrsPoisson::new(5.0).unwrap().ln_pmf(3);
+        // Poisson(λ=5) at k=3: -5 + 3*ln(5) - ln_gamma(4)
+        let expected = -5.0 + 3.0 * 5.0_f64.ln() - ln_gamma(4.0);
         assert_relative_eq!(log_p, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_poisson_analytical_vs_numerical_gradients() {
+        use crate::distributions::base::Distribution;
+
+        let dist = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
+        let predictions = array![[1.0], [0.5], [1.5]];
+        let targets = array![3.0, 1.0, 5.0];
+        let target = ResponseData::Univariate(&targets.view());
+
+        let transformed = dist.transform_params(&predictions.view());
+        let analytical = dist
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return analytical gradients");
+
+        let numerical = dist
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return numerical gradients");
+
+        for i in 0..3 {
+            assert_relative_eq!(analytical.0[[i, 0]], numerical.0[[i, 0]], epsilon = 1e-3);
+        }
     }
 
     #[test]
@@ -147,7 +225,7 @@ mod tests {
         let target_response = ResponseData::Univariate(&target.view());
 
         let nll = dist.nll(&params.view(), &target_response);
-        let expected_single = -StatrsPoisson::new(5.0).unwrap().ln_pmf(3);
+        let expected_single = -(-5.0 + 3.0 * 5.0_f64.ln() - ln_gamma(4.0));
         assert_relative_eq!(nll, 2.0 * expected_single, epsilon = 1e-10);
     }
 }

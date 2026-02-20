@@ -1,14 +1,15 @@
 //! Gaussian (Normal) distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Gaussian (Normal) distribution for distributional regression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +53,7 @@ impl Gaussian {
         }
 
         let z = (target - loc) / scale;
-        -0.5 * (2.0 * PI).ln() - scale.ln() - 0.5 * z * z
+        -0.5 * LOG_2PI - scale.ln() - 0.5 * z * z
     }
 }
 
@@ -93,14 +94,18 @@ impl Distribution for Gaussian {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let loc_col = params.column(0);
+                let scale_col = params.column(1);
                 let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
-                    let p = if params.nrows() == 1 {
-                        vec![params[[0, 0]], params[[0, 1]]]
-                    } else {
-                        vec![params[[i, 0]], params[[i, 1]]]
-                    };
-                    total -= self.log_prob_scalar(&p, y_val);
+                if params.nrows() == 1 {
+                    let p = [loc_col[0], scale_col[0]];
+                    for &y_val in y.iter() {
+                        total -= self.log_prob_scalar(&p, y_val);
+                    }
+                } else {
+                    for (i, &y_val) in y.iter().enumerate() {
+                        total -= self.log_prob_scalar(&[loc_col[i], scale_col[i]], y_val);
+                    }
                 }
                 total
             }
@@ -152,44 +157,63 @@ impl Distribution for Gaussian {
         };
 
         let n_samples = predictions.nrows();
-        let mut gradients = Array2::zeros((n_samples, 2));
-        let mut hessians = Array2::zeros((n_samples, 2));
 
         let scale_response_fn = &self.params[1].response_fn;
 
-        for i in 0..n_samples {
-            let loc = transformed[[i, 0]];
-            let scale = transformed[[i, 1]].max(1e-6);
-            let scale_sq = scale * scale;
-            let scale_cu = scale_sq * scale;
-            let yi = y[i];
-            let diff = yi - loc;
-            let diff_sq = diff * diff;
+        let t_loc = transformed.column(0);
+        let t_scale = transformed.column(1);
+        let p_scale = predictions.column(1);
 
-            // Gradient w.r.t. loc (identity response, so derivative is 1)
-            // ∂NLL/∂loc = -diff / σ² = (loc - y) / σ²
-            let grad_loc = -diff / scale_sq;
-            gradients[[i, 0]] = grad_loc;
+        let mut gradients = Array2::zeros((n_samples, 2));
+        let mut hessians = Array2::zeros((n_samples, 2));
 
-            // Hessian w.r.t. loc
-            // ∂²NLL/∂loc² = 1 / σ²
-            hessians[[i, 0]] = (1.0 / scale_sq).max(1e-6);
+        if n_samples >= 4096 {
+            let resp_deriv = scale_response_fn.derivative_batch(&p_scale);
+            let resp_second = scale_response_fn.second_derivative_batch(&p_scale);
 
-            // Gradient w.r.t. scale (need chain rule for response function)
-            // ∂NLL/∂σ = 1/σ - (y-μ)²/σ³
-            let grad_scale_param = 1.0 / scale - diff_sq / scale_cu;
+            let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
+                let loc = t_loc[i];
+                let scale = t_scale[i].max(1e-6);
+                let scale_sq = scale * scale;
+                let yi = y[i];
+                let diff = yi - loc;
+                let diff_sq = diff * diff;
+                let g0 = -diff / scale_sq;
+                let h0 = (1.0 / scale_sq).max(1e-6);
+                let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
+                let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
+                let rd = resp_deriv[i];
+                let rsd = resp_second[i];
+                let g1 = grad_scale_param * rd;
+                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                (g0, h0, g1, h1)
+            };
 
-            // Chain rule: ∂NLL/∂pred_scale = ∂NLL/∂σ * ∂σ/∂pred_scale
-            let pred_scale = predictions[[i, 1]];
-            let response_derivative = scale_response_fn.derivative(pred_scale);
-            gradients[[i, 1]] = grad_scale_param * response_derivative;
-
-            // Hessian w.r.t. scale (simplified - using diagonal approximation)
-            // ∂²NLL/∂σ² = -1/σ² + 3*(y-μ)²/σ⁴
-            let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
-            // Apply chain rule squared for Hessian (Gauss-Newton approximation)
-            let hess_scale = hess_scale_param * response_derivative * response_derivative;
-            hessians[[i, 1]] = hess_scale.max(1e-6);
+            let results: Vec<_> = (0..n_samples).into_par_iter().map(compute_sample).collect();
+            for (i, (g0, h0, g1, h1)) in results.into_iter().enumerate() {
+                gradients[[i, 0]] = g0;
+                hessians[[i, 0]] = h0;
+                gradients[[i, 1]] = g1;
+                hessians[[i, 1]] = h1;
+            }
+        } else {
+            for i in 0..n_samples {
+                let loc = t_loc[i];
+                let scale = t_scale[i].max(1e-6);
+                let scale_sq = scale * scale;
+                let yi = y[i];
+                let diff = yi - loc;
+                let diff_sq = diff * diff;
+                gradients[[i, 0]] = -diff / scale_sq;
+                hessians[[i, 0]] = (1.0 / scale_sq).max(1e-6);
+                let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
+                let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
+                let pred_scale = p_scale[i];
+                let rd = scale_response_fn.derivative(pred_scale);
+                let rsd = scale_response_fn.second_derivative(pred_scale);
+                gradients[[i, 1]] = grad_scale_param * rd;
+                hessians[[i, 1]] = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+            }
         }
 
         Some((gradients, hessians))
@@ -216,7 +240,7 @@ mod tests {
         let dist = Gaussian::default();
 
         let log_p = dist.log_prob_scalar(&[0.0, 1.0], 0.0);
-        assert_relative_eq!(log_p, -0.5 * (2.0 * PI).ln(), epsilon = 1e-10);
+        assert_relative_eq!(log_p, -0.5 * LOG_2PI, epsilon = 1e-10);
 
         let log_p_wide = dist.log_prob_scalar(&[0.0, 2.0], 0.0);
         let log_p_narrow = dist.log_prob_scalar(&[0.0, 0.5], 0.0);

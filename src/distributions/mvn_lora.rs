@@ -1,6 +1,7 @@
 //! Low-Rank Multivariate Normal distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -8,7 +9,6 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Low-Rank Multivariate Normal distribution for distributional regression.
 ///
@@ -112,10 +112,9 @@ impl MVNLoRa {
             cov_factor.push(params[i]);
         }
 
-        // Extract and transform covariance diagonal parameters
+        // Cov diagonal params are already transformed by transform_params before reaching here
         for i in end_factor..n_params {
-            let param = &self.params[i];
-            cov_diag.push(param.response_fn.apply_scalar(params[i]));
+            cov_diag.push(params[i]);
         }
 
         (loc, cov_factor, cov_diag)
@@ -170,7 +169,7 @@ impl MVNLoRa {
             .sum::<f64>();
 
         // Compute log probability
-        -0.5 * (n as f64) * (2.0 * PI).ln() - 0.5 * log_det - 0.5 * quadratic_form
+        -0.5 * (n as f64) * LOG_2PI - 0.5 * log_det - 0.5 * quadratic_form
     }
 
     /// Solve linear system A*x = b using Gaussian elimination with partial pivoting.
@@ -258,20 +257,69 @@ impl MVNLoRa {
         log_det_d + log_det_update
     }
 
-    /// Simple power iteration for eigenvalue approximation (for small matrices).
+    /// Compute eigenvalues of a small symmetric matrix using Jacobi iteration.
     fn eigenvalues(matrix: &Array2<f64>) -> Vec<f64> {
-        // For small matrices, we can use a simple approach
-        // In production, consider using a proper eigenvalue decomposition
         let n = matrix.nrows();
 
         if n == 1 {
             return vec![matrix[[0, 0]]];
         }
 
-        // Simple approximation: use diagonal elements for small matrices
+        // Jacobi eigenvalue algorithm for small symmetric matrices
+        let mut a = matrix.clone();
+        let max_iter = 100;
+
+        for _ in 0..max_iter {
+            // Find largest off-diagonal element
+            let mut max_val = 0.0_f64;
+            let mut p = 0;
+            let mut q = 1;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if a[[i, j]].abs() > max_val {
+                        max_val = a[[i, j]].abs();
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+
+            // Check convergence
+            if max_val < 1e-12 {
+                break;
+            }
+
+            // Compute rotation angle
+            let theta = if (a[[p, p]] - a[[q, q]]).abs() < 1e-15 {
+                std::f64::consts::FRAC_PI_4
+            } else {
+                0.5 * (2.0 * a[[p, q]] / (a[[p, p]] - a[[q, q]])).atan()
+            };
+
+            let c = theta.cos();
+            let s = theta.sin();
+
+            // Apply Jacobi rotation
+            let mut new_a = a.clone();
+            for i in 0..n {
+                if i != p && i != q {
+                    new_a[[i, p]] = c * a[[i, p]] + s * a[[i, q]];
+                    new_a[[p, i]] = new_a[[i, p]];
+                    new_a[[i, q]] = -s * a[[i, p]] + c * a[[i, q]];
+                    new_a[[q, i]] = new_a[[i, q]];
+                }
+            }
+            new_a[[p, p]] = c * c * a[[p, p]] + 2.0 * s * c * a[[p, q]] + s * s * a[[q, q]];
+            new_a[[q, q]] = s * s * a[[p, p]] - 2.0 * s * c * a[[p, q]] + c * c * a[[q, q]];
+            new_a[[p, q]] = 0.0;
+            new_a[[q, p]] = 0.0;
+
+            a = new_a;
+        }
+
         let mut eigenvalues = Vec::with_capacity(n);
         for i in 0..n {
-            eigenvalues.push(matrix[[i, i]]);
+            eigenvalues.push(a[[i, i]]);
         }
 
         eigenvalues
@@ -335,10 +383,18 @@ impl Distribution for MVNLoRa {
                 let n_samples = params.nrows();
 
                 for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
-                    let target_row: Vec<f64> = arr.row(i).to_vec();
+                    let row_params = params.row(i);
+                    let target_row = arr.row(i);
 
-                    let log_prob = self.log_prob(&row_params, &target_row);
+                    // Avoid allocation when rows are contiguous (standard layout)
+                    let log_prob = match (row_params.as_slice(), target_row.as_slice()) {
+                        (Some(rp), Some(tr)) => self.log_prob(rp, tr),
+                        _ => {
+                            let rp = row_params.to_vec();
+                            let tr = target_row.to_vec();
+                            self.log_prob(&rp, &tr)
+                        }
+                    };
                     total_nll -= log_prob;
                 }
 
@@ -354,6 +410,9 @@ impl Distribution for MVNLoRa {
         // For multivariate, we return samples with shape (n_samples, n_obs * n_targets)
         let mut result = Array2::zeros((n_samples, n_obs * n_targets));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        let standard_normal = Normal::new(0.0, 1.0).unwrap();
+        let mut z = vec![0.0f64; n_targets];
 
         for j in 0..n_obs {
             let row_params: Vec<f64> = params.row(j).to_vec();
@@ -372,44 +431,44 @@ impl Distribution for MVNLoRa {
             let mut cov_matrix = Array2::zeros((n_targets, n_targets));
 
             for i in 0..n_targets {
-                for j in 0..n_targets {
-                    cov_matrix[[i, j]] = factor_part[[i, j]];
-                    if i == j {
-                        cov_matrix[[i, j]] += cov_diag[i];
+                for jj in 0..n_targets {
+                    cov_matrix[[i, jj]] = factor_part[[i, jj]];
+                    if i == jj {
+                        cov_matrix[[i, jj]] += cov_diag[i];
                     }
                 }
             }
 
-            // Sample from multivariate normal using Cholesky decomposition
-            let mut samples = Vec::with_capacity(n_samples);
-            for _ in 0..n_samples {
-                let mut sample = Vec::with_capacity(n_targets);
-
-                // Sample from standard normal
-                let standard_normal = Normal::new(0.0, 1.0).unwrap();
-                let z: Vec<f64> = (0..n_targets)
-                    .map(|_| standard_normal.sample(&mut rng))
-                    .collect();
-
-                // Transform using Cholesky decomposition: L * z + μ
-                // For simplicity, we'll use the covariance matrix directly
-                // In production, consider proper Cholesky decomposition
-                for i in 0..n_targets {
-                    let mut sum = 0.0;
-                    for k in 0..n_targets {
-                        // Simple approach: use covariance matrix as transformation
-                        sum += cov_matrix[[i, k]] * z[k];
+            // Compute Cholesky decomposition of covariance matrix: Σ = LL^T
+            let mut chol = Array2::zeros((n_targets, n_targets));
+            for i in 0..n_targets {
+                for jj in 0..=i {
+                    let mut sum = cov_matrix[[i, jj]];
+                    for k in 0..jj {
+                        sum -= chol[[i, k]] * chol[[jj, k]];
                     }
-                    sample.push(loc[i] + sum);
+                    if i == jj {
+                        chol[[i, jj]] = if sum > 0.0 { sum.sqrt() } else { 1e-6 };
+                    } else {
+                        chol[[i, jj]] = sum / chol[[jj, jj]];
+                    }
                 }
-
-                samples.push(sample);
             }
 
-            // Store samples in the result array
+            // Sample from multivariate normal using Cholesky factor: L * z + μ
             for s in 0..n_samples {
+                // Sample z from standard normal (reuse buffer)
+                for zi in z.iter_mut() {
+                    *zi = standard_normal.sample(&mut rng);
+                }
+
+                // Transform using Cholesky factor: L * z + μ
                 for t in 0..n_targets {
-                    result[[s, j * n_targets + t]] = samples[s][t];
+                    let mut sum = 0.0;
+                    for k in 0..=t {
+                        sum += chol[[t, k]] * z[k];
+                    }
+                    result[[s, j * n_targets + t]] = loc[t] + sum;
                 }
             }
         }
@@ -455,8 +514,9 @@ mod tests {
         );
 
         // Simple case: rank=1, 2 targets
-        // loc = [0, 0], cov_factor = [1, 1], cov_diag = [1, 1]
-        let params = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; // All zeros -> exp(0) = 1 for cov_diag
+        // loc = [0, 0], cov_factor = [0, 0], cov_diag = [1, 1]
+        // Params are in already-transformed space (cov_diag already exp'd)
+        let params = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
         let target = vec![0.0, 0.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -473,9 +533,10 @@ mod tests {
             LossFn::Nll,
             false,
         );
+        // Params are in already-transformed space (cov_diag already exp'd)
         let params = array![
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
         ];
         let target = array![[0.0, 0.0], [1.0, 1.0]];
         let target_response = ResponseData::Multivariate(&target.view());
@@ -494,9 +555,10 @@ mod tests {
             LossFn::Nll,
             false,
         );
+        // Params are in already-transformed space (cov_diag already exp'd)
         let params = array![
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
         ];
         let samples = dist.sample(&params.view(), 1000, 123);
 

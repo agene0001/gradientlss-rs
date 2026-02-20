@@ -1,6 +1,7 @@
 //! Multivariate Student's T distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -8,7 +9,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
+use statrs::function::gamma::ln_gamma;
 
 /// Multivariate Student's T distribution for distributional regression.
 ///
@@ -90,10 +91,11 @@ impl MVT {
     }
 
     /// Get the lower triangular indices for a given dimension.
+    /// Matches PyTorch's torch.tril_indices: row-major order (row first, then column).
     fn get_tril_indices(n: usize) -> Vec<(usize, usize)> {
         let mut indices = Vec::new();
-        for col in 0..n {
-            for row in col..n {
+        for row in 0..n {
+            for col in 0..=row {
                 indices.push((row, col));
             }
         }
@@ -106,18 +108,17 @@ impl MVT {
         let mut loc = Vec::with_capacity(self.n_targets);
         let mut tril = Vec::with_capacity(n_params - self.n_targets - 1); // -1 for df
 
-        // Extract and transform degrees of freedom
-        let df = self.params[0].response_fn.apply_scalar(params[0]);
+        // Degrees of freedom already transformed by transform_params before reaching here
+        let df = params[0];
 
         // Extract location parameters
         for i in 1..=self.n_targets {
             loc.push(params[i]);
         }
 
-        // Extract and transform tril parameters
+        // Tril parameters are already transformed by transform_params before reaching here
         for i in self.n_targets + 1..n_params {
-            let param = &self.params[i];
-            tril.push(param.response_fn.apply_scalar(params[i]));
+            tril.push(params[i]);
         }
 
         (df, loc, tril)
@@ -161,13 +162,13 @@ impl MVT {
         let quadratic_form = z.iter().map(|&x| x * x).sum::<f64>();
 
         // Compute log probability for multivariate Student's T
-        let log_gamma_half_df = Self::log_gamma(df / 2.0);
-        let log_gamma_half_df_plus_n = Self::log_gamma((df + n as f64) / 2.0);
+        let log_gamma_half_df = ln_gamma(df / 2.0);
+        let log_gamma_half_df_plus_n = ln_gamma((df + n as f64) / 2.0);
 
         log_gamma_half_df_plus_n
             - log_gamma_half_df
             - 0.5 * log_det
-            - (n as f64 / 2.0) * (PI * df).ln()
+            - (n as f64 / 2.0) * (LOG_PI + df.ln())
             - ((df + n as f64) / 2.0) * (1.0 + quadratic_form / df).ln()
     }
 
@@ -187,40 +188,6 @@ impl MVT {
             }
         }
         x
-    }
-
-    /// Approximate log gamma function (Lanczos approximation).
-    fn log_gamma(x: f64) -> f64 {
-        if x <= 0.0 {
-            return f64::NEG_INFINITY;
-        }
-
-        // Lanczos approximation coefficients
-        let g = 7.0;
-        let p = [
-            0.99999999999980993,
-            676.5203681218851,
-            -1259.1392167224028,
-            771.32342877765313,
-            -176.61502916214059,
-            12.507343278686905,
-            -0.13857109526572012,
-            9.9843695780195716e-6,
-            1.5056327351493116e-7,
-        ];
-
-        if x < 0.5 {
-            return Self::log_gamma(x + 1.0) - x.ln();
-        }
-
-        let x_adj = x - 1.0;
-        let mut a = p[0];
-        for i in 1..p.len() {
-            a += p[i] / (x_adj + i as f64);
-        }
-
-        let t = x_adj + g + 0.5;
-        (x_adj + 0.5).ln() * (2.4041138063191886 * x).sqrt() - t + a.ln()
     }
 }
 
@@ -281,10 +248,18 @@ impl Distribution for MVT {
                 let n_samples = params.nrows();
 
                 for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
-                    let target_row: Vec<f64> = arr.row(i).to_vec();
+                    let row_params = params.row(i);
+                    let target_row = arr.row(i);
 
-                    let log_prob = self.log_prob(&row_params, &target_row);
+                    // Avoid allocation when rows are contiguous (standard layout)
+                    let log_prob = match (row_params.as_slice(), target_row.as_slice()) {
+                        (Some(rp), Some(tr)) => self.log_prob(rp, tr),
+                        _ => {
+                            let rp = row_params.to_vec();
+                            let tr = target_row.to_vec();
+                            self.log_prob(&rp, &tr)
+                        }
+                    };
                     total_nll -= log_prob;
                 }
 
@@ -301,6 +276,10 @@ impl Distribution for MVT {
         let mut result = Array2::zeros((n_samples, n_obs * n_targets));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
+        let standard_normal = Normal::new(0.0, 1.0).unwrap();
+        let tril_indices = Self::get_tril_indices(n_targets);
+        let mut z = vec![0.0f64; n_targets];
+
         for j in 0..n_obs {
             let row_params: Vec<f64> = params.row(j).to_vec();
             let (df, loc, tril) = self.transform_dist_params(&row_params);
@@ -309,51 +288,33 @@ impl Distribution for MVT {
             let df = df.max(2.1); // Ensure df > 2 for valid covariance
 
             // Reconstruct the lower triangular matrix
-            let tril_indices = Self::get_tril_indices(n_targets);
             let mut cov = Array2::zeros((n_targets, n_targets));
             for (i, (row, col)) in tril_indices.iter().enumerate() {
                 cov[[*row, *col]] = tril[i];
             }
 
-            // Compute covariance matrix: Σ = LL^T
-
             // Sample from multivariate Student's T using the relationship:
             // MVT(μ, Σ, df) = μ + L * Z / sqrt(W/df)
             // where Z ~ N(0, I), W ~ χ²(df)
-            let mut samples = Vec::with_capacity(n_samples);
-            for _ in 0..n_samples {
-                let mut sample = Vec::with_capacity(n_targets);
+            let gamma_dist = rand_distr::Gamma::new(df / 2.0, 2.0).unwrap();
 
-                // Sample from standard normal
-                let standard_normal = Normal::new(0.0, 1.0).unwrap();
-                let z: Vec<f64> = (0..n_targets)
-                    .map(|_| standard_normal.sample(&mut rng))
-                    .collect();
+            for s in 0..n_samples {
+                // Sample z from standard normal (reuse buffer)
+                for zi in z.iter_mut() {
+                    *zi = standard_normal.sample(&mut rng);
+                }
 
                 // Sample from chi-squared distribution (W ~ χ²(df))
-                // We can use Gamma(df/2, 2) since χ²(df) = Gamma(df/2, 2)
-                let gamma_dist = rand_distr::Gamma::new(df / 2.0, 2.0).unwrap();
                 let w = gamma_dist.sample(&mut rng);
-
-                // Compute scaling factor
                 let scale_factor = (w / df).sqrt();
 
                 // Transform using: μ + L * z / scale_factor
-                for i in 0..n_targets {
+                for t in 0..n_targets {
                     let mut sum = 0.0;
                     for k in 0..n_targets {
-                        sum += cov[[i, k]] * z[k];
+                        sum += cov[[t, k]] * z[k];
                     }
-                    sample.push(loc[i] + sum / scale_factor);
-                }
-
-                samples.push(sample);
-            }
-
-            // Store samples in the result array
-            for s in 0..n_samples {
-                for t in 0..n_targets {
-                    result[[s, j * n_targets + t]] = samples[s][t];
+                    result[[s, j * n_targets + t]] = loc[t] + sum / scale_factor;
                 }
             }
         }

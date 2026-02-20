@@ -4,11 +4,11 @@ use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Gamma as RandGamma};
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Continuous, Gamma as StatrsGamma};
+use statrs::function::gamma::ln_gamma;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZAGamma {
@@ -51,7 +51,10 @@ impl ZAGamma {
         )
     }
 
-    /// Helper method for scalar log probability
+    /// Helper method for scalar log probability.
+    /// Matches Python's ZeroInflatedDistribution.log_prob which uses the mixture formula
+    /// for both zero and non-zero values. For zero values, continuous distributions
+    /// clamp the value to epsilon before evaluating the base distribution.
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
         let concentration = params[0];
         let rate = params[1];
@@ -61,13 +64,23 @@ impl ZAGamma {
             return f64::NEG_INFINITY;
         }
 
-        if target == 0.0 {
-            gate.ln()
+        let is_zero = target == 0.0;
+
+        // Clamp value away from 0 for continuous distributions (matches Python's epsilon clamp)
+        let clamped_target = if target <= 0.0 { f64::EPSILON } else { target };
+
+        // Gamma ln_pdf inlined
+        let base_log_prob = concentration * rate.ln() + (concentration - 1.0) * clamped_target.ln()
+            - rate * clamped_target
+            - ln_gamma(concentration);
+        let log_one_minus_gate = (1.0 - gate).ln();
+        let log_prob = log_one_minus_gate + base_log_prob;
+
+        if is_zero {
+            // log(gate + (1-gate) * base_pdf(epsilon))
+            (gate + log_prob.exp()).ln()
         } else {
-            match StatrsGamma::new(concentration, rate) {
-                Ok(gamma_dist) => (1.0 - gate).ln() + gamma_dist.ln_pdf(target),
-                Err(_) => f64::NEG_INFINITY,
-            }
+            log_prob
         }
     }
 }
@@ -109,13 +122,15 @@ impl Distribution for ZAGamma {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let col0 = params.column(0);
+                let col1 = params.column(1);
+                let col2 = params.column(2);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
                     if y_val < 0.0 {
                         return f64::INFINITY;
                     }
-                    let p = vec![params[[i, 0]], params[[i, 1]], params[[i, 2]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y_val);
                 }
                 total
             }
@@ -165,13 +180,18 @@ mod tests {
     #[test]
     fn test_zagamma_log_prob() {
         let dist = ZAGamma::default();
+        // Gamma(shape=2, rate=1) ln_pdf helper
+        let gamma_ln_pdf =
+            |x: f64| -> f64 { 2.0 * 1.0_f64.ln() + 1.0 * x.ln() - 1.0 * x - ln_gamma(2.0) };
 
+        // Zero case: log(gate + (1-gate) * base_pdf(epsilon))
         let log_p_zero = dist.log_prob_scalar(&[2.0, 1.0, 0.1], 0.0);
-        assert_relative_eq!(log_p_zero, 0.1f64.ln(), epsilon = 1e-10);
+        let base_pdf_eps = gamma_ln_pdf(f64::EPSILON).exp();
+        let expected_zero = (0.1 + 0.9 * base_pdf_eps).ln();
+        assert_relative_eq!(log_p_zero, expected_zero, epsilon = 1e-10);
 
         let log_p_non_zero = dist.log_prob_scalar(&[2.0, 1.0, 0.1], 1.5);
-        let gamma_dist = StatrsGamma::new(2.0, 1.0).unwrap();
-        let expected_non_zero = (1.0 - 0.1f64).ln() + gamma_dist.ln_pdf(1.5);
+        let expected_non_zero = 0.9_f64.ln() + gamma_ln_pdf(1.5);
         assert_relative_eq!(log_p_non_zero, expected_non_zero, epsilon = 1e-10);
     }
 }

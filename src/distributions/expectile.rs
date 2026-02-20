@@ -76,8 +76,11 @@ impl Expectile {
         )
     }
 
-    /// Compute the expectile loss function.
-    fn expectile_loss(&self, params: &[f64], target: f64) -> f64 {
+    /// Compute the expectile loss function for a single observation.
+    /// The crossing penalty is NOT applied here; it is computed at the batch level
+    /// in the `nll` method, matching Python's batch-mean penalty:
+    ///   penalty = torch.mean((~torch.all(torch.diff(predt, dim=1) > 0, dim=1)).float())
+    fn expectile_loss(&self, params: &[f64], target: f64, penalty: f64) -> f64 {
         let mut total_loss = 0.0;
 
         for (i, &tau) in self.expectiles.iter().enumerate() {
@@ -91,25 +94,26 @@ impl Expectile {
             total_loss += loss;
         }
 
-        // Add crossing penalty if enabled
-        let mut penalty = 0.0;
-        if self.penalize_crossing && self.expectiles.len() > 1 {
-            for i in 1..self.expectiles.len() {
-                if params[i] < params[i - 1] {
-                    penalty = 1.0;
-                    break;
-                }
-            }
-        }
-
         total_loss = total_loss * (1.0 + penalty) / self.expectiles.len() as f64;
 
         total_loss
     }
 
+    /// Compute per-observation crossing indicator.
+    /// Returns 1.0 if any consecutive pair of expectiles crosses (non-increasing), 0.0 otherwise.
+    fn has_crossing(&self, params: &[f64]) -> f64 {
+        if self.expectiles.len() <= 1 {
+            return 0.0;
+        }
+        let crossed = (1..self.expectiles.len()).any(|i| params[i] <= params[i - 1]);
+        if crossed { 1.0 } else { 0.0 }
+    }
+
     /// Compute the log probability (negative expectile loss).
-    fn log_prob_expectile(&self, params: &[f64], target: f64) -> f64 {
-        -self.expectile_loss(params, target)
+    /// Note: When called per-observation (e.g. from log_prob), penalty is 0.0.
+    /// The actual batch penalty is computed in `nll`.
+    fn log_prob_expectile(&self, params: &[f64], target: f64, penalty: f64) -> f64 {
+        -self.expectile_loss(params, target, penalty)
     }
 
     /// Transform parameters to the distribution parameter space.
@@ -158,21 +162,36 @@ impl Distribution for Expectile {
         }
 
         let transformed = self.transform_dist_params(params);
-        self.log_prob_expectile(&transformed, target[0])
+        // Per-observation log_prob does not include crossing penalty (penalty=0.0).
+        // Crossing penalty is computed at the batch level in nll().
+        self.log_prob_expectile(&transformed, target[0], 0.0)
     }
 
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(arr) => {
-                let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
+                // Compute batch-level crossing penalty matching Python:
+                //   penalty = torch.mean((~torch.all(torch.diff(predt, dim=1) > 0, dim=1)).float())
+                let penalty = if self.penalize_crossing && self.expectiles.len() > 1 {
+                    let crossing_count: f64 = (0..n_samples)
+                        .map(|i| {
+                            let row_params: Vec<f64> = params.row(i).to_vec();
+                            self.has_crossing(&row_params)
+                        })
+                        .sum();
+                    crossing_count / n_samples as f64
+                } else {
+                    0.0
+                };
+
+                let mut total_nll = 0.0;
                 for i in 0..n_samples {
                     let row_params: Vec<f64> = params.row(i).to_vec();
                     let target_val = arr[i];
-
-                    let log_prob = self.log_prob(&row_params, &[target_val]);
-                    total_nll -= log_prob;
+                    let transformed = self.transform_dist_params(&row_params);
+                    total_nll += self.expectile_loss(&transformed, target_val, penalty);
                 }
 
                 total_nll
@@ -185,7 +204,7 @@ impl Distribution for Expectile {
 
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64> {
         let n_obs = params.nrows();
-        let mut result = Array2::zeros((n_obs, n_samples));
+        let mut result = Array2::zeros((n_samples, n_obs));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         // Find the index of the expectile closest to 0.5
@@ -202,7 +221,7 @@ impl Distribution for Expectile {
             let normal_dist = Normal::new(expectile_value, 1.0).unwrap(); // Assume variance of 1.0
 
             for i in 0..n_samples {
-                result[[j, i]] = normal_dist.sample(&mut rng);
+                result[[i, j]] = normal_dist.sample(&mut rng);
             }
         }
         result
@@ -309,15 +328,15 @@ mod tests {
         let params = array![[1.0, 1.5, 2.0], [1.1, 1.6, 2.1]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
-        // Should have shape (n_obs, n_samples) = (2, 1000)
-        assert_eq!(samples.dim(), (2, 1000));
+        // Should have shape (n_samples, n_obs) = (1000, 2)
+        assert_eq!(samples.dim(), (1000, 2));
 
         // Check that samples for first observation are centered around the median expectile value
-        let mean_0: f64 = samples.row(0).iter().sum::<f64>() / 1000.0;
+        let mean_0: f64 = samples.column(0).iter().sum::<f64>() / 1000.0;
         assert_relative_eq!(mean_0, 1.5, epsilon = 0.1);
 
         // Check that samples for second observation are centered around the median expectile value
-        let mean_1: f64 = samples.row(1).iter().sum::<f64>() / 1000.0;
+        let mean_1: f64 = samples.column(1).iter().sum::<f64>() / 1000.0;
         assert_relative_eq!(mean_1, 1.6, epsilon = 0.1);
     }
 }

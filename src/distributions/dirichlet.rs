@@ -60,11 +60,8 @@ impl Dirichlet {
 
     /// Transform parameters to the distribution parameter space.
     fn transform_dist_params(&self, params: &[f64]) -> Vec<f64> {
-        params
-            .iter()
-            .zip(self.params.iter())
-            .map(|(&p, param)| param.response_fn.apply_scalar(p))
-            .collect()
+        // Params are already transformed by transform_params before reaching here
+        params.to_vec()
     }
 
     /// Compute the log probability for Dirichlet distribution.
@@ -188,8 +185,8 @@ impl Distribution for Dirichlet {
         let n_obs = params.nrows();
         let n_targets = self.n_targets;
 
-        // For Dirichlet, we return samples with shape (n_obs * n_targets, n_samples)
-        let mut result = Array2::zeros((n_obs * n_targets, n_samples));
+        // Shape (n_samples, n_obs * n_targets), consistent with MVN/MVT/MVNLoRa
+        let mut result = Array2::zeros((n_samples, n_obs * n_targets));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         for j in 0..n_obs {
@@ -219,7 +216,7 @@ impl Distribution for Dirichlet {
                 }
                 // Normalize to get Dirichlet sample
                 for t in 0..n_targets {
-                    result[[j * n_targets + t, s]] = gamma_samples[t] / sum;
+                    result[[s, j * n_targets + t]] = gamma_samples[t] / sum;
                 }
             }
         }
@@ -260,7 +257,8 @@ mod tests {
         let dist = Dirichlet::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
         // Test with target that doesn't sum to 1
-        let params = vec![0.0, 0.0]; // concentration = [1, 1]
+        // Params are in already-transformed space (concentrations already exp'd)
+        let params = vec![1.0, 1.0]; // concentration = [1, 1]
         let target = vec![0.6, 0.3]; // Sums to 0.9, not 1.0
 
         let log_p = dist.log_prob(&params, &target);
@@ -270,7 +268,8 @@ mod tests {
     #[test]
     fn test_dirichlet_nll() {
         let dist = Dirichlet::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
-        let params = array![[0.0, 0.0], [1.0, 0.0]];
+        // Params are in already-transformed space (concentrations already exp'd)
+        let params = array![[1.0, 1.0], [2.718281828, 1.0]];
         let target = array![[0.5, 0.5], [0.7, 0.3]];
         let target_response = ResponseData::Multivariate(&target.view());
 
@@ -281,27 +280,30 @@ mod tests {
     #[test]
     fn test_dirichlet_sample() {
         let dist = Dirichlet::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
-        let params = array![[0.0, 0.0], [1.0, 0.0]];
+        // Params are in already-transformed space (concentrations already exp'd)
+        let params = array![[1.0, 1.0], [2.718281828, 1.0]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
-        // Should have shape (n_obs * n_targets, n_samples) = (2*2, 1000) = (4, 1000)
-        assert_eq!(samples.dim(), (4, 1000));
+        // Should have shape (n_samples, n_obs * n_targets) = (1000, 2*2) = (1000, 4)
+        assert_eq!(samples.dim(), (1000, 4));
 
         // Check that samples for the first observation sum to approximately 1
+        // columns 0 and 1 are target dims for obs 0
         let sum_0: f64 = samples
-            .row(0)
+            .column(0)
             .iter()
-            .zip(samples.row(1).iter())
+            .zip(samples.column(1).iter())
             .map(|(&a, &b)| a + b)
             .sum::<f64>()
             / 1000.0;
         assert_relative_eq!(sum_0, 1.0, epsilon = 0.05);
 
         // Check that samples for the second observation sum to approximately 1
+        // columns 2 and 3 are target dims for obs 1
         let sum_1: f64 = samples
-            .row(2)
+            .column(2)
             .iter()
-            .zip(samples.row(3).iter())
+            .zip(samples.column(3).iter())
             .map(|(&a, &b)| a + b)
             .sum::<f64>()
             / 1000.0;

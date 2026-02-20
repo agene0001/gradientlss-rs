@@ -1,6 +1,7 @@
 //! Multivariate Normal distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -8,7 +9,6 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Multivariate Normal distribution for distributional regression.
 ///
@@ -78,10 +78,11 @@ impl MVN {
     }
 
     /// Get the lower triangular indices for a given dimension.
+    /// Matches PyTorch's torch.tril_indices: row-major order (row first, then column).
     fn get_tril_indices(n: usize) -> Vec<(usize, usize)> {
         let mut indices = Vec::new();
-        for col in 0..n {
-            for row in col..n {
+        for row in 0..n {
+            for col in 0..=row {
                 indices.push((row, col));
             }
         }
@@ -99,10 +100,9 @@ impl MVN {
             loc.push(params[i]);
         }
 
-        // Extract and transform tril parameters
+        // Tril parameters are already transformed by transform_params before reaching here
         for i in self.n_targets..n_params {
-            let param = &self.params[i];
-            tril.push(param.response_fn.apply_scalar(params[i]));
+            tril.push(params[i]);
         }
 
         (loc, tril)
@@ -160,7 +160,7 @@ impl MVN {
         let quadratic_form = z.iter().map(|&x| x * x).sum::<f64>();
 
         // Compute log probability
-        -0.5 * (n as f64) * (2.0 * PI).ln() - 0.5 * log_det - 0.5 * quadratic_form
+        -0.5 * (n as f64) * LOG_2PI - 0.5 * log_det - 0.5 * quadratic_form
     }
 }
 
@@ -220,12 +220,35 @@ impl Distribution for MVN {
                 let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
-                for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
-                    let target_row: Vec<f64> = arr.row(i).to_vec();
+                // Pre-allocate fallback buffers for non-contiguous rows
+                let n_params = self.n_params();
+                let n_targets = self.n_targets;
+                let mut params_buf = vec![0.0f64; n_params];
+                let mut target_buf = vec![0.0f64; n_targets];
 
-                    let log_prob = self.log_prob(&row_params, &target_row);
-                    total_nll -= log_prob;
+                for i in 0..n_samples {
+                    let row_params = params.row(i);
+                    let target_row = arr.row(i);
+
+                    let rp: &[f64] = match row_params.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in row_params.iter().enumerate() {
+                                params_buf[k] = v;
+                            }
+                            &params_buf[..n_params]
+                        }
+                    };
+                    let tr: &[f64] = match target_row.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in target_row.iter().enumerate() {
+                                target_buf[k] = v;
+                            }
+                            &target_buf[..n_targets]
+                        }
+                    };
+                    total_nll -= self.log_prob(rp, tr);
                 }
 
                 total_nll
@@ -241,46 +264,34 @@ impl Distribution for MVN {
         let mut result = Array2::zeros((n_samples, n_obs * n_targets));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
+        let standard_normal = Normal::new(0.0, 1.0).unwrap();
+        let tril_indices = Self::get_tril_indices(n_targets);
+        let mut z = vec![0.0f64; n_targets];
+
         for j in 0..n_obs {
             let row_params: Vec<f64> = params.row(j).to_vec();
             let (loc, tril) = self.transform_dist_params(&row_params);
 
             // Reconstruct the lower triangular matrix
-            let tril_indices = Self::get_tril_indices(n_targets);
             let mut cov = Array2::zeros((n_targets, n_targets));
             for (i, (row, col)) in tril_indices.iter().enumerate() {
                 cov[[*row, *col]] = tril[i];
             }
 
-            // Compute covariance matrix: Σ = LL^T
-
-            // Sample from multivariate normal
-            let mut samples = Vec::with_capacity(n_samples);
-            for _ in 0..n_samples {
-                let mut sample = Vec::with_capacity(n_targets);
-
-                // Sample from standard normal
-                let standard_normal = Normal::new(0.0, 1.0).unwrap();
-                let z: Vec<f64> = (0..n_targets)
-                    .map(|_| standard_normal.sample(&mut rng))
-                    .collect();
-
-                // Transform using Cholesky decomposition: L * z + μ
-                for i in 0..n_targets {
-                    let mut sum = 0.0;
-                    for k in 0..n_targets {
-                        sum += cov[[i, k]] * z[k];
-                    }
-                    sample.push(loc[i] + sum);
+            // Sample from multivariate normal and write directly to result
+            for s in 0..n_samples {
+                // Sample z from standard normal (reuse buffer)
+                for zi in z.iter_mut() {
+                    *zi = standard_normal.sample(&mut rng);
                 }
 
-                samples.push(sample);
-            }
-
-            // Store samples in the result array
-            for s in 0..n_samples {
+                // Transform: result = L * z + μ
                 for t in 0..n_targets {
-                    result[[s, j * n_targets + t]] = samples[s][t];
+                    let mut sum = 0.0;
+                    for k in 0..n_targets {
+                        sum += cov[[t, k]] * z[k];
+                    }
+                    result[[s, j * n_targets + t]] = loc[t] + sum;
                 }
             }
         }
@@ -309,15 +320,14 @@ mod tests {
     fn test_mvn_log_prob() {
         let dist = MVN::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
-        // Simple case: identity covariance after transformation
-        // With ResponseFn::Exp, we need params that result in tril=[[1,0],[0,1]]
-        // So diagonal elements should be log(1) = 0.0
-        let params = vec![0.0, 0.0, 0.0, 0.0, 0.0]; // loc=[0,0], tril=[[exp(0),0],[0,exp(0)]] = [[1,0],[0,1]]
+        // Simple case: identity covariance
+        // Params are in already-transformed space (diagonal elements already exp'd)
+        let params = vec![0.0, 0.0, 1.0, 0.0, 1.0]; // loc=[0,0], tril=[[1,0],[0,1]]
         let target = vec![0.0, 0.0];
 
         let log_p = dist.log_prob(&params, &target);
         // For 2D standard normal at mean, should be similar to 2 * log_prob of 1D standard normal
-        let expected = -2.0 * (0.5 * (2.0 * PI).ln());
+        let expected = -2.0 * (0.5 * LOG_2PI);
         assert_relative_eq!(log_p, expected, epsilon = 0.1);
     }
 

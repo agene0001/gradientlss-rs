@@ -1,7 +1,7 @@
 //! XGBoost backend implementation.
 //!
-//! This backend trains separate boosters for each distribution parameter,
-//! which is the standard approach for distributional regression with XGBoost.
+//! This backend trains a single multi-output booster with num_target set to
+//! the number of distribution parameters, matching Python XGBoostLSS.
 
 use super::traits::{
     Backend, BackendDataset, BackendModel, BackendParams, CallbackAction, FeatureImportance,
@@ -129,10 +129,8 @@ impl BackendDataset for XGBoostDataset {
         // Convert to f32 for xgboost
         let features_f32: Vec<f32> = features.iter().map(|&x| x as f32).collect();
 
-        // For XGBoost with separate boosters per distribution parameter, we only use
-        // single-target labels. If labels has more elements than n_rows (multivariate case),
-        // only use the first n_rows labels. This prevents XGBoost from thinking it's a
-        // multi-output problem. The actual gradients are passed via update_custom.
+        // Use first n_rows labels for XGBoost DMatrix.
+        // For multivariate targets the full label array is stored separately.
         let labels_f32: Vec<f32> = labels.iter().take(n_rows).map(|&x| x as f32).collect();
 
         // Create DMatrix from dense array (row-major)
@@ -140,7 +138,6 @@ impl BackendDataset for XGBoostDataset {
             GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
         })?;
 
-        // Set labels (only n_rows labels to keep XGBoost in single-output mode)
         dmatrix
             .set_labels(&labels_f32)
             .map_err(|e| GradientLSSError::BackendError(format!("Failed to set labels: {}", e)))?;
@@ -154,12 +151,13 @@ impl BackendDataset for XGBoostDataset {
         })
     }
 
-    fn set_init_score(&mut self, _init_score: &Array1<f64>) -> Result<()> {
-        // Note: We intentionally don't use base_margin here because:
-        // 1. The XGBoost backend trains separate boosters for each distribution parameter
-        // 2. Each booster expects base_margin of shape (n_samples, 1), not (n_samples * n_params)
-        // 3. The training loop already handles start values by adding them to predictions
-        // 4. Using base_margin with the wrong shape causes errors in newer XGBoost versions
+    fn set_init_score(&mut self, init_score: &Array1<f64>) -> Result<()> {
+        // Set base_margin on the DMatrix, matching Python's set_base_margin.
+        // For multi-output, base_margin is flattened row-major: n_samples * n_params.
+        let margin_f32: Vec<f32> = init_score.iter().map(|&x| x as f32).collect();
+        self.dmatrix.set_base_margin(&margin_f32).map_err(|e| {
+            GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
+        })?;
         Ok(())
     }
 
@@ -168,8 +166,6 @@ impl BackendDataset for XGBoostDataset {
     }
 
     fn get_labels(&self) -> Result<Array1<f64>> {
-        // Return the full labels (which may be longer than n_rows for multivariate targets)
-        // rather than the truncated labels stored in the DMatrix
         Ok(Array1::from(self.full_labels.clone()))
     }
 }
@@ -196,10 +192,9 @@ impl XGBoostDataset {
     }
 }
 
-/// XGBoost model wrapper - contains one booster per distribution parameter.
+/// XGBoost model wrapper - single multi-output booster matching Python XGBoostLSS.
 pub struct XGBoostModel {
-    /// One booster for each distribution parameter
-    boosters: Vec<Booster>,
+    booster: Booster,
     n_params: usize,
 }
 
@@ -207,9 +202,20 @@ impl std::fmt::Debug for XGBoostModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("XGBoostModel")
             .field("n_params", &self.n_params)
-            .field("n_boosters", &self.boosters.len())
             .finish()
     }
+}
+
+/// Helper to reshape flat predictions from XGBoost into (n_samples, n_params).
+fn prediction_to_array2(preds: &[f32], n_samples: usize, n_params: usize) -> Array2<f64> {
+    let mut result = Array2::zeros((n_samples, n_params));
+    // XGBoost multi-output returns predictions row-major: [s0_p0, s0_p1, ..., s1_p0, ...]
+    for i in 0..n_samples {
+        for j in 0..n_params {
+            result[[i, j]] = preds[i * n_params + j] as f64;
+        }
+    }
+    result
 }
 
 impl BackendModel for XGBoostModel {
@@ -229,7 +235,6 @@ impl BackendModel for XGBoostModel {
         F: Fn(&Array2<f64>, &Array1<f64>, Option<&Array1<f64>>) -> Result<GradientsAndHessians>,
         M: Fn(&Array2<f64>, &Array1<f64>) -> f64,
     {
-        // Use the callback version with no callbacks
         let (model, _) =
             Self::train_with_objective_and_callbacks::<F, M, super::traits::HistoryCallback>(
                 params,
@@ -262,17 +267,38 @@ impl BackendModel for XGBoostModel {
         let n_params = params.n_dist_params();
         let n_samples = train_data.num_rows();
 
-        // Create one booster per distribution parameter
-        let mut boosters: Vec<Booster> = Vec::with_capacity(n_params);
-        for _ in 0..n_params {
-            let booster = Booster::new_with_cached_dmats(
-                &BoosterParameters::default(),
-                &[&train_data.dmatrix],
-            )
-            .map_err(|e| {
+        // Set base_margin on DMatrix if start values are provided.
+        // This matches Python: base_margin = np.ones((n_rows, 1)) * start_values, flattened.
+        if let Some(sv) = start_values {
+            let mut margin = Vec::with_capacity(n_samples * n_params);
+            for _i in 0..n_samples {
+                for j in 0..n_params {
+                    margin.push(sv[j] as f32);
+                }
+            }
+            train_data.dmatrix.set_base_margin(&margin).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
+            })?;
+        }
+
+        // Create a single booster with num_target matching Python's XGBoostLSS
+        let mut xgb_params = params.to_xgb_params();
+        xgb_params.insert("num_target".to_string(), n_params.to_string());
+
+        let mut booster =
+            Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&train_data.dmatrix])
+                .map_err(|e| {
                 GradientLSSError::BackendError(format!("Failed to create booster: {}", e))
             })?;
-            boosters.push(booster);
+
+        // Apply all user-specified parameters
+        for (key, value) in &xgb_params {
+            booster.set_param(key, value).map_err(|e| {
+                GradientLSSError::BackendError(format!(
+                    "Failed to set param {}={}: {}",
+                    key, value, e
+                ))
+            })?;
         }
 
         let labels = train_data.get_labels()?;
@@ -291,84 +317,50 @@ impl BackendModel for XGBoostModel {
         let mut rounds_without_improvement = 0;
         let mut stopped_early = false;
 
-        // Training history
         let mut train_history = Vec::with_capacity(config.num_boost_round);
         let mut valid_history = Vec::with_capacity(config.num_boost_round);
 
-        // Initialize predictions with start values or zeros
-        let mut predictions = Array2::zeros((n_samples, n_params));
-        if let Some(sv) = start_values {
-            for i in 0..n_samples {
-                for j in 0..n_params {
-                    predictions[[i, j]] = sv[j];
-                }
-            }
-        }
-
-        // Notify callbacks of training start
         if let Some(ref mut cb) = callbacks {
             cb.on_training_start(config.num_boost_round);
         }
 
         let mut final_round = 0;
 
-        // Training loop
         for round in 0..config.num_boost_round {
             final_round = round;
 
-            // Get current predictions from all boosters
-            for (param_idx, booster) in boosters.iter().enumerate() {
-                let preds = booster.predict(&train_data.dmatrix).map_err(|e| {
-                    GradientLSSError::BackendError(format!("Prediction failed: {}", e))
-                })?;
+            // Get current predictions from the single multi-output booster
+            let raw_preds = booster
+                .predict(&train_data.dmatrix)
+                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
 
-                // Only use first n_samples predictions (XGBoost may return more based on labels)
-                for i in 0..n_samples {
-                    predictions[[i, param_idx]] = preds[i] as f64;
-                }
-            }
-
-            // Add start values to predictions if provided
-            if let Some(sv) = start_values {
-                for i in 0..n_samples {
-                    for j in 0..n_params {
-                        predictions[[i, j]] += sv[j];
-                    }
-                }
-            }
+            // Reshape flat predictions to (n_samples, n_params)
+            let predictions = prediction_to_array2(&raw_preds, n_samples, n_params);
 
             // Compute gradients and hessians for all parameters
             let gh = objective_fn(&predictions, &labels, None)?;
 
-            // Update each booster with its corresponding gradients
-            for (param_idx, booster) in boosters.iter_mut().enumerate() {
-                let mut grad_f32 = Vec::with_capacity(n_samples);
-                let mut hess_f32 = Vec::with_capacity(n_samples);
+            // Flatten gradients/hessians row-major: [g_s0_p0, g_s0_p1, ..., g_s1_p0, ...]
+            // This matches Python which concatenates per-param gradients along axis=1
+            let mut grad_f32 = Vec::with_capacity(n_samples * n_params);
+            let mut hess_f32 = Vec::with_capacity(n_samples * n_params);
 
-                for i in 0..n_samples {
-                    grad_f32.push(gh.gradients[[i, param_idx]] as f32);
-                    hess_f32.push(gh.hessians[[i, param_idx]] as f32);
+            for i in 0..n_samples {
+                for j in 0..n_params {
+                    grad_f32.push(gh.gradients[[i, j]] as f32);
+                    hess_f32.push(gh.hessians[[i, j]] as f32);
                 }
-
-                // Set gradient data for this parameter's booster
-                OBJECTIVE_DATA.with(|data| {
-                    *data.borrow_mut() = Some((grad_f32, hess_f32));
-                });
-
-                // Update the booster
-                booster
-                    .update_custom(
-                        &train_data.dmatrix,
-                        round as i32, // <--- Add this argument
-                        objective_trampoline
-                    )
-                    .map_err(|e| {
-                        GradientLSSError::BackendError(format!(
-                            "Update failed for param {}: {}",
-                            param_idx, e
-                        ))
-                    })?;
             }
+
+            // Set gradient data for the trampoline
+            OBJECTIVE_DATA.with(|data| {
+                *data.borrow_mut() = Some((grad_f32, hess_f32));
+            });
+
+            // Update the single booster with all parameters' gradients
+            booster
+                .update_custom(&train_data.dmatrix, round as i32, objective_trampoline)
+                .map_err(|e| GradientLSSError::BackendError(format!("Update failed: {}", e)))?;
 
             // Compute training loss
             let train_loss = metric_fn(&predictions, &labels);
@@ -378,31 +370,31 @@ impl BackendModel for XGBoostModel {
             let valid_loss = if let (Some((vf, vr, _vc)), Some(vl)) =
                 (&valid_features, &valid_labels)
             {
-                // Compute predictions on validation set
-                let valid_dmat = DMatrix::from_dense(vf, *vr).map_err(|e| {
+                let mut valid_dmat = DMatrix::from_dense(vf, *vr).map_err(|e| {
                     GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
                 })?;
 
-                let mut valid_preds = Array2::zeros((*vr, n_params));
-                for (param_idx, booster) in boosters.iter().enumerate() {
-                    let preds = booster.predict(&valid_dmat).map_err(|e| {
-                        GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
-                    })?;
-
-                    // Only use first vr predictions
-                    for i in 0..*vr {
-                        valid_preds[[i, param_idx]] = preds[i] as f64;
-                    }
-                }
-
-                // Add start values
+                // Set base_margin on validation DMatrix too
                 if let Some(sv) = start_values {
-                    for i in 0..*vr {
+                    let mut margin = Vec::with_capacity(*vr * n_params);
+                    for _i in 0..*vr {
                         for j in 0..n_params {
-                            valid_preds[[i, j]] += sv[j];
+                            margin.push(sv[j] as f32);
                         }
                     }
+                    valid_dmat.set_base_margin(&margin).map_err(|e| {
+                        GradientLSSError::BackendError(format!(
+                            "Failed to set valid base_margin: {}",
+                            e
+                        ))
+                    })?;
                 }
+
+                let valid_raw = booster.predict(&valid_dmat).map_err(|e| {
+                    GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
+                })?;
+
+                let valid_preds = prediction_to_array2(&valid_raw, *vr, n_params);
 
                 let vl_loss = metric_fn(&valid_preds, vl);
                 valid_history.push(vl_loss);
@@ -411,7 +403,6 @@ impl BackendModel for XGBoostModel {
                 None
             };
 
-            // Determine the evaluation loss for early stopping
             let eval_loss = valid_loss.unwrap_or(train_loss);
 
             if config.verbose && round % 10 == 0 {
@@ -424,7 +415,6 @@ impl BackendModel for XGBoostModel {
                 }
             }
 
-            // Invoke callbacks
             if let Some(ref mut cb) = callbacks {
                 if cb.on_iteration_end(round, train_loss, valid_loss) == CallbackAction::Stop {
                     stopped_early = true;
@@ -432,7 +422,6 @@ impl BackendModel for XGBoostModel {
                 }
             }
 
-            // Built-in early stopping (if no callbacks or callbacks didn't stop)
             if let Some(early_stopping) = config.early_stopping_rounds {
                 if eval_loss < best_loss {
                     best_loss = eval_loss;
@@ -454,7 +443,6 @@ impl BackendModel for XGBoostModel {
             }
         }
 
-        // Notify callbacks of training end
         if let Some(ref mut cb) = callbacks {
             cb.on_training_end(final_round + 1, stopped_early);
         }
@@ -468,99 +456,78 @@ impl BackendModel for XGBoostModel {
             stopped_early,
         };
 
-        Ok((Self { boosters, n_params }, result))
+        Ok((Self { booster, n_params }, result))
     }
 
     fn predict_raw(&self, data: &ArrayView2<f64>) -> Result<Array2<f64>> {
         let n_samples = data.nrows();
 
-        // Create DMatrix from features
         let features_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
         let dmatrix = DMatrix::from_dense(&features_f32, n_samples).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
         })?;
 
-        // Get predictions from each booster
-        let mut result = Array2::zeros((n_samples, self.n_params));
+        let raw_preds = self
+            .booster
+            .predict(&dmatrix)
+            .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
 
-        for (param_idx, booster) in self.boosters.iter().enumerate() {
-            let preds = booster
-                .predict(&dmatrix)
-                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-
-            // Only use first n_samples predictions
-            for i in 0..n_samples {
-                result[[i, param_idx]] = preds[i] as f64;
-            }
-        }
-
-        Ok(result)
+        Ok(prediction_to_array2(&raw_preds, n_samples, self.n_params))
     }
 
     fn save_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
-        // Write number of boosters
+        // Write n_params so we know how to reshape predictions on load
         writer
-            .write_all(&(self.boosters.len() as u64).to_le_bytes())
+            .write_all(&(self.n_params as u64).to_le_bytes())
             .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
-        // Write each booster using temp file workaround (xgboost crate lacks save_buffer)
-        for booster in &self.boosters {
-            let temp_file =
-                NamedTempFile::new().map_err(|e| GradientLSSError::IoError(e.to_string()))?;
-            let temp_path = temp_file.path();
+        // Save the single booster
+        let temp_file =
+            NamedTempFile::new().map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        let temp_path = temp_file.path();
 
-            booster.save(temp_path).map_err(|e| {
-                GradientLSSError::BackendError(format!(
-                    "Failed to save booster to temp file: {}",
-                    e
-                ))
-            })?;
+        self.booster.save(temp_path).map_err(|e| {
+            GradientLSSError::BackendError(format!("Failed to save booster to temp file: {}", e))
+        })?;
 
-            let model_bytes =
-                std::fs::read(temp_path).map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        let model_bytes =
+            std::fs::read(temp_path).map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
-            writer
-                .write_all(&(model_bytes.len() as u64).to_le_bytes())
-                .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
-            writer
-                .write_all(&model_bytes)
-                .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
-        }
+        writer
+            .write_all(&(model_bytes.len() as u64).to_le_bytes())
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        writer
+            .write_all(&model_bytes)
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+
         Ok(())
     }
 
     fn load_from_reader<R: Read>(reader: &mut R) -> Result<Self> {
-        // Read number of boosters
-        let mut n_boosters_bytes = [0u8; 8];
+        // Read n_params
+        let mut n_params_bytes = [0u8; 8];
         reader
-            .read_exact(&mut n_boosters_bytes)
+            .read_exact(&mut n_params_bytes)
             .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
-        let n_boosters = u64::from_le_bytes(n_boosters_bytes) as usize;
+        let n_params = u64::from_le_bytes(n_params_bytes) as usize;
 
-        // Read each booster
-        let mut boosters = Vec::with_capacity(n_boosters);
-        for _ in 0..n_boosters {
-            let mut len_bytes = [0u8; 8];
-            reader
-                .read_exact(&mut len_bytes)
-                .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
-            let len = u64::from_le_bytes(len_bytes) as usize;
+        // Read the single booster
+        let mut len_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut len_bytes)
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        let len = u64::from_le_bytes(len_bytes) as usize;
 
-            let mut model_bytes = vec![0u8; len];
-            reader
-                .read_exact(&mut model_bytes)
-                .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        let mut model_bytes = vec![0u8; len];
+        reader
+            .read_exact(&mut model_bytes)
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
-            let booster = Booster::load_buffer(&model_bytes).map_err(|e| {
-                GradientLSSError::BackendError(format!("Failed to load booster from buffer: {}", e))
-            })?;
-            boosters.push(booster);
-        }
+        let booster = Booster::load_buffer(&model_bytes).map_err(|e| {
+            GradientLSSError::BackendError(format!("Failed to load booster from buffer: {}", e))
+        })?;
 
-        Ok(Self {
-            boosters,
-            n_params: n_boosters,
-        })
+        Ok(Self { booster, n_params })
     }
 
     fn feature_importance(
@@ -568,49 +535,25 @@ impl BackendModel for XGBoostModel {
         importance_type: FeatureImportanceType,
         feature_names: Option<Vec<String>>,
     ) -> Result<FeatureImportance> {
-        if self.boosters.is_empty() {
-            return Err(GradientLSSError::ModelNotTrained);
-        }
-
-        // XGBoost Rust crate doesn't expose feature importance directly.
-        // We parse the model dump to extract feature usage statistics.
-        // This is a simplified implementation that counts feature occurrences.
-
         let n_params = self.n_params;
 
-        // Parse feature importance from model dumps
-        let mut all_importance: Vec<HashMap<String, f64>> = Vec::with_capacity(n_params);
+        let mut importance: HashMap<String, f64> = HashMap::new();
 
-        for booster in &self.boosters {
-            let mut importance: HashMap<String, f64> = HashMap::new();
-
-            // Dump the model to text and parse feature usage
-            if let Ok(model_dump) = booster.dump_model(true, None) {
-                for line in model_dump.lines() {
-                    // Look for lines like "[f0<0.5]" or "f0<0.5"
-                    if let Some(start) = line.find("[f") {
-                        if let Some(end) =
-                            line[start..].find('<').or_else(|| line[start..].find(']'))
-                        {
-                            let feature_name = &line[start + 1..start + end];
-                            *importance.entry(feature_name.to_string()).or_insert(0.0) += 1.0;
-                        }
+        // Parse feature importance from model dump
+        if let Ok(model_dump) = self.booster.dump_model(true, None) {
+            for line in model_dump.lines() {
+                if let Some(start) = line.find("[f") {
+                    if let Some(end) = line[start..].find('<').or_else(|| line[start..].find(']')) {
+                        let feature_name = &line[start + 1..start + end];
+                        *importance.entry(feature_name.to_string()).or_insert(0.0) += 1.0;
                     }
                 }
             }
-
-            all_importance.push(importance);
         }
 
-        // Find all unique feature names across boosters
-        let mut all_features: Vec<String> = all_importance
-            .iter()
-            .flat_map(|m| m.keys().cloned())
-            .collect();
+        let mut all_features: Vec<String> = importance.keys().cloned().collect();
         all_features.sort();
-        all_features.dedup();
 
-        // If no features found, create a placeholder
         if all_features.is_empty() {
             return Ok(FeatureImportance {
                 feature_indices: vec![],
@@ -622,11 +565,12 @@ impl BackendModel for XGBoostModel {
 
         let n_features = all_features.len();
 
-        // Build scores matrix (n_features x n_params)
+        // For a single multi-output booster, feature importance is shared across params.
+        // Replicate the scores for each param column to match the expected shape.
         let mut scores_vec = Vec::with_capacity(n_features * n_params);
         for feat in &all_features {
-            for imp_map in &all_importance {
-                let score = imp_map.get(feat).copied().unwrap_or(0.0);
+            let score = importance.get(feat).copied().unwrap_or(0.0);
+            for _ in 0..n_params {
                 scores_vec.push(score);
             }
         }
@@ -638,7 +582,6 @@ impl BackendModel for XGBoostModel {
             }
         })?;
 
-        // Extract feature indices from names (XGBoost names features as "f0", "f1", etc.)
         let feature_indices: Vec<usize> = all_features
             .iter()
             .map(|f| {
@@ -657,8 +600,6 @@ impl BackendModel for XGBoostModel {
     }
 
     fn num_features(&self) -> usize {
-        // XGBoost doesn't directly expose num_features, return 0 if unknown
-        // Users should track this themselves or use feature_importance which discovers features
         0
     }
 
@@ -719,7 +660,20 @@ mod tests {
     #[test]
     fn test_xgboost_params_n_dist_params() {
         let mut params = XGBoostParams::default();
+        assert_eq!(params.n_dist_params(), 1);
         params.set_n_dist_params(3);
         assert_eq!(params.n_dist_params(), 3);
+    }
+
+    #[test]
+    fn test_prediction_to_array2() {
+        let preds = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let result = prediction_to_array2(&preds, 3, 2);
+        assert_eq!(result[[0, 0]], 1.0);
+        assert_eq!(result[[0, 1]], 2.0);
+        assert_eq!(result[[1, 0]], 3.0);
+        assert_eq!(result[[1, 1]], 4.0);
+        assert_eq!(result[[2, 0]], 5.0);
+        assert_eq!(result[[2, 1]], 6.0);
     }
 }

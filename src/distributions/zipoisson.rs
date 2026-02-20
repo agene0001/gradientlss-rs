@@ -4,11 +4,11 @@ use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Poisson as RandPoisson};
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Discrete, Poisson as StatrsPoisson};
+use statrs::function::gamma::ln_gamma;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZIPoisson {
@@ -41,14 +41,19 @@ impl ZIPoisson {
     pub fn default() -> Self {
         Self::new(
             Stabilization::None,
-            ResponseFn::Exp,
+            ResponseFn::Relu,
             ResponseFn::Sigmoid,
             LossFn::Nll,
             false,
         )
     }
 
-    /// Helper method for scalar log probability
+    /// Poisson ln_pmf inlined: -λ + k*ln(λ) - ln_gamma(k+1)
+    fn poisson_ln_pmf(rate: f64, k: u64) -> f64 {
+        -rate + (k as f64) * rate.ln() - ln_gamma(k as f64 + 1.0)
+    }
+
+    /// Helper method for scalar log probability (inlined formula)
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
         let rate = params[0];
         let gate = params[1];
@@ -57,15 +62,12 @@ impl ZIPoisson {
             return f64::NEG_INFINITY;
         }
 
-        match StatrsPoisson::new(rate) {
-            Ok(poisson_dist) => {
-                if target == 0.0 {
-                    (gate + (1.0 - gate) * poisson_dist.pmf(0)).ln()
-                } else {
-                    (1.0 - gate).ln() + poisson_dist.ln_pmf(target as u64)
-                }
-            }
-            Err(_) => f64::NEG_INFINITY,
+        if target == 0.0 {
+            // pmf(0) = exp(-rate), so gate + (1-gate)*exp(-rate)
+            (gate + (1.0 - gate) * (-rate).exp()).ln()
+        } else {
+            let k = target as u64;
+            (1.0 - gate).ln() + Self::poisson_ln_pmf(rate, k)
         }
     }
 }
@@ -111,10 +113,11 @@ impl Distribution for ZIPoisson {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let col0 = params.column(0);
+                let col1 = params.column(1);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p = vec![params[[i, 0]], params[[i, 1]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[col0[i], col1[i]], y_val);
                 }
                 total
             }
@@ -163,14 +166,15 @@ mod tests {
     #[test]
     fn test_zipoisson_log_prob() {
         let dist = ZIPoisson::default();
-        let poisson_dist = StatrsPoisson::new(5.0).unwrap();
 
         let log_p_zero = dist.log_prob_scalar(&[5.0, 0.1], 0.0);
-        let expected_zero = (0.1 + (1.0 - 0.1) * poisson_dist.pmf(0)).ln();
+        // pmf(0) = exp(-5), so gate + (1-gate)*exp(-5) = 0.1 + 0.9*exp(-5)
+        let expected_zero = (0.1 + 0.9 * (-5.0_f64).exp()).ln();
         assert_relative_eq!(log_p_zero, expected_zero, epsilon = 1e-10);
 
         let log_p_non_zero = dist.log_prob_scalar(&[5.0, 0.1], 3.0);
-        let expected_non_zero = (1.0 - 0.1f64).ln() + poisson_dist.ln_pmf(3);
+        // ln(1-gate) + poisson_ln_pmf(5, 3) = ln(0.9) + (-5 + 3*ln(5) - ln_gamma(4))
+        let expected_non_zero = 0.9_f64.ln() + (-5.0 + 3.0 * 5.0_f64.ln() - ln_gamma(4.0));
         assert_relative_eq!(log_p_non_zero, expected_non_zero, epsilon = 1e-10);
     }
 }

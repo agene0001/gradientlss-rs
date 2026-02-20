@@ -7,8 +7,9 @@ use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Exp};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Continuous, Laplace as StatrsLaplace};
+// Direct formula - no statrs constructor needed
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Laplace {
@@ -41,7 +42,7 @@ impl Laplace {
         Self::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false)
     }
 
-    /// Helper method for scalar log probability
+    /// Helper method for scalar log probability (direct formula)
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
         let loc = params[0];
         let scale = params[1];
@@ -50,10 +51,8 @@ impl Laplace {
             return f64::NEG_INFINITY;
         }
 
-        match StatrsLaplace::new(loc, scale) {
-            Ok(dist) => dist.ln_pdf(target),
-            Err(_) => f64::NEG_INFINITY,
-        }
+        // ln_pdf = -|x - loc| / scale - ln(2 * scale)
+        -((target - loc).abs() / scale) - (2.0 * scale).ln()
     }
 }
 
@@ -94,10 +93,11 @@ impl Distribution for Laplace {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let loc_col = params.column(0);
+                let scale_col = params.column(1);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p = vec![params[[i, 0]], params[[i, 1]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[loc_col[i], scale_col[i]], y_val);
                 }
                 total
             }
@@ -107,7 +107,7 @@ impl Distribution for Laplace {
 
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64> {
         let n_obs = params.nrows();
-        let mut result = Array2::zeros((n_obs, n_samples));
+        let mut result = Array2::zeros((n_samples, n_obs));
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         for j in 0..n_obs {
@@ -120,7 +120,7 @@ impl Distribution for Laplace {
                     for i in 0..n_samples {
                         let e1: f64 = exp_dist.sample(&mut rng);
                         let e2: f64 = exp_dist.sample(&mut rng);
-                        result[[j, i]] = loc + e1 - e2;
+                        result[[i, j]] = loc + e1 - e2;
                     }
                 }
             }
@@ -153,44 +153,78 @@ impl Distribution for Laplace {
         };
 
         let n_samples = predictions.nrows();
-        let mut gradients = Array2::zeros((n_samples, 2));
-        let mut hessians = Array2::zeros((n_samples, 2));
 
         let scale_response_fn = &self.params[1].response_fn;
 
-        for i in 0..n_samples {
-            let loc = transformed[[i, 0]];
-            let scale = transformed[[i, 1]].max(1e-6);
-            let yi = y[i];
-            let diff = yi - loc;
-            let abs_diff = diff.abs();
+        let t_loc = transformed.column(0);
+        let t_scale = transformed.column(1);
+        let p_scale = predictions.column(1);
 
-            // Gradient w.r.t. loc (identity response)
-            // ∂NLL/∂μ = -sign(y-μ) / b
-            let sign_diff = if diff > 0.0 {
-                1.0
-            } else if diff < 0.0 {
-                -1.0
-            } else {
-                0.0
+        let mut gradients = Array2::zeros((n_samples, 2));
+        let mut hessians = Array2::zeros((n_samples, 2));
+
+        if n_samples >= 4096 {
+            // Pre-compute batch derivatives for scale (loc uses Identity: deriv=1, second=0)
+            let resp_deriv = scale_response_fn.derivative_batch(&p_scale);
+            let resp_second = scale_response_fn.second_derivative_batch(&p_scale);
+
+            let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
+                let loc = t_loc[i];
+                let scale = t_scale[i].max(1e-6);
+                let yi = y[i];
+                let diff = yi - loc;
+                let abs_diff = diff.abs();
+                let scale_sq = scale * scale;
+
+                // Gradient/Hessian w.r.t. loc (identity response)
+                let g0 = -diff.signum() / scale;
+                let h0 = (1.0 / scale_sq).max(1e-6);
+
+                // Gradient/Hessian w.r.t. scale with chain rule
+                let grad_scale_param = 1.0 / scale - abs_diff / scale_sq;
+                let hess_scale_param = -1.0 / scale_sq + 2.0 * abs_diff / (scale_sq * scale);
+                let rd = resp_deriv[i];
+                let rsd = resp_second[i];
+                let g1 = grad_scale_param * rd;
+                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+
+                (g0, h0, g1, h1)
             };
-            gradients[[i, 0]] = -sign_diff / scale;
 
-            // Hessian w.r.t. loc (Laplace has 0 second derivative except at μ=y)
-            // Use a small positive value for stability
-            hessians[[i, 0]] = (1.0 / (scale * scale)).max(1e-6);
+            let results: Vec<_> = (0..n_samples).into_par_iter().map(compute_sample).collect();
+            for (i, (g0, h0, g1, h1)) in results.into_iter().enumerate() {
+                gradients[[i, 0]] = g0;
+                hessians[[i, 0]] = h0;
+                gradients[[i, 1]] = g1;
+                hessians[[i, 1]] = h1;
+            }
+        } else {
+            for i in 0..n_samples {
+                let loc = t_loc[i];
+                let scale = t_scale[i].max(1e-6);
+                let yi = y[i];
+                let diff = yi - loc;
+                let abs_diff = diff.abs();
+                let scale_sq = scale * scale;
 
-            // Gradient w.r.t. scale
-            // ∂NLL/∂b = 1/b - |y-μ| / b²
-            let grad_scale_param = 1.0 / scale - abs_diff / (scale * scale);
+                // Gradient/Hessian w.r.t. loc (identity response)
+                let g0 = -diff.signum() / scale;
+                let h0 = (1.0 / scale_sq).max(1e-6);
 
-            let pred_scale = predictions[[i, 1]];
-            let scale_derivative = scale_response_fn.derivative(pred_scale);
-            gradients[[i, 1]] = grad_scale_param * scale_derivative;
+                // Gradient/Hessian w.r.t. scale with chain rule
+                let pred_scale = p_scale[i];
+                let rd = scale_response_fn.derivative(pred_scale);
+                let rsd = scale_response_fn.second_derivative(pred_scale);
+                let grad_scale_param = 1.0 / scale - abs_diff / scale_sq;
+                let hess_scale_param = -1.0 / scale_sq + 2.0 * abs_diff / (scale_sq * scale);
+                let g1 = grad_scale_param * rd;
+                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
 
-            // Hessian w.r.t. scale
-            let hess_scale = (1.0 / (scale * scale)) * scale_derivative * scale_derivative;
-            hessians[[i, 1]] = hess_scale.max(1e-6);
+                gradients[[i, 0]] = g0;
+                hessians[[i, 0]] = h0;
+                gradients[[i, 1]] = g1;
+                hessians[[i, 1]] = h1;
+            }
         }
 
         Some((gradients, hessians))
@@ -216,7 +250,8 @@ mod tests {
     fn test_laplace_log_prob() {
         let dist = Laplace::default();
         let log_p = dist.log_prob_scalar(&[0.0, 1.0], 0.0);
-        let expected = StatrsLaplace::new(0.0, 1.0).unwrap().ln_pdf(0.0);
+        // Laplace(loc=0, scale=1) at x=0: -|0|/1 - ln(2) = -ln(2)
+        let expected = -(2.0_f64).ln();
         assert_relative_eq!(log_p, expected, epsilon = 1e-10);
     }
 
@@ -227,7 +262,7 @@ mod tests {
         let target = array![0.0, 0.0];
         let target_response = ResponseData::Univariate(&target.view());
         let nll = dist.nll(&params.view(), &target_response);
-        let expected_single = -StatrsLaplace::new(0.0, 1.0).unwrap().ln_pdf(0.0);
+        let expected_single = (2.0_f64).ln();
         assert_relative_eq!(nll, 2.0 * expected_single, epsilon = 1e-10);
     }
 
@@ -237,12 +272,12 @@ mod tests {
         let params = array![[0.0, 1.0], [2.0, 3.0]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
-        assert_eq!(samples.dim(), (2, 1000));
+        assert_eq!(samples.dim(), (1000, 2));
 
-        let mean_0: f64 = samples.row(0).iter().sum::<f64>() / 1000.0;
+        let mean_0: f64 = samples.column(0).iter().sum::<f64>() / 1000.0;
         assert_relative_eq!(mean_0, 0.0, epsilon = 0.2);
 
-        let mean_1: f64 = samples.row(1).iter().sum::<f64>() / 1000.0;
+        let mean_1: f64 = samples.column(1).iter().sum::<f64>() / 1000.0;
         assert_relative_eq!(mean_1, 2.0, epsilon = 0.2);
     }
 }

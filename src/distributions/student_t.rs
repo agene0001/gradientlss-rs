@@ -7,9 +7,11 @@ use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, StudentT as RandStudentT};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Continuous, StudentsT};
-use statrs::function::gamma::digamma;
+use statrs::function::gamma::{digamma, ln_gamma};
+
+use crate::constants::{LOG_PI, trigamma};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudentT {
@@ -51,7 +53,7 @@ impl StudentT {
         )
     }
 
-    /// Helper method for scalar log probability
+    /// Helper method for scalar log probability (inlined formula, no statrs constructor)
     fn log_prob_scalar(&self, params: &[f64], target: f64) -> f64 {
         let df = params[0];
         let loc = params[1];
@@ -60,11 +62,16 @@ impl StudentT {
         if df <= 0.0 || scale <= 0.0 {
             return f64::NEG_INFINITY;
         }
-
-        match StudentsT::new(loc, scale, df) {
-            Ok(dist) => dist.ln_pdf(target),
-            Err(_) => f64::NEG_INFINITY,
+        if target.is_infinite() {
+            return f64::NEG_INFINITY;
         }
+
+        let d = (target - loc) / scale;
+        ln_gamma((df + 1.0) / 2.0)
+            - 0.5 * ((df + 1.0) * (1.0 + d * d / df).ln())
+            - ln_gamma(df / 2.0)
+            - 0.5 * (df.ln() + LOG_PI)
+            - scale.ln()
     }
 }
 
@@ -105,10 +112,12 @@ impl Distribution for StudentT {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                let df_col = params.column(0);
+                let loc_col = params.column(1);
+                let scale_col = params.column(2);
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p = vec![params[[i, 0]], params[[i, 1]], params[[i, 2]]];
-                    total -= self.log_prob_scalar(&p, y_val);
+                    total -= self.log_prob_scalar(&[df_col[i], loc_col[i], scale_col[i]], y_val);
                 }
                 total
             }
@@ -141,21 +150,19 @@ impl Distribution for StudentT {
 
     /// Analytical gradients for Student-T distribution.
     ///
-    /// The Student-T log probability is:
-    /// log p(y|ν,μ,σ) = log Γ((ν+1)/2) - log Γ(ν/2) - 0.5*log(νπ) - log(σ)
-    ///                  - ((ν+1)/2) * log(1 + ((y-μ)/σ)²/ν)
+    /// NLL = -ln_gamma((ν+1)/2) + 0.5*(ν+1)*ln(1+d²/ν) + ln_gamma(ν/2) + 0.5*ln(νπ) + ln(σ)
+    /// where d = (y-μ)/σ, ν = df.
     ///
-    /// Gradients:
-    /// - ∂NLL/∂μ = (ν+1) * (y-μ) / (σ² * (ν + z²))  where z = (y-μ)/σ
-    /// - ∂NLL/∂σ = 1/σ - (ν+1) * z² / (σ * (ν + z²))
-    /// - ∂NLL/∂ν = 0.5 * [digamma((ν+1)/2) - digamma(ν/2) - 1/ν - log(1 + z²/ν) + (ν+1)*z²/(ν*(ν+z²))]
+    /// Gradients w.r.t. distribution parameters (let z = 1 + d²/ν):
+    /// - ∂NLL/∂μ = -(ν+1)*d / (σ*(ν+d²))
+    /// - ∂NLL/∂σ = 1/σ - (ν+1)*d² / (σ*(ν+d²))
+    /// - ∂NLL/∂ν = -0.5*digamma((ν+1)/2) + 0.5*digamma(ν/2) + 0.5*ln(z) - 0.5*(ν+1)*d²/(ν²*z) + 0.5/ν
     fn analytical_gradients(
         &self,
         predictions: &ArrayView2<f64>,
         transformed: &ArrayView2<f64>,
         target: &ResponseData,
     ) -> Option<(Array2<f64>, Array2<f64>)> {
-        // Only support NLL for analytical gradients
         if self.loss_fn != LossFn::Nll {
             return None;
         }
@@ -166,55 +173,126 @@ impl Distribution for StudentT {
         };
 
         let n_samples = predictions.nrows();
-        let mut gradients = Array2::zeros((n_samples, 3));
-        let mut hessians = Array2::zeros((n_samples, 3));
 
         let df_response_fn = &self.params[0].response_fn;
         let scale_response_fn = &self.params[2].response_fn;
 
-        for i in 0..n_samples {
-            let df = transformed[[i, 0]].max(2.001); // Ensure df > 2 for stability
-            let loc = transformed[[i, 1]];
-            let scale = transformed[[i, 2]].max(1e-6);
+        let t_df = transformed.column(0);
+        let t_loc = transformed.column(1);
+        let t_scale = transformed.column(2);
+        let p_df = predictions.column(0);
+        let p_scale = predictions.column(2);
 
-            let yi = y[i];
-            let z = (yi - loc) / scale;
-            let z_sq = z * z;
-            let df_plus_zsq = df + z_sq;
+        let mut gradients = Array2::zeros((n_samples, 3));
+        let mut hessians = Array2::zeros((n_samples, 3));
 
-            // Gradient w.r.t. df
-            // ∂NLL/∂ν = -0.5 * [digamma((ν+1)/2) - digamma(ν/2) - 1/ν - log(1 + z²/ν) + (ν+1)*z²/(ν*(ν+z²))]
-            let digamma_term = digamma((df + 1.0) / 2.0) - digamma(df / 2.0);
-            let log_term = (1.0 + z_sq / df).ln();
-            let ratio_term = (df + 1.0) * z_sq / (df * df_plus_zsq);
-            let grad_df_param = -0.5 * (digamma_term - 1.0 / df - log_term + ratio_term);
+        if n_samples >= 4096 {
+            let rd_df = df_response_fn.derivative_batch(&p_df);
+            let rsd_df = df_response_fn.second_derivative_batch(&p_df);
+            let rd_scale = scale_response_fn.derivative_batch(&p_scale);
+            let rsd_scale = scale_response_fn.second_derivative_batch(&p_scale);
 
-            let pred_df = predictions[[i, 0]];
-            let df_derivative = df_response_fn.derivative(pred_df);
-            gradients[[i, 0]] = grad_df_param * df_derivative;
+            let compute_sample = |i: usize| -> ([f64; 3], [f64; 3]) {
+                let nu = t_df[i].max(1e-6);
+                let mu = t_loc[i];
+                let sigma = t_scale[i].max(1e-6);
+                let yi = y[i];
 
-            // Hessian for df (use positive approximation)
-            hessians[[i, 0]] = (0.1 * df_derivative * df_derivative).max(1e-6);
+                if !yi.is_finite() {
+                    return ([0.0, 0.0, 0.0], [1e-6, 1e-6, 1e-6]);
+                }
 
-            // Gradient w.r.t. loc (identity response)
-            // ∂NLL/∂μ = -(ν+1) * (y-μ) / (σ² * (ν + z²))
-            let grad_loc = -(df + 1.0) * (yi - loc) / (scale * scale * df_plus_zsq);
-            gradients[[i, 1]] = grad_loc;
+                let d = (yi - mu) / sigma;
+                let d2 = d * d;
+                let nu_plus_d2 = nu + d2;
+                let z = 1.0 + d2 / nu;
+                let nu_p1 = nu + 1.0;
+                let sigma_sq = sigma * sigma;
 
-            // Hessian w.r.t. loc
-            hessians[[i, 1]] = ((df + 1.0) / (scale * scale * df_plus_zsq)).max(1e-6);
+                let g1 = -(nu_p1) * d / (sigma * nu_plus_d2);
+                let h1 = (nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2)).max(1e-6);
 
-            // Gradient w.r.t. scale
-            // ∂NLL/∂σ = 1/σ - (ν+1) * z² / (σ * (ν + z²))
-            let grad_scale_param = 1.0 / scale - (df + 1.0) * z_sq / (scale * df_plus_zsq);
+                let grad_sigma = 1.0 / sigma - nu_p1 * d2 / (sigma * nu_plus_d2);
+                let hess_sigma_param = -1.0 / sigma_sq
+                    + nu_p1 * d2 * (3.0 * nu + d2) / (sigma_sq * nu_plus_d2 * nu_plus_d2);
+                let rs = rd_scale[i];
+                let rss = rsd_scale[i];
+                let g2 = grad_sigma * rs;
+                let h2 = (hess_sigma_param * rs * rs + grad_sigma * rss).max(1e-6);
 
-            let pred_scale = predictions[[i, 2]];
-            let scale_derivative = scale_response_fn.derivative(pred_scale);
-            gradients[[i, 2]] = grad_scale_param * scale_derivative;
+                let half_nu_p1 = nu_p1 / 2.0;
+                let half_nu = nu / 2.0;
+                let ln_z = z.ln();
+                let grad_nu = -0.5 * digamma(half_nu_p1) + 0.5 * digamma(half_nu) + 0.5 * ln_z
+                    - 0.5 * nu_p1 * d2 / (nu * nu * z)
+                    + 0.5 / nu;
+                let hess_nu_param =
+                    -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu) - 0.5 / (nu * nu);
+                let rd = rd_df[i];
+                let rsd = rsd_df[i];
+                let g0 = grad_nu * rd;
+                let h0 = (hess_nu_param * rd * rd + grad_nu * rsd).max(1e-6);
 
-            // Hessian w.r.t. scale (simplified positive approximation)
-            let hess_scale = (1.0 / (scale * scale)) * scale_derivative * scale_derivative;
-            hessians[[i, 2]] = hess_scale.max(1e-6);
+                ([g0, g1, g2], [h0, h1, h2])
+            };
+
+            let results: Vec<_> = (0..n_samples).into_par_iter().map(compute_sample).collect();
+            for (i, (g, h)) in results.into_iter().enumerate() {
+                gradients[[i, 0]] = g[0];
+                gradients[[i, 1]] = g[1];
+                gradients[[i, 2]] = g[2];
+                hessians[[i, 0]] = h[0];
+                hessians[[i, 1]] = h[1];
+                hessians[[i, 2]] = h[2];
+            }
+        } else {
+            for i in 0..n_samples {
+                let nu = t_df[i].max(1e-6);
+                let mu = t_loc[i];
+                let sigma = t_scale[i].max(1e-6);
+                let yi = y[i];
+
+                if !yi.is_finite() {
+                    hessians[[i, 0]] = 1e-6;
+                    hessians[[i, 1]] = 1e-6;
+                    hessians[[i, 2]] = 1e-6;
+                    continue;
+                }
+
+                let d = (yi - mu) / sigma;
+                let d2 = d * d;
+                let nu_plus_d2 = nu + d2;
+                let z = 1.0 + d2 / nu;
+                let nu_p1 = nu + 1.0;
+                let sigma_sq = sigma * sigma;
+
+                gradients[[i, 1]] = -(nu_p1) * d / (sigma * nu_plus_d2);
+                hessians[[i, 1]] =
+                    (nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2)).max(1e-6);
+
+                let grad_sigma = 1.0 / sigma - nu_p1 * d2 / (sigma * nu_plus_d2);
+                let hess_sigma_param = -1.0 / sigma_sq
+                    + nu_p1 * d2 * (3.0 * nu + d2) / (sigma_sq * nu_plus_d2 * nu_plus_d2);
+                let pred_scale = p_scale[i];
+                let rs = scale_response_fn.derivative(pred_scale);
+                let rss = scale_response_fn.second_derivative(pred_scale);
+                gradients[[i, 2]] = grad_sigma * rs;
+                hessians[[i, 2]] = (hess_sigma_param * rs * rs + grad_sigma * rss).max(1e-6);
+
+                let half_nu_p1 = nu_p1 / 2.0;
+                let half_nu = nu / 2.0;
+                let ln_z = z.ln();
+                let grad_nu = -0.5 * digamma(half_nu_p1) + 0.5 * digamma(half_nu) + 0.5 * ln_z
+                    - 0.5 * nu_p1 * d2 / (nu * nu * z)
+                    + 0.5 / nu;
+                let hess_nu_param =
+                    -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu) - 0.5 / (nu * nu);
+                let pred_df = p_df[i];
+                let rd = df_response_fn.derivative(pred_df);
+                let rsd = df_response_fn.second_derivative(pred_df);
+                gradients[[i, 0]] = grad_nu * rd;
+                hessians[[i, 0]] = (hess_nu_param * rd * rd + grad_nu * rsd).max(1e-6);
+            }
         }
 
         Some((gradients, hessians))
@@ -240,7 +318,9 @@ mod tests {
     fn test_student_t_log_prob() {
         let dist = StudentT::default();
         let log_p = dist.log_prob_scalar(&[5.0, 0.0, 1.0], 0.0);
-        let expected = StudentsT::new(0.0, 1.0, 5.0).unwrap().ln_pdf(0.0);
+        // StudentT(df=5, loc=0, scale=1) at x=0: d=0
+        // ln_gamma(3) - 0.5*(6*ln(1)) - ln_gamma(2.5) - 0.5*ln(5π) - ln(1)
+        let expected = ln_gamma(3.0) - 0.0 - ln_gamma(2.5) - 0.5 * (5.0_f64.ln() + LOG_PI);
         assert_relative_eq!(log_p, expected, epsilon = 1e-10);
     }
 
@@ -252,8 +332,35 @@ mod tests {
         let target_response = ResponseData::Univariate(&target.view());
 
         let nll = dist.nll(&params.view(), &target_response);
-        let expected_single = -StudentsT::new(0.0, 1.0, 5.0).unwrap().ln_pdf(0.0);
+        let expected_single = -(ln_gamma(3.0) - ln_gamma(2.5) - 0.5 * (5.0_f64.ln() + LOG_PI));
         assert_relative_eq!(nll, 2.0 * expected_single, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_student_t_analytical_vs_numerical_gradients() {
+        use crate::distributions::base::Distribution;
+
+        let dist = StudentT::default();
+        // Use predictions that produce reasonable transformed params
+        let predictions = array![[0.5, 1.0, 0.3], [-0.2, 0.5, 0.8], [1.0, -0.5, 0.1]];
+        let targets = array![1.5, 0.8, -1.0];
+        let target = ResponseData::Univariate(&targets.view());
+
+        let transformed = dist.transform_params(&predictions.view());
+        let analytical = dist
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return analytical gradients");
+
+        let numerical = dist
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return numerical gradients");
+
+        // Compare gradients (allow looser tolerance for df parameter which involves digamma)
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-2);
+            }
+        }
     }
 
     #[test]

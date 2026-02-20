@@ -8,6 +8,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Bernoulli, Beta, Distribution as RandDistribution};
 use serde::{Deserialize, Serialize};
+use statrs::function::gamma::ln_gamma;
 
 /// Zero-Adjusted Beta distribution for distributional regression.
 ///
@@ -47,16 +48,8 @@ impl ZABeta {
         Self::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false)
     }
 
-    /// Transform parameters to the distribution parameter space.
-    fn transform_dist_params(&self, params: &[f64]) -> (f64, f64, f64) {
-        let concentration1 = self.params[0].response_fn.apply_scalar(params[0]);
-        let concentration0 = self.params[1].response_fn.apply_scalar(params[1]);
-        let gate = self.params[2].response_fn.apply_scalar(params[2]);
-
-        (concentration1, concentration0, gate)
-    }
-
     /// Compute the log probability for zero-adjusted Beta distribution.
+    /// Matches Python's ZeroInflatedDistribution.log_prob with epsilon clamping.
     fn log_prob_zabeta(
         &self,
         concentration1: f64,
@@ -64,16 +57,6 @@ impl ZABeta {
         gate: f64,
         target: f64,
     ) -> f64 {
-        // Handle zero case
-        if target == 0.0 {
-            return gate.ln(); // Probability of zero
-        }
-
-        // Handle continuous case (0 < y < 1)
-        if !(0.0 < target && target < 1.0) {
-            return f64::NEG_INFINITY;
-        }
-
         // Check that concentration parameters are positive
         if concentration1 <= 0.0 || concentration0 <= 0.0 {
             return f64::NEG_INFINITY;
@@ -84,53 +67,38 @@ impl ZABeta {
             return f64::NEG_INFINITY;
         }
 
-        // Compute Beta log probability
-        let log_beta = Self::log_beta(concentration1, concentration0);
-        let log_prob_beta = (concentration1 - 1.0) * target.ln()
-            + (concentration0 - 1.0) * (1.0 - target).ln()
-            - log_beta;
+        let is_zero = target == 0.0;
 
-        // Combine with gate probability (probability of non-zero)
-        (1.0 - gate).ln() + log_prob_beta
-    }
-
-    /// Compute the log of the beta function.
-    fn log_beta(a: f64, b: f64) -> f64 {
-        Self::log_gamma(a) + Self::log_gamma(b) - Self::log_gamma(a + b)
-    }
-
-    /// Approximate log gamma function (Lanczos approximation).
-    fn log_gamma(x: f64) -> f64 {
-        if x <= 0.0 {
+        // Handle out-of-range values
+        if target < 0.0 || target > 1.0 {
             return f64::NEG_INFINITY;
         }
 
-        // Lanczos approximation coefficients
-        let g = 7.0;
-        let p = [
-            0.99999999999980993,
-            676.5203681218851,
-            -1259.1392167224028,
-            771.32342877765313,
-            -176.61502916214059,
-            12.507343278686905,
-            -0.13857109526572012,
-            9.9843695780195716e-6,
-            1.5056327351493116e-7,
-        ];
+        // Clamp value away from boundaries for continuous distributions (matches Python's epsilon clamp)
+        let clamped_target = if target <= 0.0 {
+            f64::EPSILON
+        } else if target >= 1.0 {
+            1.0 - f64::EPSILON
+        } else {
+            target
+        };
 
-        if x < 0.5 {
-            return Self::log_gamma(x + 1.0) - x.ln();
+        // Compute Beta log probability using statrs ln_gamma
+        let log_beta = ln_gamma(concentration1) + ln_gamma(concentration0)
+            - ln_gamma(concentration1 + concentration0);
+        let log_prob_beta = (concentration1 - 1.0) * clamped_target.ln()
+            + (concentration0 - 1.0) * (1.0 - clamped_target).ln()
+            - log_beta;
+
+        let log_one_minus_gate = (1.0 - gate).ln();
+        let log_prob = log_one_minus_gate + log_prob_beta;
+
+        if is_zero {
+            // log(gate + (1-gate) * base_pdf(epsilon))
+            (gate + log_prob.exp()).ln()
+        } else {
+            log_prob
         }
-
-        let x_adj = x - 1.0;
-        let mut a = p[0];
-        for i in 1..p.len() {
-            a += p[i] / (x_adj + i as f64);
-        }
-
-        let t = x_adj + g + 0.5;
-        (x_adj + 0.5).ln() * (2.4041138063191886 * x).sqrt() - t + a.ln()
     }
 }
 
@@ -173,7 +141,11 @@ impl Distribution for ZABeta {
             return f64::NEG_INFINITY;
         }
 
-        let (concentration1, concentration0, gate) = self.transform_dist_params(params);
+        // params are already transformed by the caller (numerical_gradients_hessians
+        // applies response functions before calling log_prob)
+        let concentration1 = params[0];
+        let concentration0 = params[1];
+        let gate = params[2];
         self.log_prob_zabeta(concentration1, concentration0, gate, target[0])
     }
 
@@ -183,11 +155,23 @@ impl Distribution for ZABeta {
                 let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
+                let n_params = self.n_params();
+                let mut params_buf = vec![0.0f64; n_params];
+
                 for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
+                    let row = params.row(i);
+                    let row_params: &[f64] = match row.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in row.iter().enumerate() {
+                                params_buf[k] = v;
+                            }
+                            &params_buf[..n_params]
+                        }
+                    };
                     let target_val = arr[i];
 
-                    let log_prob = self.log_prob(&row_params, &[target_val]);
+                    let log_prob = self.log_prob(row_params, &[target_val]);
                     total_nll -= log_prob;
                 }
 
@@ -207,13 +191,10 @@ impl Distribution for ZABeta {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         for j in 0..n_obs {
-            let row_params: Vec<f64> = params.row(j).to_vec();
-            let (concentration1, concentration0, gate) = self.transform_dist_params(&row_params);
-
-            // Ensure valid parameters
-            let concentration1 = concentration1.max(0.1);
-            let concentration0 = concentration0.max(0.1);
-            let gate = gate.clamp(0.01, 0.99);
+            // params are already transformed by the caller, use directly
+            let concentration1 = params[[j, 0]].max(0.1);
+            let concentration0 = params[[j, 1]].max(0.1);
+            let gate = params[[j, 2]].clamp(0.01, 0.99);
 
             for s in 0..n_samples {
                 // Sample from Bernoulli to decide if zero or Beta
@@ -253,8 +234,8 @@ mod tests {
     fn test_zabeta_log_prob_zero() {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
-        // Test with zero target
-        let params = vec![1.0, 1.0, 0.0]; // concentration1=exp(1), concentration0=exp(1), gate=sigmoid(0)=0.5
+        // Test with zero target - params are already transformed
+        let params = vec![2.718281828, 2.718281828, 0.5]; // concentration1=e, concentration0=e, gate=0.5
         let target = vec![0.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -265,8 +246,8 @@ mod tests {
     fn test_zabeta_log_prob_continuous() {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
-        // Test with continuous target
-        let params = vec![1.0, 1.0, 0.0]; // concentration1=exp(1), concentration0=exp(1), gate=sigmoid(0)=0.5
+        // Test with continuous target - params are already transformed
+        let params = vec![2.718281828, 2.718281828, 0.5]; // concentration1=e, concentration0=e, gate=0.5
         let target = vec![0.5];
 
         let log_p = dist.log_prob(&params, &target);
@@ -277,8 +258,8 @@ mod tests {
     fn test_zabeta_invalid_target() {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
-        // Test with invalid target (> 1)
-        let params = vec![1.0, 1.0, 0.0];
+        // Test with invalid target (> 1) - params are already transformed
+        let params = vec![2.718281828, 2.718281828, 0.5];
         let target = vec![1.5];
 
         let log_p = dist.log_prob(&params, &target);
@@ -288,7 +269,8 @@ mod tests {
     #[test]
     fn test_zabeta_nll() {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
-        let params = array![[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        // Already transformed params: concentration1, concentration0, gate
+        let params = array![[2.0, 2.0, 0.5], [1.0, 1.0, 0.7]];
         let target = array![0.0, 0.5];
         let target_response = ResponseData::Univariate(&target.view());
 
@@ -299,7 +281,9 @@ mod tests {
     #[test]
     fn test_zabeta_sample() {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
-        let params = array![[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        // Params are in already-transformed space: gate uses Sigmoid, so pass sigmoid outputs directly
+        // gate=0.5 -> ~50% zeros, gate=0.731 -> ~73% zeros
+        let params = array![[1.0, 1.0, 0.5], [1.0, 1.0, 0.731]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
         // Should have shape (n_samples, n_obs) = (1000, 2)
@@ -311,7 +295,7 @@ mod tests {
 
         // First observation should have ~50% zeros (gate=0.5)
         assert!(zero_count_0 > 300 && zero_count_0 < 700);
-        // Second observation should have ~90% zeros (gate=sigmoid(1)≈0.73)
-        assert!(zero_count_1 > 600 && zero_count_1 < 800);
+        // Second observation should have ~73% zeros (gate=0.731)
+        assert!(zero_count_1 > 600 && zero_count_1 < 850);
     }
 }

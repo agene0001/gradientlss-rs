@@ -1,6 +1,7 @@
 //! Zero-Adjusted LogNormal distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -8,7 +9,6 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Bernoulli, Distribution as RandDistribution, LogNormal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Zero-Adjusted LogNormal distribution for distributional regression.
 ///
@@ -26,13 +26,13 @@ pub struct ZALN {
 impl ZALN {
     pub fn new(
         stabilization: Stabilization,
-        response_fn: ResponseFn,
+        scale_response_fn: ResponseFn,
         loss_fn: LossFn,
         initialize: bool,
     ) -> Self {
         let params = vec![
-            DistributionParam::new("loc", response_fn),
-            DistributionParam::new("scale", response_fn),
+            DistributionParam::new("loc", ResponseFn::Identity),
+            DistributionParam::new("scale", scale_response_fn),
             DistributionParam::new("gate", ResponseFn::Sigmoid), // Gate probability (0, 1)
         ];
 
@@ -45,35 +45,12 @@ impl ZALN {
     }
 
     pub fn default() -> Self {
-        Self::new(
-            Stabilization::None,
-            ResponseFn::Identity,
-            LossFn::Nll,
-            false,
-        )
-    }
-
-    /// Transform parameters to the distribution parameter space.
-    fn transform_dist_params(&self, params: &[f64]) -> (f64, f64, f64) {
-        let loc = self.params[0].response_fn.apply_scalar(params[0]);
-        let scale = self.params[1].response_fn.apply_scalar(params[1]);
-        let gate = self.params[2].response_fn.apply_scalar(params[2]);
-
-        (loc, scale, gate)
+        Self::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false)
     }
 
     /// Compute the log probability for zero-adjusted LogNormal distribution.
+    /// Matches Python's ZeroInflatedDistribution.log_prob with epsilon clamping.
     fn log_prob_zaln(&self, loc: f64, scale: f64, gate: f64, target: f64) -> f64 {
-        // Handle zero case
-        if target == 0.0 {
-            return gate.ln(); // Probability of zero
-        }
-
-        // Handle positive continuous case (y > 0)
-        if target <= 0.0 {
-            return f64::NEG_INFINITY;
-        }
-
         // Check that scale parameter is positive
         if scale <= 0.0 {
             return f64::NEG_INFINITY;
@@ -84,15 +61,30 @@ impl ZALN {
             return f64::NEG_INFINITY;
         }
 
-        // Compute LogNormal log probability
-        let log_target = target.ln();
-        let log_prob_lognormal = -0.5 * ((log_target - loc) / scale).powi(2)
-            - 0.5 * (2.0 * PI).ln()
-            - scale.ln()
-            - log_target;
+        let is_zero = target == 0.0;
 
-        // Combine with gate probability (probability of non-zero)
-        (1.0 - gate).ln() + log_prob_lognormal
+        // Handle negative values
+        if target < 0.0 {
+            return f64::NEG_INFINITY;
+        }
+
+        // Clamp value away from 0 for continuous distributions (matches Python's epsilon clamp)
+        let clamped_target = if target <= 0.0 { f64::EPSILON } else { target };
+
+        // Compute LogNormal log probability
+        let log_target = clamped_target.ln();
+        let log_prob_lognormal =
+            -0.5 * ((log_target - loc) / scale).powi(2) - 0.5 * LOG_2PI - scale.ln() - log_target;
+
+        let log_one_minus_gate = (1.0 - gate).ln();
+        let log_prob = log_one_minus_gate + log_prob_lognormal;
+
+        if is_zero {
+            // log(gate + (1-gate) * base_pdf(epsilon))
+            (gate + log_prob.exp()).ln()
+        } else {
+            log_prob
+        }
     }
 }
 
@@ -135,7 +127,11 @@ impl Distribution for ZALN {
             return f64::NEG_INFINITY;
         }
 
-        let (loc, scale, gate) = self.transform_dist_params(params);
+        // params are already transformed by the caller (numerical_gradients_hessians
+        // applies response functions before calling log_prob)
+        let loc = params[0];
+        let scale = params[1];
+        let gate = params[2];
         self.log_prob_zaln(loc, scale, gate, target[0])
     }
 
@@ -145,11 +141,23 @@ impl Distribution for ZALN {
                 let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
+                let n_params = self.n_params();
+                let mut params_buf = vec![0.0f64; n_params];
+
                 for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
+                    let row = params.row(i);
+                    let row_params: &[f64] = match row.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in row.iter().enumerate() {
+                                params_buf[k] = v;
+                            }
+                            &params_buf[..n_params]
+                        }
+                    };
                     let target_val = arr[i];
 
-                    let log_prob = self.log_prob(&row_params, &[target_val]);
+                    let log_prob = self.log_prob(row_params, &[target_val]);
                     total_nll -= log_prob;
                 }
 
@@ -169,12 +177,10 @@ impl Distribution for ZALN {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
         for j in 0..n_obs {
-            let row_params: Vec<f64> = params.row(j).to_vec();
-            let (loc, scale, gate) = self.transform_dist_params(&row_params);
-
-            // Ensure valid parameters
-            let scale = scale.max(0.1);
-            let gate = gate.clamp(0.01, 0.99);
+            // params are already transformed by the caller, use directly
+            let loc = params[[j, 0]];
+            let scale = params[[j, 1]].max(0.1);
+            let gate = params[[j, 2]].clamp(0.01, 0.99);
 
             for s in 0..n_samples {
                 // Sample from Bernoulli to decide if zero or LogNormal
@@ -224,8 +230,8 @@ mod tests {
             false,
         );
 
-        // Test with zero target
-        let params = vec![0.0, 1.0, 0.0]; // loc=0, scale=exp(1), gate=sigmoid(0)=0.5
+        // Test with zero target - params are already transformed
+        let params = vec![0.0, 1.0, 0.5]; // loc=0, scale=1, gate=0.5
         let target = vec![0.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -241,8 +247,8 @@ mod tests {
             false,
         );
 
-        // Test with positive target
-        let params = vec![0.0, 1.0, 0.0]; // loc=0, scale=exp(1), gate=sigmoid(0)=0.5
+        // Test with positive target - params are already transformed
+        let params = vec![0.0, 1.0, 0.5]; // loc=0, scale=1, gate=0.5
         let target = vec![1.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -258,8 +264,8 @@ mod tests {
             false,
         );
 
-        // Test with negative target
-        let params = vec![0.0, 1.0, 0.0];
+        // Test with negative target - params are already transformed
+        let params = vec![0.0, 1.0, 0.5];
         let target = vec![-1.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -274,7 +280,8 @@ mod tests {
             LossFn::Nll,
             false,
         );
-        let params = array![[0.0, 1.0, 0.0], [1.0, 0.5, 1.0]];
+        // Already transformed params: loc, scale, gate
+        let params = array![[0.0, 1.0, 0.5], [1.0, 0.5, 0.3]];
         let target = array![0.0, 1.0];
         let target_response = ResponseData::Univariate(&target.view());
 
@@ -290,7 +297,9 @@ mod tests {
             LossFn::Nll,
             false,
         );
-        let params = array![[0.0, 1.0, 0.0], [1.0, 0.5, 1.0]];
+        // Params are in already-transformed space: gate uses Sigmoid, so pass sigmoid outputs directly
+        // gate=0.5 -> ~50% zeros, gate=0.731 -> ~73% zeros
+        let params = array![[0.0, 1.0, 0.5], [1.0, 0.5, 0.731]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
         // Should have shape (n_samples, n_obs) = (1000, 2)
@@ -302,8 +311,8 @@ mod tests {
 
         // First observation should have ~50% zeros (gate=0.5)
         assert!(zero_count_0 > 300 && zero_count_0 < 700);
-        // Second observation should have ~70% zeros (gate=sigmoid(1)≈0.73)
-        assert!(zero_count_1 > 600 && zero_count_1 < 800);
+        // Second observation should have ~73% zeros (gate=0.731)
+        assert!(zero_count_1 > 600 && zero_count_1 < 850);
 
         // Check that positive samples are reasonable
         let positive_samples: Vec<f64> = samples

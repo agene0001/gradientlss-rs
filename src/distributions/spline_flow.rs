@@ -11,6 +11,7 @@
 //!   Rational Splines. AISTATS 2020.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array1, Array2, ArrayView2};
@@ -18,7 +19,6 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Target support options for the spline flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,16 +159,17 @@ impl SplineFlow {
     }
 
     /// Split parameters into widths, heights, derivatives, and optionally lambdas.
-    fn split_params(&self, params: &[f64]) -> SplineParams {
+    /// Returns borrowed slices to avoid allocation.
+    fn split_params<'a>(&self, params: &'a [f64]) -> SplineParams<'a> {
         match self.order {
             SplineOrder::Quadratic => {
                 let widths = &params[0..self.count_bins];
                 let heights = &params[self.count_bins..2 * self.count_bins];
                 let derivatives = &params[2 * self.count_bins..];
                 SplineParams {
-                    widths: widths.to_vec(),
-                    heights: heights.to_vec(),
-                    derivatives: derivatives.to_vec(),
+                    widths,
+                    heights,
+                    derivatives,
                     lambdas: None,
                 }
             }
@@ -178,10 +179,10 @@ impl SplineFlow {
                 let derivatives = &params[2 * self.count_bins..3 * self.count_bins - 1];
                 let lambdas = &params[3 * self.count_bins - 1..];
                 SplineParams {
-                    widths: widths.to_vec(),
-                    heights: heights.to_vec(),
-                    derivatives: derivatives.to_vec(),
-                    lambdas: Some(lambdas.to_vec()),
+                    widths,
+                    heights,
+                    derivatives,
+                    lambdas: Some(lambdas),
                 }
             }
         }
@@ -212,12 +213,48 @@ impl SplineFlow {
         }
 
         // Base distribution log probability (standard normal)
-        let log_prob_base = -0.5 * (2.0 * PI).ln() - 0.5 * z * z;
+        let log_prob_base = -0.5 * LOG_2PI - 0.5 * z * z;
 
         // Add log determinant of target transform inverse if needed
         let log_det_target = self.log_det_target_transform_inverse(target);
 
         // Total log probability
+        log_prob_base + log_det_inverse + log_det_target
+    }
+
+    /// Like log_prob_flow but uses pre-allocated buffers to avoid heap allocations.
+    fn log_prob_flow_with_buffers(
+        &self,
+        params: &[f64],
+        target: f64,
+        widths_buf: &mut [f64],
+        heights_buf: &mut [f64],
+        derivatives_buf: &mut [f64],
+        lambdas_buf: &mut [f64],
+    ) -> f64 {
+        let y = self.inverse_target_transform(target);
+
+        if !y.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+
+        let spline_params = self.split_params(params);
+        let (z, log_det_inverse) = self.spline_inverse_with_buffers(
+            y,
+            &spline_params,
+            widths_buf,
+            heights_buf,
+            derivatives_buf,
+            lambdas_buf,
+        );
+
+        if !z.is_finite() || !log_det_inverse.is_finite() {
+            return f64::NEG_INFINITY;
+        }
+
+        let log_prob_base = -0.5 * LOG_2PI - 0.5 * z * z;
+        let log_det_target = self.log_det_target_transform_inverse(target);
+
         log_prob_base + log_det_inverse + log_det_target
     }
 
@@ -420,20 +457,18 @@ impl SplineFlow {
         // Linear rational spline transform
         let s_k = h_k / w_k;
 
-        // Compute using linear rational formula
+        // Compute using linear rational formula (Dolatabadi et al., 2020)
         let t = xi;
         let one_minus_t = 1.0 - t;
 
-        let numerator =
-            d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
-        let denominator = d_k * one_minus_t + lambda_k * s_k * t * one_minus_t + d_k1 * t;
+        let numerator = d_k * one_minus_t + s_k * t;
+        let denominator = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
 
         if denominator.abs() < 1e-10 {
             return y_k + h_k * t;
         }
 
-        y_k + h_k * t * numerator
-            / (denominator * (d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t))
+        y_k + h_k * t * numerator / denominator
     }
 
     /// Linear rational spline inverse transform.
@@ -486,6 +521,9 @@ impl SplineFlow {
     }
 
     /// Solve for t in linear rational spline inverse using Newton's method.
+    ///
+    /// Inverts g(t) = t * (d_k*(1-t) + s_k*t) / (d_k*(1-t) + d_{k+1}*t + lambda_k*s_k*t*(1-t))
+    /// from Dolatabadi et al. (2020).
     fn solve_linear_rational_inverse(
         &self,
         y_rel: f64,
@@ -501,8 +539,8 @@ impl SplineFlow {
         for _ in 0..20 {
             let one_minus_t = 1.0 - t;
 
-            let numerator =
-                d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
+            // Forward formula numerator and denominator (linear form)
+            let numerator = d_k * one_minus_t + s_k * t;
             let denom = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
 
             if denom.abs() < 1e-10 {
@@ -511,12 +549,12 @@ impl SplineFlow {
 
             let f_t = t * numerator / denom - y_rel;
 
-            // Derivative of f(t)
-            let df_dt = numerator / denom
-                + t * ((-2.0 * d_k * one_minus_t + 2.0 * s_k * (1.0 - 2.0 * t) + 2.0 * d_k1 * t)
-                    / denom
-                    - numerator * (-d_k + d_k1 + lambda_k * s_k * (1.0 - 2.0 * t))
-                        / (denom * denom));
+            // Derivative of f(t) = t * numerator / denom
+            // Using the derivative of the linear rational spline (Dolatabadi et al., 2020):
+            // g'(t) = [d_k*(1-t)^2 + 2*s_k*t*(1-t) + d_{k+1}*t^2] / denom^2
+            let deriv_numerator =
+                d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
+            let df_dt = deriv_numerator / (denom * denom);
 
             if df_dt.abs() < 1e-10 {
                 break;
@@ -536,15 +574,15 @@ impl SplineFlow {
     /// Compute normalized widths, heights, and derivatives from parameters.
     fn compute_spline_knots(&self, params: &SplineParams) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         // Apply softmax to widths and heights to ensure they sum to 2*bound
-        let widths = softmax(&params.widths);
+        let widths = softmax(params.widths);
         let widths: Vec<f64> = widths.iter().map(|&w| w * 2.0 * self.bound).collect();
 
-        let heights = softmax(&params.heights);
+        let heights = softmax(params.heights);
         let heights: Vec<f64> = heights.iter().map(|&h| h * 2.0 * self.bound).collect();
 
         // Apply softplus to derivatives to ensure positivity, with boundary conditions
         let mut derivatives = vec![1.0]; // d_0 = 1
-        for &d in &params.derivatives {
+        for &d in params.derivatives {
             derivatives.push(softplus(d));
         }
         derivatives.push(1.0); // d_K = 1
@@ -552,15 +590,199 @@ impl SplineFlow {
         (widths, heights, derivatives)
     }
 
+    /// Compute normalized widths, heights, and derivatives into pre-allocated buffers.
+    /// Avoids heap allocation in hot loops.
+    fn compute_spline_knots_into(
+        &self,
+        params: &SplineParams,
+        widths: &mut [f64],
+        heights: &mut [f64],
+        derivatives: &mut [f64],
+    ) {
+        // Apply softmax to widths in-place
+        softmax_into(params.widths, widths);
+        let scale = 2.0 * self.bound;
+        for w in widths.iter_mut() {
+            *w *= scale;
+        }
+
+        // Apply softmax to heights in-place
+        softmax_into(params.heights, heights);
+        for h in heights.iter_mut() {
+            *h *= scale;
+        }
+
+        // Apply softplus to derivatives with boundary conditions
+        derivatives[0] = 1.0;
+        for (i, &d) in params.derivatives.iter().enumerate() {
+            derivatives[i + 1] = softplus(d);
+        }
+        derivatives[params.derivatives.len() + 1] = 1.0;
+    }
+
     /// Compute lambda parameters for linear rational splines.
     fn compute_lambdas(&self, params: &SplineParams) -> Vec<f64> {
-        match &params.lambdas {
+        match params.lambdas {
             Some(lambdas) => {
                 // Apply sigmoid to constrain lambdas to (0, 1)
                 lambdas.iter().map(|&l| sigmoid(l)).collect()
             }
             None => vec![0.5; self.count_bins], // Default value
         }
+    }
+
+    /// Compute lambda parameters into pre-allocated buffer. Zero-allocation.
+    fn compute_lambdas_into(&self, params: &SplineParams, out: &mut [f64]) {
+        match params.lambdas {
+            Some(lambdas) => {
+                for (o, &l) in out.iter_mut().zip(lambdas.iter()) {
+                    *o = sigmoid(l);
+                }
+            }
+            None => {
+                for o in out.iter_mut() {
+                    *o = 0.5;
+                }
+            }
+        }
+    }
+
+    /// Apply spline inverse with pre-allocated knot buffers.
+    /// Returns (z, log_det_inverse).
+    fn spline_inverse_with_buffers(
+        &self,
+        y: f64,
+        params: &SplineParams,
+        widths_buf: &mut [f64],
+        heights_buf: &mut [f64],
+        derivatives_buf: &mut [f64],
+        lambdas_buf: &mut [f64],
+    ) -> (f64, f64) {
+        self.compute_spline_knots_into(params, widths_buf, heights_buf, derivatives_buf);
+
+        match self.order {
+            SplineOrder::Quadratic => self.rational_quadratic_spline_inverse_buf(
+                y,
+                widths_buf,
+                heights_buf,
+                derivatives_buf,
+            ),
+            SplineOrder::Linear => {
+                self.compute_lambdas_into(params, lambdas_buf);
+                self.linear_rational_spline_inverse_buf(
+                    y,
+                    widths_buf,
+                    heights_buf,
+                    derivatives_buf,
+                    lambdas_buf,
+                )
+            }
+        }
+    }
+
+    /// Rational quadratic spline inverse using pre-computed buffers.
+    fn rational_quadratic_spline_inverse_buf(
+        &self,
+        y: f64,
+        widths: &[f64],
+        heights: &[f64],
+        derivatives: &[f64],
+    ) -> (f64, f64) {
+        if y <= -self.bound {
+            return (y, 0.0);
+        }
+        if y >= self.bound {
+            return (y, 0.0);
+        }
+
+        let (bin_idx, _) = self.find_bin_y(y, heights);
+
+        let w_k = widths[bin_idx];
+        let h_k = heights[bin_idx];
+        let d_k = derivatives[bin_idx];
+        let d_k1 = derivatives[bin_idx + 1];
+        let x_k = self.cumsum_widths(widths, bin_idx);
+        let y_k = self.cumsum_heights(heights, bin_idx);
+
+        let s_k = h_k / w_k;
+        let y_rel = y - y_k;
+
+        let a = h_k * (s_k - d_k) + y_rel * (d_k + d_k1 - 2.0 * s_k);
+        let b = h_k * d_k - y_rel * (d_k + d_k1 - 2.0 * s_k);
+        let c = -s_k * y_rel;
+
+        let discriminant = b * b - 4.0 * a * c;
+        if discriminant < 0.0 {
+            return (f64::NAN, f64::NEG_INFINITY);
+        }
+
+        let xi = if a.abs() < 1e-10 {
+            -c / b
+        } else {
+            let sqrt_disc = discriminant.sqrt();
+            let xi1 = (-b + sqrt_disc) / (2.0 * a);
+            let xi2 = (-b - sqrt_disc) / (2.0 * a);
+            if xi1 >= 0.0 && xi1 <= 1.0 { xi1 } else { xi2 }
+        };
+
+        let x = x_k + xi * w_k;
+
+        let xi_sq = xi * xi;
+        let one_minus_xi = 1.0 - xi;
+        let denom = s_k + (d_k + d_k1 - 2.0 * s_k) * xi * one_minus_xi;
+        let denom_sq = denom * denom;
+
+        let numerator_deriv = s_k
+            * s_k
+            * (d_k1 * xi_sq + 2.0 * s_k * xi * one_minus_xi + d_k * one_minus_xi * one_minus_xi);
+        let dy_dx = numerator_deriv / denom_sq;
+        let log_det = -dy_dx.ln();
+
+        (x, log_det)
+    }
+
+    /// Linear rational spline inverse using pre-computed buffers.
+    fn linear_rational_spline_inverse_buf(
+        &self,
+        y: f64,
+        widths: &[f64],
+        heights: &[f64],
+        derivatives: &[f64],
+        lambdas: &[f64],
+    ) -> (f64, f64) {
+        if y <= -self.bound {
+            return (y, 0.0);
+        }
+        if y >= self.bound {
+            return (y, 0.0);
+        }
+
+        let (bin_idx, _) = self.find_bin_y(y, heights);
+
+        let w_k = widths[bin_idx];
+        let h_k = heights[bin_idx];
+        let d_k = derivatives[bin_idx];
+        let d_k1 = derivatives[bin_idx + 1];
+        let lambda_k = lambdas[bin_idx];
+        let x_k = self.cumsum_widths(widths, bin_idx);
+        let y_k = self.cumsum_heights(heights, bin_idx);
+
+        let s_k = h_k / w_k;
+        let y_rel = (y - y_k) / h_k;
+
+        let t = self.solve_linear_rational_inverse(y_rel, d_k, d_k1, s_k, lambda_k);
+        let x = x_k + t * w_k;
+
+        let one_minus_t = 1.0 - t;
+        let numerator =
+            d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
+        let denom1 = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
+
+        let dy_dt = h_k * numerator / (denom1 * denom1);
+        let dy_dx = dy_dt / w_k;
+        let log_det = -dy_dx.abs().ln();
+
+        (x, log_det)
     }
 
     /// Find which bin x falls into and compute local coordinate xi.
@@ -601,12 +823,12 @@ impl SplineFlow {
     }
 }
 
-/// Internal struct to hold split spline parameters.
-struct SplineParams {
-    widths: Vec<f64>,
-    heights: Vec<f64>,
-    derivatives: Vec<f64>,
-    lambdas: Option<Vec<f64>>,
+/// Internal struct to hold split spline parameters (borrows from the params slice).
+struct SplineParams<'a> {
+    widths: &'a [f64],
+    heights: &'a [f64],
+    derivatives: &'a [f64],
+    lambdas: Option<&'a [f64]>,
 }
 
 #[typetag::serde]
@@ -650,10 +872,39 @@ impl Distribution for SplineFlow {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
+                // Pre-allocate reusable buffers for spline knot computation
+                let n_deriv = match self.order {
+                    SplineOrder::Quadratic => self.count_bins + 1,
+                    SplineOrder::Linear => self.count_bins + 1,
+                };
+                let mut widths_buf = vec![0.0f64; self.count_bins];
+                let mut heights_buf = vec![0.0f64; self.count_bins];
+                let mut derivatives_buf = vec![0.0f64; n_deriv];
+                let mut lambdas_buf = vec![0.0f64; self.count_bins];
+                // Fallback buffer for non-contiguous rows
+                let n_params = self.n_params();
+                let mut params_buf = vec![0.0f64; n_params];
+
                 let mut total = 0.0;
                 for (i, &y_val) in y.iter().enumerate() {
-                    let p: Vec<f64> = params.row(i).to_vec();
-                    total -= self.log_prob_flow(&p, y_val);
+                    let row = params.row(i);
+                    let p: &[f64] = match row.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in row.iter().enumerate() {
+                                params_buf[k] = v;
+                            }
+                            &params_buf[..n_params]
+                        }
+                    };
+                    total -= self.log_prob_flow_with_buffers(
+                        p,
+                        y_val,
+                        &mut widths_buf,
+                        &mut heights_buf,
+                        &mut derivatives_buf,
+                        &mut lambdas_buf,
+                    );
                 }
                 total
             }
@@ -670,15 +921,28 @@ impl Distribution for SplineFlow {
 
         let standard_normal = Normal::new(0.0, 1.0).unwrap();
 
+        // Pre-allocate a fallback buffer for non-contiguous rows
+        let n_params = self.n_params();
+        let mut params_buf = vec![0.0f64; n_params];
+
         for j in 0..n_obs {
-            let obs_params: Vec<f64> = params.row(j).to_vec();
+            let row = params.row(j);
+            let obs_params: &[f64] = match row.as_slice() {
+                Some(s) => s,
+                None => {
+                    for (k, &v) in row.iter().enumerate() {
+                        params_buf[k] = v;
+                    }
+                    &params_buf[..n_params]
+                }
+            };
 
             for i in 0..n_samples {
                 // Sample from base distribution (standard normal)
                 let z: f64 = standard_normal.sample(&mut rng);
 
                 // Apply forward transform
-                let y = self.forward_transform(z, &obs_params);
+                let y = self.forward_transform(z, obs_params);
 
                 // Round if discrete
                 let y = if self.is_discrete() {
@@ -903,6 +1167,21 @@ fn softmax(x: &[f64]) -> Vec<f64> {
     let exp_x: Vec<f64> = x.iter().map(|&v| (v - max_x).exp()).collect();
     let sum_exp: f64 = exp_x.iter().sum();
     exp_x.iter().map(|&v| v / sum_exp).collect()
+}
+
+/// Softmax into pre-allocated output buffer. Zero-allocation.
+fn softmax_into(x: &[f64], out: &mut [f64]) {
+    let max_x = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut sum_exp = 0.0;
+    for (o, &v) in out.iter_mut().zip(x.iter()) {
+        let e = (v - max_x).exp();
+        *o = e;
+        sum_exp += e;
+    }
+    let inv_sum = 1.0 / sum_exp;
+    for o in out.iter_mut() {
+        *o *= inv_sum;
+    }
 }
 
 #[cfg(test)]

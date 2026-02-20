@@ -1,14 +1,14 @@
 //! Mixture distribution implementation.
 
 use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::PI;
 
 /// Mixture distribution for distributional regression.
 ///
@@ -42,15 +42,7 @@ impl Mixture {
 
         let mut params = Vec::new();
 
-        // Mixing probabilities (using softmax response function)
-        for i in 0..n_components {
-            params.push(DistributionParam::new(
-                format!("mix_prob_{}", i + 1),
-                ResponseFn::Identity, // Will apply softmax in transform
-            ));
-        }
-
-        // Component means
+        // Component means (loc first, matching Python ordering)
         for i in 0..n_components {
             params.push(DistributionParam::new(
                 format!("loc_{}", i + 1),
@@ -63,6 +55,15 @@ impl Mixture {
             params.push(DistributionParam::new(
                 format!("scale_{}", i + 1),
                 ResponseFn::Exp,
+            ));
+        }
+
+        // Mixing probabilities (last, using gumbel_softmax via Identity;
+        // gumbel_softmax is applied in transform_dist_params, matching Python)
+        for i in 0..n_components {
+            params.push(DistributionParam::new(
+                format!("mix_prob_{}", i + 1),
+                ResponseFn::Identity,
             ));
         }
 
@@ -81,37 +82,41 @@ impl Mixture {
     }
 
     /// Transform parameters to the distribution parameter space.
+    /// Parameter ordering matches Python: [loc_1..M, scale_1..M, mix_prob_1..M]
     fn transform_dist_params(&self, params: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        let n_params = self.n_params();
-        let mut mix_probs = Vec::with_capacity(self.n_components);
-        let mut locs = Vec::with_capacity(self.n_components);
-        let mut scales = Vec::with_capacity(self.n_components);
+        let m = self.n_components;
 
-        // Extract and transform mixing probabilities (apply softmax)
-        let start_mix = 0;
-        let end_mix = self.n_components;
-        let mix_params: Vec<f64> = params[start_mix..end_mix].to_vec();
+        // Extract location parameters (first M params)
+        let locs: Vec<f64> = params[0..m].to_vec();
 
-        // Apply softmax to get valid probabilities
-        let mix_probs_softmax = Self::softmax(&mix_params, self.temperature);
-        for prob in mix_probs_softmax {
-            mix_probs.push(prob);
-        }
+        // Scale parameters are already transformed by transform_params before reaching here
+        let scales: Vec<f64> = params[m..2 * m].to_vec();
 
-        // Extract location parameters
-        let start_loc = end_mix;
-        let end_loc = start_loc + self.n_components;
-        for i in start_loc..end_loc {
-            locs.push(params[i]);
-        }
-
-        // Extract and transform scale parameters
-        for i in end_loc..n_params {
-            let param = &self.params[i];
-            scales.push(param.response_fn.apply_scalar(params[i]));
-        }
+        // Extract mixing probability logits (last M params) and apply gumbel_softmax
+        let mix_logits: Vec<f64> = params[2 * m..3 * m].to_vec();
+        let mix_probs = Self::gumbel_softmax_from_logits(&mix_logits, self.temperature);
 
         (mix_probs, locs, scales)
+    }
+
+    /// Apply Gumbel-Softmax to logits for differentiable categorical sampling.
+    /// Matches Python's gumbel_softmax_fn which uses torch.manual_seed(123)
+    /// and torch.nn.functional.gumbel_softmax on every call, making the Gumbel
+    /// noise deterministic and reproducible.
+    fn gumbel_softmax_from_logits(logits: &[f64], temperature: f64) -> Vec<f64> {
+        // Fixed seed matching Python's torch.manual_seed(123) in gumbel_softmax_fn
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+
+        // Add Gumbel(0,1) noise to logits: g_i = -log(-log(u_i)) where u_i ~ Uniform(0,1)
+        let perturbed: Vec<f64> = logits
+            .iter()
+            .map(|&x| {
+                let u: f64 = rng.random();
+                x + (-(-u.ln()).ln())
+            })
+            .collect();
+
+        Self::softmax(&perturbed, temperature)
     }
 
     /// Apply softmax function with temperature.
@@ -148,7 +153,7 @@ impl Mixture {
 
             // Compute Gaussian log probability for this component
             let z = (target - loc) / scale;
-            let log_prob_component = -0.5 * z * z - 0.5 * (2.0 * PI).ln() - scale.ln();
+            let log_prob_component = -0.5 * z * z - 0.5 * LOG_2PI - scale.ln();
 
             // Weight by mixing probability
             let weighted_log_prob = log_prob_component + mix_prob.ln();
@@ -229,11 +234,24 @@ impl Distribution for Mixture {
                 let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
+                // Pre-allocate fallback buffer for non-contiguous rows
+                let n_params = self.n_params();
+                let mut params_buf = vec![0.0f64; n_params];
+
                 for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
+                    let row = params.row(i);
+                    let row_params: &[f64] = match row.as_slice() {
+                        Some(s) => s,
+                        None => {
+                            for (k, &v) in row.iter().enumerate() {
+                                params_buf[k] = v;
+                            }
+                            &params_buf[..n_params]
+                        }
+                    };
                     let target_val = arr[i];
 
-                    let log_prob = self.log_prob(&row_params, &[target_val]);
+                    let log_prob = self.log_prob(row_params, &[target_val]);
                     total_nll -= log_prob;
                 }
 
@@ -307,7 +325,7 @@ mod tests {
     #[test]
     fn test_mixture_creation() {
         let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
-        // 2 mix_probs + 2 locs + 2 scales = 6 parameters
+        // 2 locs + 2 scales + 2 mix_probs = 6 parameters
         assert_eq!(dist.n_params(), 6);
         assert_eq!(dist.n_components, 2);
         assert_relative_eq!(dist.temperature, 1.0);
@@ -319,7 +337,9 @@ mod tests {
         let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
 
         // Test with equal mixing probabilities and similar components
-        let params = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; // mix_probs=[0.5,0.5], locs=[0,0], scales=[1,1]
+        // Order: [loc_1, loc_2, scale_1, scale_2, mix_prob_1, mix_prob_2]
+        // Params are in already-transformed space (scales already exp'd)
+        let params = vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0]; // locs=[0,0], scales=[1,1], mix_probs=[0.5,0.5]
         let target = vec![0.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -343,9 +363,11 @@ mod tests {
     #[test]
     fn test_mixture_nll() {
         let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
+        // Order: [loc_1, loc_2, scale_1, scale_2, mix_prob_1, mix_prob_2]
+        // Params are in already-transformed space (scales already exp'd)
         let params = array![
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
         ];
         let target = array![0.0, 1.0];
         let target_response = ResponseData::Univariate(&target.view());
@@ -357,9 +379,11 @@ mod tests {
     #[test]
     fn test_mixture_sample() {
         let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
+        // Order: [loc_1, loc_2, scale_1, scale_2, mix_prob_1, mix_prob_2]
+        // Params are in already-transformed space (scales already exp'd)
         let params = array![
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
         ];
         let samples = dist.sample(&params.view(), 1000, 123);
 

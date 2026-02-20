@@ -559,9 +559,9 @@ mod distribution_tests {
         let params = array![[2.0, 1.0], [3.0, 0.5]];
         let samples = dist.sample(&params.view(), 1000, 42);
 
-        // Gamma sample returns (n_observations, n_samples) - different from other distributions
-        assert_eq!(samples.nrows(), 2);
-        assert_eq!(samples.ncols(), 1000);
+        // sample returns (n_samples, n_observations)
+        assert_eq!(samples.nrows(), 1000);
+        assert_eq!(samples.ncols(), 2);
         // All samples should be positive (Gamma support is [0, inf))
         assert!(samples.iter().all(|&x| x > 0.0));
     }
@@ -1681,22 +1681,22 @@ mod zero_inflated_tests {
         let dist = ZABeta::default();
 
         // ZABeta has 3 params: concentration1, concentration0, gate
-        // ZABeta::default() uses ResponseFn::Exp for concentrations and ResponseFn::Sigmoid for gate
-        // The log_prob transforms params, so raw params [1.0, 1.0, 0.0] become:
-        // concentration1=exp(1.0)≈2.72, concentration0=exp(1.0)≈2.72, gate=sigmoid(0.0)=0.5
+        // log_prob expects pre-transformed params:
+        // concentration1 > 0, concentration0 > 0, 0 < gate < 1
         // ZABeta handles y=0 (point mass) and y in (0, 1) (Beta distribution)
         // Note: ZABeta does NOT handle y=1 - it's a zero-adjusted (not zero-one-adjusted) distribution
-        let log_p_zero = dist.log_prob(&[1.0, 1.0, 0.0], &[0.0]);
-        let log_p_mid = dist.log_prob(&[1.0, 1.0, 0.0], &[0.5]);
+        let log_p_zero = dist.log_prob(&[2.72, 2.72, 0.5], &[0.0]);
+        let log_p_mid = dist.log_prob(&[2.72, 2.72, 0.5], &[0.5]);
 
         assert!(log_p_zero.is_finite(), "ZABeta should handle y=0");
         assert!(log_p_mid.is_finite(), "ZABeta should handle y=0.5");
 
-        // ZABeta does not support y=1 (it returns NEG_INFINITY for values outside (0, 1) except 0)
-        let log_p_one = dist.log_prob(&[1.0, 1.0, 0.0], &[1.0]);
+        // y=1.0 is clamped to 1-epsilon and produces a very negative but finite log_prob
+        let log_p_one = dist.log_prob(&[2.72, 2.72, 0.5], &[1.0]);
+        assert!(log_p_one.is_finite(), "ZABeta clamps y=1 to 1-epsilon");
         assert!(
-            log_p_one == f64::NEG_INFINITY,
-            "ZABeta returns NEG_INFINITY for y=1"
+            log_p_one < log_p_mid,
+            "y=1 boundary should have lower log_prob than y=0.5"
         );
     }
 
@@ -1704,8 +1704,9 @@ mod zero_inflated_tests {
     fn test_zaln_zero_adjusted() {
         let dist = ZALN::default();
 
-        let log_p_zero = dist.log_prob(&[0.0, 1.0, 0.0], &[0.0]);
-        let log_p_pos = dist.log_prob(&[0.0, 1.0, 0.0], &[2.0]);
+        // log_prob expects pre-transformed params: scale > 0, 0 < gate < 1
+        let log_p_zero = dist.log_prob(&[0.0, 1.0, 0.5], &[0.0]);
+        let log_p_pos = dist.log_prob(&[0.0, 1.0, 0.5], &[2.0]);
 
         assert!(log_p_zero.is_finite(), "ZALN should handle zero target");
         assert!(log_p_pos.is_finite(), "ZALN should handle positive target");
@@ -1886,9 +1887,10 @@ mod multivariate_tests {
         );
 
         // Lower df = heavier tails = higher probability at extremes
-        // params: [df, loc1, loc2, tril elements...]
-        let params_low_df = vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0]; // df=exp(1)≈2.7
-        let params_high_df = vec![3.0, 0.0, 0.0, 1.0, 0.0, 1.0]; // df=exp(3)≈20
+        // log_prob expects pre-transformed params: df must be > 2.0,
+        // tril diagonal must be > 0
+        let params_low_df = vec![3.0, 0.0, 0.0, 1.0, 0.0, 1.0]; // df=3
+        let params_high_df = vec![20.0, 0.0, 0.0, 1.0, 0.0, 1.0]; // df=20
 
         let extreme_target = vec![5.0, 5.0];
 

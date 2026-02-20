@@ -48,19 +48,100 @@ impl ResponseFn {
         }
     }
 
+    /// Apply the response function element-wise, writing into a pre-allocated output.
+    /// Uses a fast path when no NaN/Inf values are present (the common case),
+    /// avoiding the overhead of computing a NaN replacement mean.
+    pub fn apply_into(&self, x: &ArrayView1<f64>, out: &mut ndarray::ArrayViewMut1<f64>) {
+        // Fast check: are there any non-finite values?
+        let has_non_finite = x.iter().any(|v| !v.is_finite());
+
+        if has_non_finite {
+            // Slow path: compute mean of finite values for NaN replacement
+            let (sum, count) = x.iter().fold((0.0, 0usize), |(s, c), &v| {
+                if v.is_finite() {
+                    (s + v, c + 1)
+                } else {
+                    (s, c)
+                }
+            });
+            let nan_replacement = if count == 0 { 0.0 } else { sum / count as f64 };
+
+            // Write nan-cleaned values into output
+            for (o, &v) in out.iter_mut().zip(x.iter()) {
+                *o = if v.is_finite() { v } else { nan_replacement };
+            }
+        } else {
+            // Fast path: direct copy, no NaN handling needed
+            out.assign(x);
+        }
+
+        // Transform in-place — mapv_inplace allows auto-vectorization of the inner loop
+        match self {
+            ResponseFn::Identity => {} // already written
+            ResponseFn::Exp => out.mapv_inplace(|v| v.exp() + EPSILON),
+            ResponseFn::ExpDf => out.mapv_inplace(|v| v.exp() + EPSILON + 2.0),
+            ResponseFn::Softplus => out.mapv_inplace(|v| softplus_scalar(v)),
+            ResponseFn::SoftplusDf => out.mapv_inplace(|v| softplus_scalar(v) + 2.0),
+            ResponseFn::Squareplus => out.mapv_inplace(|v| squareplus_scalar(v)),
+            ResponseFn::SquareplusDf => out.mapv_inplace(|v| squareplus_scalar(v) + 2.0),
+            ResponseFn::Sigmoid => out.mapv_inplace(|v| {
+                let s = 1.0 / (1.0 + (-v).exp()) + EPSILON;
+                s.clamp(SIGMOID_CLAMP_MIN, SIGMOID_CLAMP_MAX)
+            }),
+            ResponseFn::Relu => out.mapv_inplace(|v| v.max(0.0) + EPSILON),
+            ResponseFn::ReluDf => out.mapv_inplace(|v| v.max(0.0) + EPSILON + 2.0),
+        }
+    }
+
     /// Apply the response function to a single value.
     pub fn apply_scalar(&self, x: f64) -> f64 {
+        self.apply_scalar_with_nan_replacement(x, 0.0)
+    }
+
+    /// Apply the response function to a single value, using `nan_replacement`
+    /// instead of 0.0 when the input is NaN/Inf. This matches Python's
+    /// `nan_to_num(predt)` which uses `torch.nanmean(predt)` as the replacement.
+    pub fn apply_scalar_with_nan_replacement(&self, x: f64, nan_replacement: f64) -> f64 {
         match self {
-            ResponseFn::Identity => identity_scalar(x),
-            ResponseFn::Exp => exp_scalar(x),
-            ResponseFn::ExpDf => exp_scalar_df(x),
-            ResponseFn::Softplus => softplus_scalar(x),
-            ResponseFn::SoftplusDf => softplus_scalar_df(x),
-            ResponseFn::Squareplus => squareplus_scalar(x),
-            ResponseFn::SquareplusDf => squareplus_scalar_df(x),
-            ResponseFn::Sigmoid => sigmoid_scalar(x),
-            ResponseFn::Relu => relu_scalar(x),
-            ResponseFn::ReluDf => relu_scalar_df(x),
+            ResponseFn::Identity => nan_to_num_scalar(x, nan_replacement),
+            ResponseFn::Exp => nan_to_num_scalar(x, nan_replacement).exp() + EPSILON,
+            ResponseFn::ExpDf => nan_to_num_scalar(x, nan_replacement).exp() + EPSILON + 2.0,
+            ResponseFn::Softplus => {
+                let v = nan_to_num_scalar(x, nan_replacement);
+                if v > 20.0 {
+                    v + EPSILON
+                } else if v < -20.0 {
+                    EPSILON
+                } else {
+                    (1.0 + v.exp()).ln() + EPSILON
+                }
+            }
+            ResponseFn::SoftplusDf => {
+                let v = nan_to_num_scalar(x, nan_replacement);
+                let sp = if v > 20.0 {
+                    v + EPSILON
+                } else if v < -20.0 {
+                    EPSILON
+                } else {
+                    (1.0 + v.exp()).ln() + EPSILON
+                };
+                sp + 2.0
+            }
+            ResponseFn::Squareplus => {
+                let v = nan_to_num_scalar(x, nan_replacement);
+                0.5 * (v + (v * v + 4.0).sqrt()) + EPSILON
+            }
+            ResponseFn::SquareplusDf => {
+                let v = nan_to_num_scalar(x, nan_replacement);
+                0.5 * (v + (v * v + 4.0).sqrt()) + EPSILON + 2.0
+            }
+            ResponseFn::Sigmoid => {
+                let v = nan_to_num_scalar(x, nan_replacement);
+                let s = 1.0 / (1.0 + (-v).exp()) + EPSILON;
+                s.clamp(SIGMOID_CLAMP_MIN, SIGMOID_CLAMP_MAX)
+            }
+            ResponseFn::Relu => nan_to_num_scalar(x, nan_replacement).max(0.0) + EPSILON,
+            ResponseFn::ReluDf => nan_to_num_scalar(x, nan_replacement).max(0.0) + EPSILON + 2.0,
         }
     }
 }
@@ -71,12 +152,15 @@ const SIGMOID_CLAMP_MAX: f64 = 1.0 - 1e-3;
 
 /// Replace NaN and infinity values with the mean of the array.
 pub fn nan_to_num(x: &ArrayView1<f64>) -> Array1<f64> {
-    let valid_values: Vec<f64> = x.iter().filter(|v| v.is_finite()).copied().collect();
-    let mean = if valid_values.is_empty() {
-        0.0
-    } else {
-        valid_values.iter().sum::<f64>() / valid_values.len() as f64
-    };
+    // Single-pass mean computation avoids intermediate Vec allocation
+    let (sum, count) = x.iter().fold((0.0, 0usize), |(s, c), &v| {
+        if v.is_finite() {
+            (s + v, c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    let mean = if count == 0 { 0.0 } else { sum / count as f64 };
 
     x.mapv(|v| if v.is_finite() { v } else { mean })
 }
@@ -184,7 +268,7 @@ pub fn softmax_fn_2d(x: &ndarray::ArrayView2<f64>) -> ndarray::Array2<f64> {
 /// # Reference
 /// Jang, E., Gu, Shixiang and Poole, B. "Categorical Reparameterization with Gumbel-Softmax", ICLR, 2017.
 pub fn gumbel_softmax_fn(x: &ArrayView1<f64>, tau: f64, seed: u64) -> Array1<f64> {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -221,24 +305,11 @@ pub fn gumbel_softmax_fn_2d(
 }
 
 // ============================================================================
-// Scalar functions
+// Scalar functions (used by array functions that call nan_to_num separately)
 // ============================================================================
 
-fn identity_scalar(x: f64) -> f64 {
-    nan_to_num_scalar(x, 0.0)
-}
-
-fn exp_scalar(x: f64) -> f64 {
-    nan_to_num_scalar(x, 0.0).exp() + EPSILON
-}
-
-fn exp_scalar_df(x: f64) -> f64 {
-    nan_to_num_scalar(x, 0.0).exp() + EPSILON + 2.0
-}
-
 fn softplus_scalar(x: f64) -> f64 {
-    let x = nan_to_num_scalar(x, 0.0);
-    // Numerically stable softplus
+    // Numerically stable softplus (assumes input already nan-cleaned)
     if x > 20.0 {
         x + EPSILON
     } else if x < -20.0 {
@@ -248,31 +319,9 @@ fn softplus_scalar(x: f64) -> f64 {
     }
 }
 
-fn softplus_scalar_df(x: f64) -> f64 {
-    softplus_scalar(x) + 2.0
-}
-
 fn squareplus_scalar(x: f64) -> f64 {
-    let x = nan_to_num_scalar(x, 0.0);
+    // Assumes input already nan-cleaned
     0.5 * (x + (x * x + 4.0).sqrt()) + EPSILON
-}
-
-fn squareplus_scalar_df(x: f64) -> f64 {
-    squareplus_scalar(x) + 2.0
-}
-
-fn sigmoid_scalar(x: f64) -> f64 {
-    let x = nan_to_num_scalar(x, 0.0);
-    let s = 1.0 / (1.0 + (-x).exp()) + EPSILON;
-    s.clamp(SIGMOID_CLAMP_MIN, SIGMOID_CLAMP_MAX)
-}
-
-fn relu_scalar(x: f64) -> f64 {
-    nan_to_num_scalar(x, 0.0).max(0.0) + EPSILON
-}
-
-fn relu_scalar_df(x: f64) -> f64 {
-    relu_scalar(x) + 2.0
 }
 
 // ============================================================================
@@ -305,6 +354,70 @@ impl ResponseFn {
                     0.0
                 }
             }
+        }
+    }
+
+    /// Compute the second derivative of the response function at x.
+    /// Needed for exact Hessian computation via chain rule:
+    /// d²L/dpred² = (d²L/dθ²)*(dθ/dpred)² + (dL/dθ)*(d²θ/dpred²)
+    pub fn second_derivative(&self, x: f64) -> f64 {
+        match self {
+            ResponseFn::Identity => 0.0,
+            ResponseFn::Exp | ResponseFn::ExpDf => x.exp(),
+            ResponseFn::Softplus | ResponseFn::SoftplusDf => {
+                // d²/dx² softplus(x) = d/dx sigmoid(x) = sigmoid(x)*(1-sigmoid(x))
+                let s = 1.0 / (1.0 + (-x).exp());
+                s * (1.0 - s)
+            }
+            ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
+                // d²/dx² squareplus(x) = 2 / (x² + 4)^(3/2)
+                let denom = (x * x + 4.0).powf(1.5);
+                2.0 / denom
+            }
+            ResponseFn::Sigmoid => {
+                // d²/dx² sigmoid(x) = sigmoid(x)*(1-sigmoid(x))*(1-2*sigmoid(x))
+                let s = 1.0 / (1.0 + (-x).exp());
+                s * (1.0 - s) * (1.0 - 2.0 * s)
+            }
+            ResponseFn::Relu | ResponseFn::ReluDf => 0.0,
+        }
+    }
+
+    /// Compute the derivative for an entire column of predictions.
+    /// Uses mapv which LLVM can auto-vectorize for simple arithmetic.
+    pub fn derivative_batch(&self, x: &ArrayView1<f64>) -> Array1<f64> {
+        match self {
+            ResponseFn::Identity => Array1::ones(x.len()),
+            ResponseFn::Exp | ResponseFn::ExpDf => x.mapv(|v| v.exp()),
+            ResponseFn::Softplus | ResponseFn::SoftplusDf => x.mapv(|v| 1.0 / (1.0 + (-v).exp())),
+            ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
+                x.mapv(|v| 0.5 * (1.0 + v / (v * v + 4.0).sqrt()))
+            }
+            ResponseFn::Sigmoid => x.mapv(|v| {
+                let s = 1.0 / (1.0 + (-v).exp());
+                s * (1.0 - s)
+            }),
+            ResponseFn::Relu | ResponseFn::ReluDf => x.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 }),
+        }
+    }
+
+    /// Compute the second derivative for an entire column of predictions.
+    pub fn second_derivative_batch(&self, x: &ArrayView1<f64>) -> Array1<f64> {
+        match self {
+            ResponseFn::Identity => Array1::zeros(x.len()),
+            ResponseFn::Exp | ResponseFn::ExpDf => x.mapv(|v| v.exp()),
+            ResponseFn::Softplus | ResponseFn::SoftplusDf => x.mapv(|v| {
+                let s = 1.0 / (1.0 + (-v).exp());
+                s * (1.0 - s)
+            }),
+            ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
+                x.mapv(|v| 2.0 / (v * v + 4.0).powf(1.5))
+            }
+            ResponseFn::Sigmoid => x.mapv(|v| {
+                let s = 1.0 / (1.0 + (-v).exp());
+                s * (1.0 - s) * (1.0 - 2.0 * s)
+            }),
+            ResponseFn::Relu | ResponseFn::ReluDf => Array1::zeros(x.len()),
         }
     }
 }
@@ -419,5 +532,51 @@ mod tests {
         let max_low = result_low_temp.iter().cloned().fold(0.0, f64::max);
         let max_high = result_high_temp.iter().cloned().fold(0.0, f64::max);
         assert!(max_low > max_high);
+    }
+
+    #[test]
+    fn test_derivative_batch_matches_scalar() {
+        let x = array![-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let variants = [
+            ResponseFn::Identity,
+            ResponseFn::Exp,
+            ResponseFn::ExpDf,
+            ResponseFn::Softplus,
+            ResponseFn::SoftplusDf,
+            ResponseFn::Squareplus,
+            ResponseFn::SquareplusDf,
+            ResponseFn::Sigmoid,
+            ResponseFn::Relu,
+            ResponseFn::ReluDf,
+        ];
+        for rf in &variants {
+            let batch = rf.derivative_batch(&x.view());
+            for (i, &v) in x.iter().enumerate() {
+                assert_relative_eq!(batch[i], rf.derivative(v), epsilon = 1e-12,);
+            }
+        }
+    }
+
+    #[test]
+    fn test_second_derivative_batch_matches_scalar() {
+        let x = array![-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let variants = [
+            ResponseFn::Identity,
+            ResponseFn::Exp,
+            ResponseFn::ExpDf,
+            ResponseFn::Softplus,
+            ResponseFn::SoftplusDf,
+            ResponseFn::Squareplus,
+            ResponseFn::SquareplusDf,
+            ResponseFn::Sigmoid,
+            ResponseFn::Relu,
+            ResponseFn::ReluDf,
+        ];
+        for rf in &variants {
+            let batch = rf.second_derivative_batch(&x.view());
+            for (i, &v) in x.iter().enumerate() {
+                assert_relative_eq!(batch[i], rf.second_derivative(v), epsilon = 1e-12,);
+            }
+        }
     }
 }
