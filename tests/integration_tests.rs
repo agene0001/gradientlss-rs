@@ -327,6 +327,55 @@ mod xgboost_tests {
     }
 
     #[test]
+    fn test_xgboost_set_weights_via_trait() {
+        // Build a dataset, then attach per-sample weights via the BackendDataset trait.
+        let features = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let labels = array![1.0, 2.0, 3.0, 4.0];
+        let weights = array![0.5, 0.75, 1.0, 1.25];
+
+        let mut ds =
+            <XGBoostBackend as Backend>::Dataset::from_data(features.view(), labels.view())
+                .unwrap();
+        ds.set_weights(weights.view()).expect("weights should set");
+        assert_eq!(ds.num_rows(), 4);
+        assert!(<XGBoostBackend as Backend>::Dataset::supports_weights());
+
+        // Length mismatch must error rather than silently truncating/padding.
+        let bad_weights = array![1.0, 1.0];
+        let result = ds.set_weights(bad_weights.view());
+        assert!(result.is_err(), "mismatched weights length must error");
+    }
+
+    #[test]
+    fn test_xgboost_from_data_with_weights_builder() {
+        // The convenience `from_data_with_weights` builder is the call path most
+        // callers will use; this just sanity-checks that it constructs without
+        // error and the row count is preserved.
+        let features = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let labels = array![1.0, 2.0, 3.0];
+        let weights = array![0.5, 0.75, 1.0];
+
+        let ds = <XGBoostBackend as Backend>::Dataset::from_data_with_weights(
+            features.view(),
+            labels.view(),
+            weights.view(),
+        )
+        .expect("from_data_with_weights should succeed");
+        assert_eq!(ds.num_rows(), 3);
+
+        // Length-mismatched weights must error inside the builder.
+        let bad_weights = array![1.0, 1.0];
+        assert!(
+            <XGBoostBackend as Backend>::Dataset::from_data_with_weights(
+                features.view(),
+                labels.view(),
+                bad_weights.view(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_xgboost_prediction() {
         let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
 

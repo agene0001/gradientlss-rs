@@ -665,6 +665,36 @@ pub trait BackendDataset: Sized {
     /// Set the initial score/base margin.
     fn set_init_score(&mut self, init_score: &Array1<f64>) -> Result<()>;
 
+    /// Set per-sample weights for training. The boosting backend then minimizes the
+    /// weighted loss instead of the uniform one — matching scikit-learn's
+    /// `fit(..., sample_weight=...)` and XGBoost's `DMatrix::set_weights`.
+    ///
+    /// `weights` must have length equal to `num_rows()`. Default implementation
+    /// returns an error so backends opt-in by overriding.
+    fn set_weights(&mut self, _weights: ArrayView1<f64>) -> Result<()> {
+        Err(crate::error::GradientLSSError::BackendError(
+            "set_weights is not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Whether this backend's dataset honours per-sample weights via `set_weights`.
+    /// Callers can use this to decide whether to pass weights or pre-resample data.
+    fn supports_weights() -> bool {
+        false
+    }
+
+    /// Convenience builder: `from_data` followed by `set_weights`. Backends inherit
+    /// this for free once they override `set_weights` / `supports_weights`.
+    fn from_data_with_weights(
+        features: ArrayView2<f64>,
+        labels: ArrayView1<f64>,
+        weights: ArrayView1<f64>,
+    ) -> Result<Self> {
+        let mut ds = Self::from_data(features, labels)?;
+        ds.set_weights(weights)?;
+        Ok(ds)
+    }
+
     /// Get the number of rows.
     fn num_rows(&self) -> usize;
 
