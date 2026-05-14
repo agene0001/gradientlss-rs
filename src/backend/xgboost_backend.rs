@@ -161,6 +161,28 @@ impl BackendDataset for XGBoostDataset {
         Ok(())
     }
 
+    /// Plumb per-sample weights into the underlying DMatrix. Mirrors XGBoost's
+    /// `DMatrix::set_weights` — the booster picks weights up automatically during
+    /// training and rescales gradients/hessians per-sample.
+    fn set_weights(&mut self, weights: ArrayView1<f64>) -> Result<()> {
+        if weights.len() != self.n_rows {
+            return Err(GradientLSSError::BackendError(format!(
+                "set_weights: expected {} weights, got {}",
+                self.n_rows,
+                weights.len()
+            )));
+        }
+        let weights_f32: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
+        self.dmatrix.set_weights(&weights_f32).map_err(|e| {
+            GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn supports_weights() -> bool {
+        true
+    }
+
     fn num_rows(&self) -> usize {
         self.n_rows
     }
