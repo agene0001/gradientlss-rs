@@ -172,6 +172,42 @@ impl BackendDataset for LightGBMDataset {
     fn get_labels(&self) -> Result<Array1<f64>> {
         Ok(self.labels.clone())
     }
+
+    /// Plumb per-sample weights into the underlying `lgbm::Dataset` via the
+    /// `LGBM_DatasetSetField` C API (`Field::<f32>::WEIGHT`). The booster picks
+    /// the weights up automatically during training. Mirrors the XGBoost backend's
+    /// `set_weights` impl.
+    ///
+    /// `dataset` is stored as `Arc<Dataset>` because `lgbm::Booster::new` requires
+    /// `Arc<Dataset>`. We need `&mut Dataset` to call `set_field`, so we go through
+    /// `Arc::get_mut` — that succeeds when the Arc still has a single owner (i.e.
+    /// pre-Booster construction, which is when `from_data_with_weights` invokes
+    /// this). Calling `set_weights` after a Booster has been built will return a
+    /// clear error rather than silently dropping the update.
+    fn set_weights(&mut self, weights: ArrayView1<f64>) -> Result<()> {
+        if weights.len() != self.n_rows {
+            return Err(GradientLSSError::BackendError(format!(
+                "set_weights: expected {} weights, got {}",
+                self.n_rows,
+                weights.len()
+            )));
+        }
+        let weights_f32: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
+        let ds = Arc::get_mut(&mut self.dataset).ok_or_else(|| {
+            GradientLSSError::BackendError(
+                "set_weights: dataset is already shared (e.g. with a Booster); \
+                 call set_weights / from_data_with_weights before training".to_string(),
+            )
+        })?;
+        ds.set_field(Field::<f32>::WEIGHT, &weights_f32).map_err(|e| {
+            GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn supports_weights() -> bool {
+        true
+    }
 }
 
 impl LightGBMDataset {
