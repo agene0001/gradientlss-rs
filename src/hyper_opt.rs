@@ -440,12 +440,17 @@ pub fn hyper_opt_with_config<B: Backend>(
         );
 
         // Report result to optimizers (even for pruned trials)
-        let report_score = if pruned {
+        let mut report_score = if pruned {
             // For pruned trials, use the last intermediate score or infinity
             intermediate_scores.last().copied().unwrap_or(f64::INFINITY)
         } else {
             cv_score
         };
+
+        // Prevent TPE from crashing on NaN values
+        if report_score.is_nan() {
+            report_score = f64::INFINITY;
+        }
 
         for (name, raw_value) in &sampled_params {
             if let Some(optimizer) = optimizers.get_mut(name) {
