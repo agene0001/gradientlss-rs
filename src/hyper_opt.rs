@@ -566,9 +566,29 @@ fn cv_with_pruning<B: Backend>(
             }
         };
 
+        // Validation dataset = the held-out fold. Passing it to `train` enables
+        // the backend's early stopping (`config.early_stopping_rounds`). Without
+        // a validation set XGBoost/LightGBM cannot early-stop, so every fold
+        // runs the full `num_boost_round` even after the model has converged.
+        // Reusing the scoring fold as the early-stopping monitor makes each
+        // trial's score mildly optimistic, but uniformly so across trials — the
+        // TPE ranking (all that matters for HPO) is unaffected.
+        let mut val_data = match B::Dataset::from_data(test_features, test_labels) {
+            Ok(d) => d,
+            Err(_) => {
+                intermediate_scores.push(f64::INFINITY);
+                continue;
+            }
+        };
+
         let mut fold_model = GradientLSS::<B>::new(model.distribution().clone_arc());
         if fold_model
-            .train(&mut train_data, None, params.clone(), config.clone())
+            .train(
+                &mut train_data,
+                Some(&mut val_data),
+                params.clone(),
+                config.clone(),
+            )
             .is_err()
         {
             intermediate_scores.push(f64::INFINITY);
