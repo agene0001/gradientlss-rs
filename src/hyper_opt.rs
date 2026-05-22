@@ -505,6 +505,11 @@ pub fn hyper_opt_with_config<B: Backend>(
 
 /// Cross-validation with pruning support.
 ///
+/// `n_folds >= 2` runs standard k-fold CV. `n_folds <= 1` runs a single 80/20
+/// holdout (train on the first 80% of the data, validate/score on the last
+/// 20%) — one fit, no cross-fold pruning. The holdout mode is much cheaper and
+/// matches a plain train/val split for hyperparameter search.
+///
 /// Returns (final_score, was_pruned, intermediate_scores)
 fn cv_with_pruning<B: Backend>(
     model: &GradientLSS<B>,
@@ -521,16 +526,21 @@ fn cv_with_pruning<B: Backend>(
     use ndarray::{Axis, s};
 
     let n_samples = features.nrows();
-    let fold_size = n_samples / n_folds;
-    let mut intermediate_scores = Vec::with_capacity(n_folds);
+    // `n_folds <= 1` ⇒ single 80/20 holdout (one iteration); otherwise k-fold.
+    let single_holdout = n_folds <= 1;
+    let n_iters = if single_holdout { 1 } else { n_folds };
+    let fold_size = n_samples / n_iters;
+    let mut intermediate_scores = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
-    for i in 0..n_folds {
-        let test_start = i * fold_size;
-        let test_end = if i == n_folds - 1 {
-            n_samples
+    for i in 0..n_iters {
+        let (test_start, test_end) = if single_holdout {
+            // Last 20% is the held-out validation/scoring fold.
+            (((n_samples as f64) * 0.8) as usize, n_samples)
+        } else if i == n_iters - 1 {
+            (i * fold_size, n_samples)
         } else {
-            (i + 1) * fold_size
+            (i * fold_size, (i + 1) * fold_size)
         };
 
         let test_features = features.slice(s![test_start..test_end, ..]);
@@ -612,12 +622,15 @@ fn cv_with_pruning<B: Backend>(
 
         intermediate_scores.push(score);
 
-        // Check if we should prune after this fold
-        let current_avg =
-            intermediate_scores.iter().sum::<f64>() / intermediate_scores.len() as f64;
-        if pruner_state.should_prune(pruning_strategy, i, current_avg, n_completed_trials) {
-            pruned = true;
-            break;
+        // Check if we should prune after this fold. Skipped in single-holdout
+        // mode — there are no further folds to save by pruning.
+        if !single_holdout {
+            let current_avg =
+                intermediate_scores.iter().sum::<f64>() / intermediate_scores.len() as f64;
+            if pruner_state.should_prune(pruning_strategy, i, current_avg, n_completed_trials) {
+                pruned = true;
+                break;
+            }
         }
     }
 
