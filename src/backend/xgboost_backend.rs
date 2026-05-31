@@ -48,6 +48,11 @@ impl Default for XGBoostParams {
     fn default() -> Self {
         let mut inner = HashMap::new();
         inner.insert("booster".to_string(), "gbtree".to_string());
+        // Histogram split-finding — the same algorithm LightGBM uses. Without
+        // this, XGBoost defaults to `auto` (exact/approx greedy), which is ~10x
+        // slower here (esp. for the 2-parameter NegativeBinomial). This is the
+        // single biggest training-speed lever for the XGBoost backend.
+        inner.insert("tree_method".to_string(), "hist".to_string());
         inner.insert("eta".to_string(), "0.1".to_string());
         inner.insert("max_depth".to_string(), "6".to_string());
         inner.insert("base_score".to_string(), "0.0".to_string());
@@ -334,6 +339,33 @@ impl BackendModel for XGBoostModel {
         }
         .map_or((None, None), |(f, r, c, l)| (Some((f, r, c)), Some(l)));
 
+        // Build the validation DMatrix ONCE — its contents and base_margin are
+        // constant across boosting rounds, so rebuilding it every round (as the
+        // old loop did) was pure waste.
+        let valid_dmat: Option<DMatrix> = match &valid_features {
+            Some((vf, vr, _vc)) => {
+                let mut dm = DMatrix::from_dense(vf, *vr).map_err(|e| {
+                    GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
+                })?;
+                if let Some(sv) = start_values {
+                    let mut margin = Vec::with_capacity(*vr * n_params);
+                    for _i in 0..*vr {
+                        for j in 0..n_params {
+                            margin.push(sv[j] as f32);
+                        }
+                    }
+                    dm.set_base_margin(&margin).map_err(|e| {
+                        GradientLSSError::BackendError(format!(
+                            "Failed to set valid base_margin: {}",
+                            e
+                        ))
+                    })?;
+                }
+                Some(dm)
+            }
+            None => None,
+        };
+
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
         let mut rounds_without_improvement = 0;
@@ -388,31 +420,12 @@ impl BackendModel for XGBoostModel {
             let train_loss = metric_fn(&predictions, &labels);
             train_history.push(train_loss);
 
-            // Compute validation loss if validation data is available
-            let valid_loss = if let (Some((vf, vr, _vc)), Some(vl)) =
-                (&valid_features, &valid_labels)
+            // Compute validation loss if validation data is available, reusing
+            // the pre-built validation DMatrix.
+            let valid_loss = if let (Some(vdm), Some((_vf, vr, _vc)), Some(vl)) =
+                (&valid_dmat, &valid_features, &valid_labels)
             {
-                let mut valid_dmat = DMatrix::from_dense(vf, *vr).map_err(|e| {
-                    GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
-                })?;
-
-                // Set base_margin on validation DMatrix too
-                if let Some(sv) = start_values {
-                    let mut margin = Vec::with_capacity(*vr * n_params);
-                    for _i in 0..*vr {
-                        for j in 0..n_params {
-                            margin.push(sv[j] as f32);
-                        }
-                    }
-                    valid_dmat.set_base_margin(&margin).map_err(|e| {
-                        GradientLSSError::BackendError(format!(
-                            "Failed to set valid base_margin: {}",
-                            e
-                        ))
-                    })?;
-                }
-
-                let valid_raw = booster.predict(&valid_dmat).map_err(|e| {
+                let valid_raw = booster.predict(vdm).map_err(|e| {
                     GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
                 })?;
 
