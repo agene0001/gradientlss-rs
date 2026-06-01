@@ -88,11 +88,9 @@ impl Distribution for Poisson {
         match target {
             ResponseData::Univariate(y) => {
                 let rate_col = params.column(0);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
-                    total -= self.log_prob_scalar(&[rate_col[i]], y_val);
-                }
-                total
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    -self.log_prob_scalar(&[rate_col[i]], y[i])
+                })
             }
             ResponseData::Multivariate(_) => panic!("Poisson is a univariate distribution."),
         }

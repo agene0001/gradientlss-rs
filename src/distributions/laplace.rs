@@ -95,11 +95,9 @@ impl Distribution for Laplace {
             ResponseData::Univariate(y) => {
                 let loc_col = params.column(0);
                 let scale_col = params.column(1);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
-                    total -= self.log_prob_scalar(&[loc_col[i], scale_col[i]], y_val);
-                }
-                total
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    -self.log_prob_scalar(&[loc_col[i], scale_col[i]], y[i])
+                })
             }
             ResponseData::Multivariate(_) => panic!("Laplace is a univariate distribution."),
         }

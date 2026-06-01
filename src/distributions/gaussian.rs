@@ -96,18 +96,14 @@ impl Distribution for Gaussian {
             ResponseData::Univariate(y) => {
                 let loc_col = params.column(0);
                 let scale_col = params.column(1);
-                let mut total = 0.0;
                 if params.nrows() == 1 {
                     let p = [loc_col[0], scale_col[0]];
-                    for &y_val in y.iter() {
-                        total -= self.log_prob_scalar(&p, y_val);
-                    }
+                    crate::distributions::util::par_sum(y.len(), |i| -self.log_prob_scalar(&p, y[i]))
                 } else {
-                    for (i, &y_val) in y.iter().enumerate() {
-                        total -= self.log_prob_scalar(&[loc_col[i], scale_col[i]], y_val);
-                    }
+                    crate::distributions::util::par_sum(y.len(), |i| {
+                        -self.log_prob_scalar(&[loc_col[i], scale_col[i]], y[i])
+                    })
                 }
-                total
             }
             ResponseData::Multivariate(_) => panic!("Gaussian is a univariate distribution."),
         }

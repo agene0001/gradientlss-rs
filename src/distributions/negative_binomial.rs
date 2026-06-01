@@ -113,24 +113,9 @@ impl Distribution for NegativeBinomial {
             ResponseData::Univariate(y) => {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
-                let n_samples = y.len();
-
-                // Parallelize the per-sample ln_gamma sum above the same threshold
-                // `analytical_gradients` uses. The metric runs every boosting round
-                // on both train and validation, so the sequential loop was the next
-                // largest per-round cost once the O(rounds²) predict was removed.
-                if n_samples >= 4096 {
-                    (0..n_samples)
-                        .into_par_iter()
-                        .map(|i| -self.log_prob_scalar(&[col0[i], col1[i]], y[i]))
-                        .sum()
-                } else {
-                    let mut total = 0.0;
-                    for (i, &y_val) in y.iter().enumerate() {
-                        total -= self.log_prob_scalar(&[col0[i], col1[i]], y_val);
-                    }
-                    total
-                }
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    -self.log_prob_scalar(&[col0[i], col1[i]], y[i])
+                })
             }
             ResponseData::Multivariate(_) => {
                 panic!("NegativeBinomial is a univariate distribution.")

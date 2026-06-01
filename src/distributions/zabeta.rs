@@ -152,30 +152,10 @@ impl Distribution for ZABeta {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(arr) => {
-                let mut total_nll = 0.0;
-                let n_samples = params.nrows();
-
-                let n_params = self.n_params();
-                let mut params_buf = vec![0.0f64; n_params];
-
-                for i in 0..n_samples {
-                    let row = params.row(i);
-                    let row_params: &[f64] = match row.as_slice() {
-                        Some(s) => s,
-                        None => {
-                            for (k, &v) in row.iter().enumerate() {
-                                params_buf[k] = v;
-                            }
-                            &params_buf[..n_params]
-                        }
-                    };
-                    let target_val = arr[i];
-
-                    let log_prob = self.log_prob(row_params, &[target_val]);
-                    total_nll -= log_prob;
-                }
-
-                total_nll
+                crate::distributions::util::par_sum(params.nrows(), |i| {
+                    let row_vec: Vec<f64> = params.row(i).to_vec();
+                    -self.log_prob(&row_vec, &[arr[i]])
+                })
             }
             ResponseData::Multivariate(_) => {
                 panic!("ZABeta is a univariate distribution")

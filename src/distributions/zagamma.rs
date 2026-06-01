@@ -125,14 +125,14 @@ impl Distribution for ZAGamma {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
                 let col2 = params.column(2);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    let y_val = y[i];
                     if y_val < 0.0 {
-                        return f64::INFINITY;
+                        f64::INFINITY
+                    } else {
+                        -self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y_val)
                     }
-                    total -= self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y_val);
-                }
-                total
+                })
             }
             ResponseData::Multivariate(_) => panic!("ZAGamma is a univariate distribution."),
         }

@@ -109,14 +109,14 @@ impl Distribution for Gamma {
                 // NLL_i = -shape*ln(rate) - (shape-1)*ln(y) + rate*y + ln_gamma(shape)
                 let conc_col = params.column(0);
                 let rate_col = params.column(1);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    let y_val = y[i];
                     if y_val < 0.0 {
-                        return f64::INFINITY;
+                        f64::INFINITY
+                    } else {
+                        -self.log_prob_scalar(&[conc_col[i], rate_col[i]], y_val)
                     }
-                    total -= self.log_prob_scalar(&[conc_col[i], rate_col[i]], y_val);
-                }
-                total
+                })
             }
             ResponseData::Multivariate(_) => panic!("Gamma is a univariate distribution."),
         }

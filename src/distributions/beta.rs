@@ -124,14 +124,14 @@ impl Distribution for Beta {
             ResponseData::Univariate(y) => {
                 let conc1_col = params.column(0);
                 let conc0_col = params.column(1);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    let y_val = y[i];
                     if y_val < 0.0 || y_val > 1.0 {
-                        return f64::INFINITY;
+                        f64::INFINITY
+                    } else {
+                        -self.log_prob_scalar(&[conc1_col[i], conc0_col[i]], y_val)
                     }
-                    total -= self.log_prob_scalar(&[conc1_col[i], conc0_col[i]], y_val);
-                }
-                total
+                })
             }
             ResponseData::Multivariate(_) => panic!("Beta is a univariate distribution."),
         }

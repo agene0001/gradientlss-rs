@@ -111,14 +111,14 @@ impl Distribution for Weibull {
             ResponseData::Univariate(y) => {
                 let scale_col = params.column(0);
                 let conc_col = params.column(1);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    let y_val = y[i];
                     if y_val < 0.0 {
-                        return f64::INFINITY;
+                        f64::INFINITY
+                    } else {
+                        -self.log_prob_scalar(&[scale_col[i], conc_col[i]], y_val)
                     }
-                    total -= self.log_prob_scalar(&[scale_col[i], conc_col[i]], y_val);
-                }
-                total
+                })
             }
             ResponseData::Multivariate(_) => panic!("Weibull is a univariate distribution."),
         }

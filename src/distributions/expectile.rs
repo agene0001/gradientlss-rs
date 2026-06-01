@@ -175,26 +175,19 @@ impl Distribution for Expectile {
                 // Compute batch-level crossing penalty matching Python:
                 //   penalty = torch.mean((~torch.all(torch.diff(predt, dim=1) > 0, dim=1)).float())
                 let penalty = if self.penalize_crossing && self.expectiles.len() > 1 {
-                    let crossing_count: f64 = (0..n_samples)
-                        .map(|i| {
-                            let row_params: Vec<f64> = params.row(i).to_vec();
-                            self.has_crossing(&row_params)
-                        })
-                        .sum();
+                    let crossing_count: f64 = crate::distributions::util::par_sum(n_samples, |i| {
+                        self.has_crossing(&params.row(i).to_vec())
+                    });
                     crossing_count / n_samples as f64
                 } else {
                     0.0
                 };
 
-                let mut total_nll = 0.0;
-                for i in 0..n_samples {
+                crate::distributions::util::par_sum(n_samples, |i| {
                     let row_params: Vec<f64> = params.row(i).to_vec();
-                    let target_val = arr[i];
                     let transformed = self.transform_dist_params(&row_params);
-                    total_nll += self.expectile_loss(&transformed, target_val, penalty);
-                }
-
-                total_nll
+                    self.expectile_loss(&transformed, arr[i], penalty)
+                })
             }
             ResponseData::Multivariate(_) => {
                 panic!("Expectile is a univariate distribution")

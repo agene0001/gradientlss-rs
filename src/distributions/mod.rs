@@ -28,6 +28,7 @@ mod zagamma;
 mod zaln;
 mod zinb;
 mod zipoisson;
+pub(crate) mod util;
 
 pub use base::{Distribution, DistributionParam, GradientsAndHessians, LossFn, Stabilization};
 pub use beta::Beta;

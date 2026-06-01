@@ -123,11 +123,9 @@ impl Distribution for ZINB {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
                 let col2 = params.column(2);
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
-                    total -= self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y_val);
-                }
-                total
+                crate::distributions::util::par_sum(y.len(), |i| {
+                    -self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y[i])
+                })
             }
             ResponseData::Multivariate(_) => panic!("ZINB is a univariate distribution."),
         }
