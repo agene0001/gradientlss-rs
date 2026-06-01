@@ -331,6 +331,18 @@ impl BackendModel for LightGBMModel {
         }
         .map_or((None, None, 0), |(m, l, n)| (Some(m), Some(l), n));
 
+        // Running validation margin, accumulated one iteration at a time (mirrors
+        // `predictions`). Seeded with start_values; zero-sized when there's no
+        // validation set.
+        let mut valid_predictions = Array2::zeros((valid_n_samples, n_params));
+        if let Some(sv) = start_values {
+            for i in 0..valid_n_samples {
+                for j in 0..n_params {
+                    valid_predictions[[i, j]] = sv[j];
+                }
+            }
+        }
+
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
         let mut rounds_without_improvement = 0;
@@ -379,47 +391,36 @@ impl BackendModel for LightGBMModel {
                 break;
             }
 
-            // Get predictions for next iteration using stored features
-            let prediction = booster
-                .predict_for_mat(&train_mat, PredictType::RawScore, 0, None, &pred_params)
+            // Predict ONLY the iteration just added and accumulate into the running
+            // margin. RawScore is additive across trees, so summing each iteration's
+            // contribution equals re-predicting all trees — but at O(n) per round
+            // instead of O(n * trees_so_far), turning the loop from O(rounds^2) to
+            // O(rounds). This matters most for multi-output (num_class>1, e.g. the
+            // NegativeBinomial), where the full re-predict over 2x the trees was the
+            // dominant cost. `predictions` already carries start_values from init, so
+            // we no longer re-add them each round.
+            let delta = booster
+                .predict_for_mat(&train_mat, PredictType::RawScore, round, Some(1), &pred_params)
                 .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-
-            // Update predictions array
-            predictions = prediction_to_array2(&prediction, n_samples, n_params)?;
-
-            // Add start values if provided
-            if let Some(sv) = start_values {
-                for i in 0..n_samples {
-                    for j in 0..n_params {
-                        predictions[[i, j]] += sv[j];
-                    }
-                }
-            }
+            let delta = prediction_to_array2(&delta, n_samples, n_params)?;
+            predictions += &delta;
 
             // Compute training loss
             let train_loss = metric_fn(&predictions, &labels);
             train_history.push(train_loss);
 
-            // Compute validation loss if available
+            // Compute validation loss if available — same per-iteration accumulation
+            // into the running `valid_predictions` margin (carries start_values).
             let valid_loss = if let (Some(vm), Some(vl)) = (&valid_mat, &valid_labels) {
-                let valid_pred = booster
-                    .predict_for_mat(vm, PredictType::RawScore, 0, None, &pred_params)
+                let vdelta = booster
+                    .predict_for_mat(vm, PredictType::RawScore, round, Some(1), &pred_params)
                     .map_err(|e| {
                         GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
                     })?;
+                let vdelta = prediction_to_array2(&vdelta, valid_n_samples, n_params)?;
+                valid_predictions += &vdelta;
 
-                let mut valid_preds = prediction_to_array2(&valid_pred, valid_n_samples, n_params)?;
-
-                // Add start values
-                if let Some(sv) = start_values {
-                    for i in 0..valid_n_samples {
-                        for j in 0..n_params {
-                            valid_preds[[i, j]] += sv[j];
-                        }
-                    }
-                }
-
-                let vl_loss = metric_fn(&valid_preds, vl);
+                let vl_loss = metric_fn(&valid_predictions, vl);
                 valid_history.push(vl_loss);
                 Some(vl_loss)
             } else {
