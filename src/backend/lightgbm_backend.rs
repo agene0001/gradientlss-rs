@@ -708,4 +708,67 @@ mod tests {
         params.set_n_dist_params(3);
         assert_eq!(params.n_dist_params(), 3);
     }
+
+    /// The training loop's speed fix replaces a full re-predict each round with
+    /// summing per-iteration RawScore contributions. This verifies the invariant
+    /// it relies on: `Σ_r predict(start=r, num=1) == predict(start=0, num=all)`,
+    /// for a multi-output (`num_class=2`) booster — i.e. the NegativeBinomial path.
+    #[test]
+    fn test_per_iteration_accumulation_matches_full_predict() {
+        let n = 60usize;
+        let f = 5usize;
+        let num_class = 2usize;
+
+        // Deterministic dummy features + labels.
+        let mut feats = Array2::<f64>::zeros((n, f));
+        for i in 0..n {
+            for j in 0..f {
+                feats[[i, j]] = (((i * 7 + j * 11) % 17) as f64) / 17.0;
+            }
+        }
+        let labels = Array1::from_vec((0..n).map(|i| (i % 4) as f64).collect());
+
+        let ds = LightGBMDataset::from_data(feats.view(), labels.view()).expect("dataset");
+        let mut params = LightGBMParams::default();
+        params.set_n_dist_params(num_class);
+        let mut booster = Booster::new(ds.dataset.clone(), params.inner()).expect("booster");
+
+        // A few rounds with per-sample-varying custom gradients (column-major by
+        // class) so the trees actually split — constant gradients build trivial trees.
+        let rounds = 6usize;
+        for _ in 0..rounds {
+            let mut grad = vec![0f32; n * num_class];
+            let hess = vec![1f32; n * num_class];
+            for c in 0..num_class {
+                for i in 0..n {
+                    grad[c * n + i] = (feats[[i, c % f]] - 0.5) as f32;
+                }
+            }
+            booster
+                .update_one_iter_custom(&grad, &hess)
+                .expect("update_one_iter_custom");
+        }
+
+        let mat = ds.to_mat();
+        let pp = Parameters::new();
+
+        let full = booster
+            .predict_for_mat(&mat, PredictType::RawScore, 0, None, &pp)
+            .expect("full predict");
+        let full = prediction_to_array2(&full, n, num_class).expect("full arr");
+
+        let mut acc = Array2::<f64>::zeros((n, num_class));
+        for r in 0..rounds {
+            let d = booster
+                .predict_for_mat(&mat, PredictType::RawScore, r, Some(1), &pp)
+                .expect("per-iteration predict");
+            acc += &prediction_to_array2(&d, n, num_class).expect("iter arr");
+        }
+
+        let max_diff = (&acc - &full).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff < 1e-4,
+            "per-iteration accumulation diverged from full predict (max abs diff {max_diff})"
+        );
+    }
 }
