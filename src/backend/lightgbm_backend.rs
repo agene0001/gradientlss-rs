@@ -771,4 +771,83 @@ mod tests {
             "per-iteration accumulation diverged from full predict (max abs diff {max_diff})"
         );
     }
+
+    /// Manual benchmark proving the LightGBM per-iteration fix is a real speedup
+    /// (no XGBoost-style regression):
+    /// `cargo test --release --features full --lib lgb_predict_strategy_timing -- --ignored --nocapture`
+    ///
+    /// Strategy A is the OLD loop — full `predict_for_mat(start=0, num=None)` each
+    /// round (re-walks every tree). Strategy B is the shipped fix —
+    /// `predict_for_mat(start=r, num=Some(1))` (the round's tree only). Unlike
+    /// XGBoost's cached `predict()`, `predict_for_mat` runs from scratch on the
+    /// passed `Mat`, so A grows O(rounds) per call (O(rounds²) total) while B stays
+    /// O(1). If B ≪ A, the fix helps and cannot regress.
+    #[test]
+    #[ignore]
+    fn lgb_predict_strategy_timing() {
+        use std::time::{Duration, Instant};
+
+        let n = 12000usize;
+        let f = 60usize;
+        let rounds = 300usize;
+
+        let mut feats = vec![0f32; n * f];
+        for i in 0..n {
+            for j in 0..f {
+                feats[i * f + j] = (((i * 7 + j * 13) % 101) as f32) / 101.0;
+            }
+        }
+        let labels: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let mat = Mat::from_slice(&feats, n, f, lgbm::mat::RowMajor);
+
+        let build_booster = || {
+            let dparams = Parameters::new();
+            let mut dataset = Dataset::from_mat(&mat, None, &dparams).unwrap();
+            dataset.set_field(Field::<f32>::LABEL, &labels).unwrap();
+            let mut bparams = Parameters::new();
+            bparams.push("objective", "regression");
+            bparams.push("boosting", "gbdt");
+            bparams.push("num_leaves", "31");
+            bparams.push("learning_rate", "0.1");
+            bparams.push("verbose", "-1");
+            Booster::new(Arc::new(dataset), &bparams).unwrap()
+        };
+        let pred_params = Parameters::new();
+
+        // Strategy A: full re-predict each round.
+        let mut b_a = build_booster();
+        let mut predict_a = Duration::ZERO;
+        let total_a = Instant::now();
+        for _ in 0..rounds {
+            b_a.update_one_iter().unwrap();
+            let t = Instant::now();
+            let _ = b_a
+                .predict_for_mat(&mat, PredictType::RawScore, 0, None, &pred_params)
+                .unwrap();
+            predict_a += t.elapsed();
+        }
+        let total_a = total_a.elapsed();
+
+        // Strategy B: per-iteration predict (the shipped fix).
+        let mut b_b = build_booster();
+        let mut predict_b = Duration::ZERO;
+        let total_b = Instant::now();
+        for r in 0..rounds {
+            b_b.update_one_iter().unwrap();
+            let t = Instant::now();
+            let _ = b_b
+                .predict_for_mat(&mat, PredictType::RawScore, r, Some(1), &pred_params)
+                .unwrap();
+            predict_b += t.elapsed();
+        }
+        let total_b = total_b.elapsed();
+
+        eprintln!("LGB {rounds} rounds, {n}x{f}:");
+        eprintln!("  A full predict_for_mat(0,None):  predict={predict_a:?}  total={total_a:?}");
+        eprintln!("  B predict_for_mat(r,1) [fix]:    predict={predict_b:?}  total={total_b:?}");
+        eprintln!(
+            "  predict-time ratio A/B = {:.1}x (>1 means the fix is faster)",
+            predict_a.as_secs_f64() / predict_b.as_secs_f64().max(1e-9)
+        );
+    }
 }

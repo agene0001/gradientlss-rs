@@ -707,6 +707,92 @@ mod tests {
         assert_eq!(params.n_dist_params(), 3);
     }
 
+    /// Manual benchmark proving the prediction-cache claim:
+    /// `cargo test --release --features full --lib xgb_predict_cache_timing -- --ignored --nocapture`
+    ///
+    /// Strategy A is the restored loop — `predict()` on the cached train DMatrix
+    /// each round. Strategy B is the reverted-out loop — `predict_matrix(r..r+1)`
+    /// each round. Both build identical trees (`update`); only the per-round
+    /// prediction differs. If XGBoost's prediction cache is real, A's accumulated
+    /// predict time stays ~flat while B's grows with the model, so B ≫ A.
+    #[test]
+    #[ignore]
+    fn xgb_predict_cache_timing() {
+        use std::time::{Duration, Instant};
+        use xgb::{PredictConfig, PredictType};
+
+        let n = 12000usize;
+        let f = 60usize;
+        let rounds = 300usize;
+
+        let mut feats = vec![0f32; n * f];
+        for i in 0..n {
+            for j in 0..f {
+                feats[i * f + j] = (((i * 7 + j * 13) % 101) as f32) / 101.0;
+            }
+        }
+        let labels: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let params = [
+            ("tree_method", "hist"),
+            ("max_depth", "6"),
+            ("eta", "0.1"),
+            ("objective", "reg:squarederror"),
+        ];
+
+        // Strategy A: cached predict().
+        let mut dtrain_a = DMatrix::from_dense(&feats, n).unwrap();
+        dtrain_a.set_labels(&labels).unwrap();
+        let mut b_a =
+            Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&dtrain_a]).unwrap();
+        for (k, v) in params {
+            b_a.set_param(k, v).unwrap();
+        }
+        let mut predict_a = Duration::ZERO;
+        let total_a = Instant::now();
+        for r in 0..rounds {
+            let t = Instant::now();
+            let _ = b_a.predict(&dtrain_a).unwrap();
+            predict_a += t.elapsed();
+            b_a.update(&dtrain_a, r as i32).unwrap();
+        }
+        let total_a = total_a.elapsed();
+
+        // Strategy B: predict_matrix(iteration_begin=r, end=r+1) each round.
+        let mut dtrain_b = DMatrix::from_dense(&feats, n).unwrap();
+        dtrain_b.set_labels(&labels).unwrap();
+        let mut b_b =
+            Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&dtrain_b]).unwrap();
+        for (k, v) in params {
+            b_b.set_param(k, v).unwrap();
+        }
+        let mut predict_b = Duration::ZERO;
+        let total_b = Instant::now();
+        for r in 0..rounds {
+            // Mirror the regressed loop: train the round, THEN predict the
+            // just-added iteration (so iteration_end = r+1 is in range).
+            b_b.update(&dtrain_b, r as i32).unwrap();
+            let cfg = PredictConfig {
+                _type: PredictType::OutputMargin,
+                training: false,
+                iteration_begin: r as i64,
+                iteration_end: r as i64 + 1,
+                strict_shape: false,
+            };
+            let t = Instant::now();
+            let _ = b_b.predict_matrix(&dtrain_b, &cfg.as_json()).unwrap();
+            predict_b += t.elapsed();
+        }
+        let total_b = total_b.elapsed();
+
+        eprintln!("XGB {rounds} rounds, {n}x{f}:");
+        eprintln!("  A predict() cached:        predict={predict_a:?}  total={total_a:?}");
+        eprintln!("  B predict_matrix(r..r+1):  predict={predict_b:?}  total={total_b:?}");
+        eprintln!(
+            "  predict-time ratio B/A = {:.1}x",
+            predict_b.as_secs_f64() / predict_a.as_secs_f64().max(1e-9)
+        );
+    }
+
     #[test]
     fn test_prediction_to_array2() {
         let preds = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
