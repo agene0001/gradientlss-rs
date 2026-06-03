@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use tempfile::NamedTempFile;
 
 use xgb::parameters::BoosterParameters;
-use xgb::{Booster, DMatrix, PredictConfig, PredictType};
+use xgb::{Booster, DMatrix};
 
 // Thread-local storage to pass gradients/hessians to the strict function pointer callback
 thread_local! {
@@ -308,29 +308,9 @@ impl BackendModel for XGBoostModel {
             })?;
         }
 
-        // Create a single booster with num_target matching Python's XGBoostLSS
-        let mut xgb_params = params.to_xgb_params();
-        xgb_params.insert("num_target".to_string(), n_params.to_string());
-
-        let mut booster =
-            Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&train_data.dmatrix])
-                .map_err(|e| {
-                GradientLSSError::BackendError(format!("Failed to create booster: {}", e))
-            })?;
-
-        // Apply all user-specified parameters
-        for (key, value) in &xgb_params {
-            booster.set_param(key, value).map_err(|e| {
-                GradientLSSError::BackendError(format!(
-                    "Failed to set param {}={}: {}",
-                    key, value, e
-                ))
-            })?;
-        }
-
         let labels = train_data.get_labels()?;
 
-        // For validation-based early stopping
+        // For validation-based early stopping.
         let (valid_features, valid_labels) = if let Some(ref vd) = valid_data {
             let vl = vd.get_labels()?;
             Some((vd.features().to_vec(), vd.n_rows, vd.n_cols, vl))
@@ -366,6 +346,35 @@ impl BackendModel for XGBoostModel {
             None => None,
         };
 
+        // Create the booster, caching BOTH the train and (when present) validation
+        // DMatrices. XGBoost keeps an incremental prediction cache for cached
+        // DMatrices and refreshes it inside each TrainOneIter, so `predict()` on
+        // either inside the loop is an O(new-trees) cache read rather than a full
+        // re-prediction — this is what keeps the loop O(rounds), not O(rounds²).
+        // (XGBoost-specific: the LightGBM backend has no such cache, which is why
+        // it accumulates per-iteration margins instead.)
+        let mut xgb_params = params.to_xgb_params();
+        xgb_params.insert("num_target".to_string(), n_params.to_string());
+
+        let cached_dmats: Vec<&DMatrix> = match &valid_dmat {
+            Some(vdm) => vec![&train_data.dmatrix, vdm],
+            None => vec![&train_data.dmatrix],
+        };
+        let mut booster =
+            Booster::new_with_cached_dmats(&BoosterParameters::default(), &cached_dmats).map_err(
+                |e| GradientLSSError::BackendError(format!("Failed to create booster: {}", e)),
+            )?;
+
+        // Apply all user-specified parameters
+        for (key, value) in &xgb_params {
+            booster.set_param(key, value).map_err(|e| {
+                GradientLSSError::BackendError(format!(
+                    "Failed to set param {}={}: {}",
+                    key, value, e
+                ))
+            })?;
+        }
+
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
         let mut rounds_without_improvement = 0;
@@ -378,56 +387,20 @@ impl BackendModel for XGBoostModel {
             cb.on_training_start(config.num_boost_round);
         }
 
-        // ------------------------------------------------------------------
-        // Per-iteration margin accumulation (replaces the O(rounds²) full
-        // re-predict the loop used to do every round). We maintain the current
-        // raw margin incrementally:
-        //   `predictions` = base_margin + Σ_{t<round} tree_t.
-        // XGBoost's per-iteration margin slice (iteration_begin=r, end=r+1)
-        // *includes* base_margin, so we subtract a constant base_margin row from
-        // each slice to isolate that round's tree contribution before folding it
-        // in. The gradient/hessian inputs are then bit-for-bit identical to the
-        // old full-predict path — this is purely a speed optimization.
-        // ------------------------------------------------------------------
-        let base_row: Vec<f64> = match start_values {
-            Some(sv) => (0..n_params).map(|j| sv[j]).collect(),
-            None => vec![0.0; n_params],
-        };
-        let make_base_full = |rows: usize| {
-            let mut a = Array2::<f64>::zeros((rows, n_params));
-            for mut row in a.rows_mut() {
-                for j in 0..n_params {
-                    row[j] = base_row[j];
-                }
-            }
-            a
-        };
-        let base_full = make_base_full(n_samples);
-        let mut predictions = base_full.clone();
-
-        let base_full_valid = valid_features
-            .as_ref()
-            .map(|(_, vr, _)| make_base_full(*vr));
-        let mut valid_predictions = base_full_valid.clone();
-
-        let margin_cfg = |begin: i64, end: i64| {
-            PredictConfig {
-                _type: PredictType::OutputMargin,
-                training: false,
-                iteration_begin: begin,
-                iteration_end: end,
-                strict_shape: false,
-            }
-            .as_json()
-        };
-
         let mut final_round = 0;
 
         for round in 0..config.num_boost_round {
             final_round = round;
 
-            // `predictions` already holds base_margin + trees [0, round) — no
-            // full re-predict needed.
+            // Current margin from trees [0, round). The train DMatrix is cached at
+            // booster creation and XGBoost refreshes its prediction cache inside
+            // the previous TrainOneIter, so this is an O(new-trees) cache read.
+            let raw_preds = booster
+                .predict(&train_data.dmatrix)
+                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
+            let predictions = prediction_to_array2(&raw_preds, n_samples, n_params);
+
+            // Gradients/hessians for all distribution parameters.
             let gh = objective_fn(&predictions, &labels, None)?;
 
             // Flatten gradients/hessians row-major: [g_s0_p0, g_s0_p1, ..., g_s1_p0, ...]
@@ -447,8 +420,7 @@ impl BackendModel for XGBoostModel {
                 *data.borrow_mut() = Some((grad_f32, hess_f32));
             });
 
-            // Training loss reflects trees [0, round) — computed before folding in
-            // this round's tree, matching the previous (pre-update) behavior.
+            // Training loss reflects trees [0, round) (pre-update), matching prior behavior.
             let train_loss = metric_fn(&predictions, &labels);
             train_history.push(train_loss);
 
@@ -457,56 +429,16 @@ impl BackendModel for XGBoostModel {
                 .update_custom(&train_data.dmatrix, round as i32, objective_trampoline)
                 .map_err(|e| GradientLSSError::BackendError(format!("Update failed: {}", e)))?;
 
-            // Fold in only this round's tree contribution (slice − base_margin).
-            let (slice, _shape) = booster
-                .predict_matrix(
-                    &train_data.dmatrix,
-                    &margin_cfg(round as i64, round as i64 + 1),
-                )
-                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-            if slice.len() != n_samples * n_params {
-                return Err(GradientLSSError::BackendError(format!(
-                    "per-iteration margin slice returned {} values, expected {} (n_samples {} × n_params {}); \
-                     incremental accumulation assumes a row-major (n_samples, n_params) layout",
-                    slice.len(),
-                    n_samples * n_params,
-                    n_samples,
-                    n_params
-                )));
-            }
-            let slice = prediction_to_array2(&slice, n_samples, n_params);
-            predictions += &slice;
-            predictions -= &base_full;
-
-            // Validation loss reflects trees [0, round] — accumulate this round's
-            // contribution first, then evaluate (matches the previous post-update
-            // predict on the validation DMatrix).
-            let valid_loss = if let (Some(vdm), Some((_vf, vr, _vc)), Some(vl), Some(vpred), Some(vbase)) = (
-                &valid_dmat,
-                &valid_features,
-                &valid_labels,
-                valid_predictions.as_mut(),
-                base_full_valid.as_ref(),
-            ) {
-                let (vslice, _vs) = booster
-                    .predict_matrix(vdm, &margin_cfg(round as i64, round as i64 + 1))
-                    .map_err(|e| {
-                        GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
-                    })?;
-                if vslice.len() != *vr * n_params {
-                    return Err(GradientLSSError::BackendError(format!(
-                        "valid per-iteration margin slice returned {} values, expected {} ({} × {})",
-                        vslice.len(),
-                        *vr * n_params,
-                        *vr,
-                        n_params
-                    )));
-                }
-                let vslice = prediction_to_array2(&vslice, *vr, n_params);
-                *vpred += &vslice;
-                *vpred -= vbase;
-
-                let vl_loss = metric_fn(&*vpred, vl);
+            // Validation loss (post-update → trees [0, round]). The validation
+            // DMatrix is also cached, so this is likewise a cache read.
+            let valid_loss = if let (Some(vdm), Some((_vf, vr, _vc)), Some(vl)) =
+                (&valid_dmat, &valid_features, &valid_labels)
+            {
+                let valid_raw = booster.predict(vdm).map_err(|e| {
+                    GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
+                })?;
+                let valid_preds = prediction_to_array2(&valid_raw, *vr, n_params);
+                let vl_loss = metric_fn(&valid_preds, vl);
                 valid_history.push(vl_loss);
                 Some(vl_loss)
             } else {
@@ -787,112 +719,4 @@ mod tests {
         assert_eq!(result[[2, 1]], 6.0);
     }
 
-    /// Build a small multi-output booster trained with custom gradients, exactly
-    /// like the training loop. Returns (booster, dmatrix, n, n_params) for the
-    /// iteration-semantics tests below.
-    fn train_dummy_booster(
-        with_base_margin: bool,
-        n_params: usize,
-    ) -> (Booster, DMatrix, usize, usize, usize) {
-        let n = 50usize;
-        let f = 4usize;
-        let rounds = 5usize;
-
-        let mut feats = vec![0f32; n * f];
-        for i in 0..n {
-            for j in 0..f {
-                feats[i * f + j] = (((i * 7 + j * 11) % 17) as f32) / 17.0;
-            }
-        }
-        let mut dmat = DMatrix::from_dense(&feats, n).unwrap();
-        let labels: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect();
-        dmat.set_labels(&labels).unwrap();
-        if with_base_margin {
-            // Distinct constant per param so a double-count is obvious.
-            let per_param = [0.5f32, -0.3f32];
-            let bm: Vec<f32> = (0..n)
-                .flat_map(|_| (0..n_params).map(|j| per_param[j % 2]).collect::<Vec<_>>())
-                .collect();
-            dmat.set_base_margin(&bm).unwrap();
-        }
-
-        let mut params = XGBoostParams::default();
-        params.set_n_dist_params(n_params);
-        let mut xgb_params = params.to_xgb_params();
-        xgb_params.insert("num_target".to_string(), n_params.to_string());
-
-        let mut booster =
-            Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&dmat]).unwrap();
-        for (k, v) in &xgb_params {
-            booster.set_param(k, v).unwrap();
-        }
-
-        for r in 0..rounds {
-            // Per-sample-varying gradients so the trees actually split.
-            let mut g = vec![0f32; n * n_params];
-            let h = vec![1f32; n * n_params];
-            for i in 0..n {
-                for j in 0..n_params {
-                    g[i * n_params + j] = feats[i * f + (j % f)] - 0.5;
-                }
-            }
-            OBJECTIVE_DATA.with(|d| *d.borrow_mut() = Some((g, h)));
-            booster
-                .update_custom(&dmat, r as i32, objective_trampoline)
-                .unwrap();
-        }
-
-        (booster, dmat, n, n_params, rounds)
-    }
-
-    fn margin_slice(booster: &Booster, dmat: &DMatrix, begin: i64, end: i64) -> Vec<f32> {
-        use xgb::{PredictConfig, PredictType};
-        let cfg = PredictConfig {
-            _type: PredictType::OutputMargin,
-            training: false,
-            iteration_begin: begin,
-            iteration_end: end,
-            strict_shape: false,
-        };
-        booster.predict_matrix(dmat, &cfg.as_json()).unwrap().0
-    }
-
-    /// Verifies the training loop's O(rounds²) → O(rounds) fix: starting from
-    /// `base_margin` and folding in each round's `(slice − base_margin)` exactly
-    /// reconstructs the full booster margin. Covers both the no-base-margin path
-    /// and the base-margin path (where each per-iteration slice re-adds the base,
-    /// which the subtraction cancels). The per-column arithmetic is identical for
-    /// `num_target>1`, so a single-output booster is sufficient — and avoids the
-    /// 2-D custom-gradient shape constraint that only the full `train()` path sets up.
-    #[test]
-    fn test_per_iteration_margin_accumulation_matches_full() {
-        for &bm in &[false, true] {
-            let (booster, dmat, n, n_params, rounds) = train_dummy_booster(bm, 1);
-
-            let full =
-                prediction_to_array2(&booster.predict_margin(&dmat).unwrap(), n, n_params);
-
-            // Base margin row used by the fix (param 0 == 0.5 when base_margin is set).
-            let base_val = if bm { 0.5f64 } else { 0.0 };
-            let base_full = Array2::<f64>::from_elem((n, n_params), base_val);
-
-            // Replicate exactly what the training loop does.
-            let mut predictions = base_full.clone();
-            for r in 0..rounds {
-                let slice = prediction_to_array2(
-                    &margin_slice(&booster, &dmat, r as i64, (r + 1) as i64),
-                    n,
-                    n_params,
-                );
-                predictions += &slice;
-                predictions -= &base_full;
-            }
-
-            let max_diff = (&predictions - &full).iter().fold(0f64, |m, &x| m.max(x.abs()));
-            assert!(
-                max_diff < 1e-4,
-                "with_base_margin={bm}: per-iteration accumulation diverged from full margin (max abs diff {max_diff})"
-            );
-        }
-    }
 }
