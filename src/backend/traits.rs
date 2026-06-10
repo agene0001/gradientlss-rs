@@ -31,6 +31,35 @@ impl Default for TrainConfig {
     }
 }
 
+/// Default relative improvement an iteration must beat the running best by to
+/// reset the built-in early-stopping patience counter. 1e-4 ⇒ 0.01% of the
+/// current best's magnitude.
+pub(crate) const EARLY_STOP_REL_DELTA: f64 = 1e-4;
+
+/// Whether `eval_loss` is a *meaningful* improvement over `best_loss` — i.e. it
+/// beats it by at least `rel_delta` of the current best's magnitude.
+///
+/// The built-in `early_stopping_rounds` loops monitor the distribution NLL,
+/// which `Distribution::nll` returns as a SUM over samples — so its magnitude
+/// scales with fold size and distribution (a NegBinom fold is easily in the
+/// hundreds–thousands). An *absolute* tolerance (like
+/// `EarlyStoppingCallback::min_delta`) is therefore unusable here, so this is
+/// relative and hence scale-free. A noisy sub-`rel_delta` tick (e.g. a 1e-9
+/// wiggle on a 2000-NLL fold) no longer resets the patience counter, so
+/// slow-converging fits — chiefly the 2-parameter NegativeBinomial — actually
+/// early-stop instead of riding noise out to `num_boost_round`.
+///
+/// The first finite loss always counts as an improvement: it beats the
+/// `f64::INFINITY` seed, and `INFINITY - rel_delta * INFINITY` is `NaN`, so the
+/// finiteness branch is handled explicitly rather than by the subtraction.
+pub(crate) fn is_significant_improvement(eval_loss: f64, best_loss: f64, rel_delta: f64) -> bool {
+    if best_loss.is_finite() {
+        eval_loss < best_loss - rel_delta * best_loss.abs()
+    } else {
+        eval_loss.is_finite()
+    }
+}
+
 /// Training result containing metadata about the training run.
 #[derive(Debug, Clone)]
 pub struct TrainingResult {
