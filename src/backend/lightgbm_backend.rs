@@ -5,8 +5,9 @@
 //! LightGBM natively supports multi-output, so we use a single booster with num_class.
 
 use super::traits::{
-    Backend, BackendDataset, BackendModel, BackendParams, CallbackAction, FeatureImportance,
-    FeatureImportanceType, ParamValue, TrainConfig, TrainingCallback, TrainingResult,
+    Backend, BackendDataset, BackendModel, BackendParams, CallbackAction, EARLY_STOP_REL_DELTA,
+    FeatureImportance, FeatureImportanceType, ParamValue, TrainConfig, TrainingCallback,
+    TrainingResult, is_significant_improvement,
 };
 use crate::distributions::GradientsAndHessians;
 use crate::error::{GradientLSSError, Result};
@@ -448,25 +449,27 @@ impl BackendModel for LightGBMModel {
                 }
             }
 
-            // Built-in early stopping
-            if let Some(early_stopping) = config.early_stopping_rounds {
-                if eval_loss < best_loss {
-                    best_loss = eval_loss;
-                    best_iteration = round;
-                    rounds_without_improvement = 0;
-                } else {
-                    rounds_without_improvement += 1;
-                    if rounds_without_improvement >= early_stopping {
-                        if config.verbose {
-                            println!("Early stopping at round {}", round);
-                        }
-                        stopped_early = true;
-                        break;
-                    }
-                }
-            } else if eval_loss < best_loss {
+            // Built-in early stopping. Count this round as progress only if it
+            // beats the best by a relative margin (see `is_significant_improvement`).
+            // Without the min-delta, a noisy sub-1e-4 NLL tick reset the patience
+            // counter every round, so NegBinom fits rode `num_boost_round` to the
+            // end instead of early-stopping.
+            if is_significant_improvement(eval_loss, best_loss, EARLY_STOP_REL_DELTA) {
                 best_loss = eval_loss;
                 best_iteration = round;
+                rounds_without_improvement = 0;
+            } else {
+                rounds_without_improvement += 1;
+            }
+
+            if let Some(early_stopping) = config.early_stopping_rounds {
+                if rounds_without_improvement >= early_stopping {
+                    if config.verbose {
+                        println!("Early stopping at round {}", round);
+                    }
+                    stopped_early = true;
+                    break;
+                }
             }
         }
 
