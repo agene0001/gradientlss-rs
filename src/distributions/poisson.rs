@@ -7,6 +7,7 @@ use ndarray::{Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Poisson as RandPoisson};
+use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::ln_gamma;
@@ -45,9 +46,15 @@ impl Poisson {
         if rate <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        let k = target as u64;
+        // Use the target as-is rather than truncating to u64. The lgamma-based
+        // ln_pmf is well-defined for non-integer counts, and truncating silently
+        // mapped negatives to 0; counts outside the support are -inf.
+        let k = target;
+        if !k.is_finite() || k < 0.0 {
+            return f64::NEG_INFINITY;
+        }
         // ln_pmf = -λ + k*ln(λ) - ln(k!) = -λ + k*ln(λ) - ln_gamma(k+1)
-        -rate + (k as f64) * rate.ln() - ln_gamma(k as f64 + 1.0)
+        -rate + k * rate.ln() - ln_gamma(k + 1.0)
     }
 }
 
@@ -123,28 +130,65 @@ impl Distribution for Poisson {
         };
 
         let n_samples = predictions.nrows();
-        let mut gradients = Array2::zeros((n_samples, 1));
-        let mut hessians = Array2::zeros((n_samples, 1));
-
         let rate_response_fn = &self.params[0].response_fn;
 
-        for i in 0..n_samples {
-            let lambda = transformed[[i, 0]].max(1e-6);
+        let t_rate = transformed.column(0);
+        let p_rate = predictions.column(0);
+
+        // Batch response-fn derivatives (auto-vectorized), shared by both paths.
+        let rd = rate_response_fn.derivative_batch(&p_rate);
+        let rsd = rate_response_fn.second_derivative_batch(&p_rate);
+
+        let compute = |i: usize| -> (f64, f64) {
+            let lambda = t_rate[i].max(1e-6);
             let k = y[i];
 
             if !k.is_finite() || k < 0.0 {
-                hessians[[i, 0]] = 1e-6;
-                continue;
+                return (0.0, 1e-6);
             }
 
             let grad_lambda = 1.0 - k / lambda;
             let hess_lambda = k / (lambda * lambda);
 
-            let pred = predictions[[i, 0]];
-            let rd = rate_response_fn.derivative(pred);
-            let rsd = rate_response_fn.second_derivative(pred);
-            gradients[[i, 0]] = grad_lambda * rd;
-            hessians[[i, 0]] = (hess_lambda * rd * rd + grad_lambda * rsd).max(1e-6);
+            let d = rd[i];
+            let sd = rsd[i];
+            let g = grad_lambda * d;
+            let h = (hess_lambda * d * d + grad_lambda * sd).max(1e-6);
+            (g, h)
+        };
+
+        let mut gradients = Array2::zeros((n_samples, 1));
+        let mut hessians = Array2::zeros((n_samples, 1));
+        // Single param → one element per sample; write straight into the backing
+        // slices. Threshold matches the numerical path (256).
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+
+        const PAR_MIN: usize = 256;
+        if n_samples >= PAR_MIN {
+            g_slice
+                .par_iter_mut()
+                .zip(h_slice.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (g, h))| {
+                    let (gv, hv) = compute(i);
+                    *g = gv;
+                    *h = hv;
+                });
+        } else {
+            g_slice
+                .iter_mut()
+                .zip(h_slice.iter_mut())
+                .enumerate()
+                .for_each(|(i, (g, h))| {
+                    let (gv, hv) = compute(i);
+                    *g = gv;
+                    *h = hv;
+                });
         }
 
         Some((gradients, hessians))

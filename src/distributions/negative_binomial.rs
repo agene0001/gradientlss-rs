@@ -13,6 +13,37 @@ use statrs::function::gamma::{digamma, ln_gamma};
 
 use crate::constants::trigamma;
 
+/// For the `total_count` (r) gradient/hessian the NB NLL needs
+/// `digamma(r+k) - digamma(r)` and `trigamma(r+k) - trigamma(r)`. For integer k
+/// these collapse to finite rational sums, ~2x cheaper than two special-function
+/// evaluations each:
+///   digamma(r+k)  - digamma(r)  =  Σ_{j=0}^{k-1} 1/(r+j)
+///   trigamma(r+k) - trigamma(r) = -Σ_{j=0}^{k-1} 1/(r+j)²
+///
+/// Returns the pair actually used below — `(-digamma(r+k)+digamma(r),
+/// -trigamma(r+k)+trigamma(r))` = `(-Σ1/(r+j), Σ1/(r+j)²)` — so `hess_r` is
+/// nonnegative by construction. Falls back to `None` for non-integer or large k,
+/// where the loop would lose its edge over the asymptotic special functions.
+///
+/// Shared with the Zero-Inflated NB (`ZINB`), whose positive-count branch has the
+/// same NB `total_count` gradient/hessian.
+#[inline]
+pub(crate) fn nb_psi_diff(r: f64, k: f64) -> Option<(f64, f64)> {
+    if k >= 0.0 && k <= 64.0 && k == k.trunc() {
+        let kk = k as u32;
+        let mut s1 = 0.0;
+        let mut s2 = 0.0;
+        for j in 0..kk {
+            let inv = 1.0 / (r + j as f64);
+            s1 += inv;
+            s2 += inv * inv;
+        }
+        Some((-s1, s2))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegativeBinomial {
     params: Vec<DistributionParam>,
@@ -60,7 +91,15 @@ impl NegativeBinomial {
             return f64::NEG_INFINITY;
         }
 
-        let k = target as u64 as f64;
+        // Use the target as-is rather than truncating to u64. PyTorch's NB
+        // log_prob is lgamma-based and well-defined for non-integer counts, and
+        // the analytical-gradient path already uses the raw target — truncating
+        // here made the early-stopping NLL disagree with the training gradient.
+        // Negative or non-finite counts are outside the support → -inf.
+        let k = target;
+        if !k.is_finite() || k < 0.0 {
+            return f64::NEG_INFINITY;
+        }
         // PyTorch NB uses probs = P(success/counted event), mean = r*p/(1-p)
         // statrs NB uses p = P(success/stopping event), mean = r*(1-p)/p
         // They are complementary: statrs_p = 1 - probs
@@ -160,88 +199,85 @@ impl Distribution for NegativeBinomial {
         let p_r = predictions.column(0);
         let p_probs = predictions.column(1);
 
+        // Batch response-fn derivatives (auto-vectorized); shared by the
+        // sequential and parallel paths so we no longer branch on the per-sample
+        // scalar derivative calls.
+        let rd_r = r_response_fn.derivative_batch(&p_r);
+        let rsd_r = r_response_fn.second_derivative_batch(&p_r);
+        let rd_p = probs_response_fn.derivative_batch(&p_probs);
+        let rsd_p = probs_response_fn.second_derivative_batch(&p_probs);
+
+        // Per-sample (grad_r, hess_r, grad_probs, hess_probs) in prediction space.
+        let compute = |i: usize| -> (f64, f64, f64, f64) {
+            let r = t_r[i].max(1e-6);
+            let probs = t_probs[i].clamp(1e-6, 1.0 - 1e-6);
+            let k = y[i];
+
+            if !k.is_finite() || k < 0.0 {
+                return (0.0, 1e-6, 0.0, 1e-6);
+            }
+
+            let one_minus_probs = 1.0 - probs;
+
+            // r-parameter digamma/trigamma differences: exact rational sums for
+            // integer k, else the asymptotic special functions.
+            let (grad_r_psi, hess_r) = nb_psi_diff(r, k)
+                .unwrap_or_else(|| (-digamma(r + k) + digamma(r), -trigamma(r + k) + trigamma(r)));
+            let grad_r = grad_r_psi - one_minus_probs.ln();
+            let grad_probs = r / one_minus_probs - k / probs;
+            let hess_probs = r / (one_minus_probs * one_minus_probs) + k / (probs * probs);
+
+            let r0 = rd_r[i];
+            let rs0 = rsd_r[i];
+            let g0 = grad_r * r0;
+            let h0 = (hess_r * r0 * r0 + grad_r * rs0).max(1e-6);
+
+            let r1 = rd_p[i];
+            let rs1 = rsd_p[i];
+            let g1 = grad_probs * r1;
+            let h1 = (hess_probs * r1 * r1 + grad_probs * rs1).max(1e-6);
+
+            (g0, h0, g1, h1)
+        };
+
         let mut gradients = Array2::zeros((n_samples, 2));
         let mut hessians = Array2::zeros((n_samples, 2));
+        // C-order rows are [param0, param1] per sample, so write straight into
+        // the contiguous backing slices — no intermediate Vec of tuples.
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
 
-        if n_samples >= 4096 {
-            // Pre-compute batch derivatives for both parameters
-            let rd_r = r_response_fn.derivative_batch(&p_r);
-            let rsd_r = r_response_fn.second_derivative_batch(&p_r);
-            let rd_p = probs_response_fn.derivative_batch(&p_probs);
-            let rsd_p = probs_response_fn.second_derivative_batch(&p_probs);
-
-            let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
-                let r = t_r[i].max(1e-6);
-                let probs = t_probs[i].clamp(1e-6, 1.0 - 1e-6);
-                let k = y[i];
-
-                if !k.is_finite() || k < 0.0 {
-                    return (0.0, 1e-6, 0.0, 1e-6);
-                }
-
-                let one_minus_probs = 1.0 - probs;
-
-                let grad_r = -digamma(r + k) + digamma(r) - one_minus_probs.ln();
-                let hess_r = -trigamma(r + k) + trigamma(r);
-                let grad_probs = r / one_minus_probs - k / probs;
-                let hess_probs = r / (one_minus_probs * one_minus_probs) + k / (probs * probs);
-
-                let r0 = rd_r[i];
-                let rs0 = rsd_r[i];
-                let g0 = grad_r * r0;
-                let h0 = (hess_r * r0 * r0 + grad_r * rs0).max(1e-6);
-
-                let r1 = rd_p[i];
-                let rs1 = rsd_p[i];
-                let g1 = grad_probs * r1;
-                let h1 = (hess_probs * r1 * r1 + grad_probs * rs1).max(1e-6);
-
-                (g0, h0, g1, h1)
-            };
-
-            let results: Vec<_> = (0..n_samples).into_par_iter().map(compute_sample).collect();
-            for (i, (g0, h0, g1, h1)) in results.into_iter().enumerate() {
-                gradients[[i, 0]] = g0;
-                hessians[[i, 0]] = h0;
-                gradients[[i, 1]] = g1;
-                hessians[[i, 1]] = h1;
-            }
+        // Threshold matches the numerical path (256): the per-sample work here
+        // (digamma / short rational sums) amortizes rayon at the same size.
+        const PAR_MIN: usize = 256;
+        if n_samples >= PAR_MIN {
+            g_slice
+                .par_chunks_mut(2)
+                .zip(h_slice.par_chunks_mut(2))
+                .enumerate()
+                .for_each(|(i, (gc, hc))| {
+                    let (g0, h0, g1, h1) = compute(i);
+                    gc[0] = g0;
+                    gc[1] = g1;
+                    hc[0] = h0;
+                    hc[1] = h1;
+                });
         } else {
-            for i in 0..n_samples {
-                let r = t_r[i].max(1e-6);
-                let probs = t_probs[i].clamp(1e-6, 1.0 - 1e-6);
-                let k = y[i];
-
-                if !k.is_finite() || k < 0.0 {
-                    gradients[[i, 0]] = 0.0;
-                    hessians[[i, 0]] = 1e-6;
-                    gradients[[i, 1]] = 0.0;
-                    hessians[[i, 1]] = 1e-6;
-                    continue;
-                }
-
-                let one_minus_probs = 1.0 - probs;
-
-                let grad_r = -digamma(r + k) + digamma(r) - one_minus_probs.ln();
-                let hess_r = -trigamma(r + k) + trigamma(r);
-                let grad_probs = r / one_minus_probs - k / probs;
-                let hess_probs = r / (one_minus_probs * one_minus_probs) + k / (probs * probs);
-
-                let r0 = r_response_fn.derivative(p_r[i]);
-                let rs0 = r_response_fn.second_derivative(p_r[i]);
-                let g0 = grad_r * r0;
-                let h0 = (hess_r * r0 * r0 + grad_r * rs0).max(1e-6);
-
-                let r1 = probs_response_fn.derivative(p_probs[i]);
-                let rs1 = probs_response_fn.second_derivative(p_probs[i]);
-                let g1 = grad_probs * r1;
-                let h1 = (hess_probs * r1 * r1 + grad_probs * rs1).max(1e-6);
-
-                gradients[[i, 0]] = g0;
-                hessians[[i, 0]] = h0;
-                gradients[[i, 1]] = g1;
-                hessians[[i, 1]] = h1;
-            }
+            g_slice
+                .chunks_mut(2)
+                .zip(h_slice.chunks_mut(2))
+                .enumerate()
+                .for_each(|(i, (gc, hc))| {
+                    let (g0, h0, g1, h1) = compute(i);
+                    gc[0] = g0;
+                    gc[1] = g1;
+                    hc[0] = h0;
+                    hc[1] = h1;
+                });
         }
 
         Some((gradients, hessians))
@@ -249,27 +285,40 @@ impl Distribution for NegativeBinomial {
 
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64> {
         let n_obs = params.nrows();
-        let mut result = Array2::zeros((n_samples, n_obs));
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        for j in 0..n_obs {
-            let total_count = params[[j, 0]];
-            let probs = params[[j, 1]];
+        // Sample each observation's column independently in parallel. Each column
+        // gets its own ChaCha stream seeded from `seed + j`, so results are
+        // deterministic and independent of how rayon schedules the observations
+        // (the previous single shared RNG forced a sequential pass).
+        let cols: Vec<Vec<f64>> = (0..n_obs)
+            .into_par_iter()
+            .map(|j| {
+                let total_count = params[[j, 0]];
+                let probs = params[[j, 1]];
+                let mut col = vec![0.0; n_samples];
 
-            if total_count > 0.0 && probs > 0.0 && probs < 1.0 {
-                // NegativeBinomial as Gamma-Poisson mixture
-                // rand_distr::Gamma takes (shape, scale), where scale = 1/rate
-                // For NB(total_count, probs): Gamma(shape=total_count, scale=probs/(1-probs))
-                let scale = probs / (1.0 - probs);
-                if let Ok(gamma_dist) = RandGamma::new(total_count, scale) {
-                    for i in 0..n_samples {
-                        let lambda: f64 = gamma_dist.sample(&mut rng);
-                        if let Ok(poisson_dist) = RandPoisson::new(lambda) {
-                            result[[i, j]] = poisson_dist.sample(&mut rng) as f64;
+                if total_count > 0.0 && probs > 0.0 && probs < 1.0 {
+                    // NegativeBinomial as Gamma-Poisson mixture.
+                    // rand_distr::Gamma takes (shape, scale), where scale = 1/rate.
+                    // For NB(total_count, probs): Gamma(total_count, probs/(1-probs)).
+                    let scale = probs / (1.0 - probs);
+                    if let Ok(gamma_dist) = RandGamma::new(total_count, scale) {
+                        let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(j as u64));
+                        for v in col.iter_mut() {
+                            let lambda: f64 = gamma_dist.sample(&mut rng);
+                            if let Ok(poisson_dist) = RandPoisson::new(lambda) {
+                                *v = poisson_dist.sample(&mut rng) as f64;
+                            }
                         }
                     }
                 }
-            }
+                col
+            })
+            .collect();
+
+        let mut result = Array2::zeros((n_samples, n_obs));
+        for (j, col) in cols.into_iter().enumerate() {
+            result.column_mut(j).assign(&ndarray::Array1::from(col));
         }
         result
     }
