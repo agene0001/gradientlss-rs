@@ -174,7 +174,7 @@ impl Distribution for Gamma {
                 let yi = y[i];
 
                 if yi <= 0.0 || !yi.is_finite() {
-                    return (0.0, 1e-6, 0.0, 1e-6);
+                    return (0.0, 0.0, 0.0, 0.0);
                 }
 
                 let ln_y = yi.ln();
@@ -188,12 +188,12 @@ impl Distribution for Gamma {
                 let rd0 = rd_conc[i];
                 let rsd0 = rsd_conc[i];
                 let g0 = grad_alpha * rd0;
-                let h0 = (hess_alpha * rd0 * rd0 + grad_alpha * rsd0).max(1e-6);
+                let h0 = hess_alpha * rd0 * rd0 + grad_alpha * rsd0;
 
                 let rd1 = rd_rate[i];
                 let rsd1 = rsd_rate[i];
                 let g1 = grad_beta * rd1;
-                let h1 = (hess_beta * rd1 * rd1 + grad_beta * rsd1).max(1e-6);
+                let h1 = hess_beta * rd1 * rd1 + grad_beta * rsd1;
 
                 (g0, h0, g1, h1)
             };
@@ -230,12 +230,12 @@ impl Distribution for Gamma {
                 let rd0 = conc_response_fn.derivative(p_conc[i]);
                 let rsd0 = conc_response_fn.second_derivative(p_conc[i]);
                 let g0 = grad_alpha * rd0;
-                let h0 = (hess_alpha * rd0 * rd0 + grad_alpha * rsd0).max(1e-6);
+                let h0 = hess_alpha * rd0 * rd0 + grad_alpha * rsd0;
 
                 let rd1 = rate_response_fn.derivative(p_rate[i]);
                 let rsd1 = rate_response_fn.second_derivative(p_rate[i]);
                 let g1 = grad_beta * rd1;
-                let h1 = (hess_beta * rd1 * rd1 + grad_beta * rsd1).max(1e-6);
+                let h1 = hess_beta * rd1 * rd1 + grad_beta * rsd1;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

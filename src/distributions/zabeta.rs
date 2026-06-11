@@ -76,9 +76,9 @@ impl ZABeta {
 
         // Clamp value away from boundaries for continuous distributions (matches Python's epsilon clamp)
         let clamped_target = if target <= 0.0 {
-            f64::EPSILON
+            crate::constants::ZERO_CLAMP_EPS
         } else if target >= 1.0 {
-            1.0 - f64::EPSILON
+            1.0 - crate::constants::ZERO_CLAMP_EPS
         } else {
             target
         };

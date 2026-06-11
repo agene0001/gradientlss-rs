@@ -24,6 +24,16 @@ pub const LOG_SQRT_2PI: f64 = 0.9189385332046727;
 /// 1 / π ≈ 0.3183098861837907
 pub const INV_PI: f64 = 0.3183098861837907;
 
+/// Epsilon used by the zero-adjusted (ZA*) distributions to clamp zero targets
+/// before evaluating the continuous base density.
+///
+/// Python's `ZeroInflatedDistribution.log_prob` clamps with
+/// `torch.finfo(value.dtype).eps`, and targets arrive as float32 from
+/// xgboost/lightgbm — i.e. ~1.1920929e-7, NOT f64 machine epsilon. Using
+/// `f64::EPSILON` (2.2e-16) shifted the clamped log-density by many nats for
+/// e.g. Gamma with concentration < 1, diverging from the Python fits.
+pub(crate) const ZERO_CLAMP_EPS: f64 = f32::EPSILON as f64;
+
 /// Trigamma function: ψ₁(x) = d²/dx² ln(Γ(x)) = d/dx ψ(x)
 ///
 /// Uses the recurrence ψ₁(x) = ψ₁(x+1) + 1/x² to shift x >= 6,

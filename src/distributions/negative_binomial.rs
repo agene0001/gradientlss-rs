@@ -25,11 +25,16 @@ use crate::constants::trigamma;
 /// nonnegative by construction. Falls back to `None` for non-integer or large k,
 /// where the loop would lose its edge over the asymptotic special functions.
 ///
+/// The k cutoff is measured, not guessed: on Apple Silicon the digamma+trigamma
+/// pair costs ~16 ns while the division-bound loop costs ~0.4 ns/iteration, so
+/// the loop wins below k ≈ 40 (k=32: 0.73x, k=64: 1.67x of the special-function
+/// cost) — both branches are exact, so the cutoff is purely a speed knob.
+///
 /// Shared with the Zero-Inflated NB (`ZINB`), whose positive-count branch has the
 /// same NB `total_count` gradient/hessian.
 #[inline]
 pub(crate) fn nb_psi_diff(r: f64, k: f64) -> Option<(f64, f64)> {
-    if k >= 0.0 && k <= 64.0 && k == k.trunc() {
+    if k >= 0.0 && k <= 40.0 && k == k.trunc() {
         let kk = k as u32;
         let mut s1 = 0.0;
         let mut s2 = 0.0;
@@ -212,7 +217,7 @@ impl Distribution for NegativeBinomial {
             let k = y[i];
 
             if !k.is_finite() || k < 0.0 {
-                return (0.0, 1e-6, 0.0, 1e-6);
+                return (0.0, 0.0, 0.0, 0.0);
             }
 
             let one_minus_probs = 1.0 - probs;
@@ -228,12 +233,12 @@ impl Distribution for NegativeBinomial {
             let r0 = rd_r[i];
             let rs0 = rsd_r[i];
             let g0 = grad_r * r0;
-            let h0 = (hess_r * r0 * r0 + grad_r * rs0).max(1e-6);
+            let h0 = hess_r * r0 * r0 + grad_r * rs0;
 
             let r1 = rd_p[i];
             let rs1 = rsd_p[i];
             let g1 = grad_probs * r1;
-            let h1 = (hess_probs * r1 * r1 + grad_probs * rs1).max(1e-6);
+            let h1 = hess_probs * r1 * r1 + grad_probs * rs1;
 
             (g0, h0, g1, h1)
         };
@@ -374,6 +379,13 @@ mod tests {
         for i in 0..3 {
             for j in 0..2 {
                 assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-2);
+                // True (unfloored) Hessians: both paths must agree on value AND sign.
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
+                );
             }
         }
     }

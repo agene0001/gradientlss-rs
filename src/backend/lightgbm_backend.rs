@@ -253,6 +253,12 @@ pub struct LightGBMModel {
     booster: Booster,
     n_params: usize,
     n_features: usize,
+    /// Best iteration found by early stopping, if early stopping was enabled.
+    /// LightGBM's Python `Booster.predict` defaults `num_iteration` to
+    /// `best_iteration` when it exists, so LightGBMLSS predicts with the best
+    /// model rather than all built trees (best + patience extras). We mirror
+    /// that in `predict_raw`.
+    best_iteration: Option<usize>,
 }
 
 impl std::fmt::Debug for LightGBMModel {
@@ -260,6 +266,7 @@ impl std::fmt::Debug for LightGBMModel {
         f.debug_struct("LightGBMModel")
             .field("n_params", &self.n_params)
             .field("n_features", &self.n_features)
+            .field("best_iteration", &self.best_iteration)
             .finish()
     }
 }
@@ -385,14 +392,25 @@ impl BackendModel for LightGBMModel {
             // Compute gradients and hessians using our distribution
             let gh = objective_fn(&predictions, &labels, train_weights.as_ref())?;
 
-            // Flatten gradients and hessians in Fortran order (column-major)
-            // lgbm expects: [grad_param0_sample0, grad_param0_sample1, ..., grad_param1_sample0, ...]
-            let (grad_flat, hess_flat) =
-                LightGBMBackend::reshape_gradients(&gh.gradients, &gh.hessians);
-
-            // Convert to f32 for lgbm
-            let grad_f32: Vec<f32> = grad_flat.iter().map(|&x| x as f32).collect();
-            let hess_f32: Vec<f32> = hess_flat.iter().map(|&x| x as f32).collect();
+            // Flatten gradients and hessians in Fortran order (column-major):
+            // lgbm expects [grad_param0_sample0, grad_param0_sample1, ..., grad_param1_sample0, ...].
+            // Transpose and cast to f32 in a single pass — the previous
+            // `reshape_gradients` + `map` route allocated two intermediate f64
+            // arrays per round.
+            let mut grad_f32 = vec![0f32; n_samples * n_params];
+            let mut hess_f32 = vec![0f32; n_samples * n_params];
+            for (i, (g_row, h_row)) in gh
+                .gradients
+                .rows()
+                .into_iter()
+                .zip(gh.hessians.rows())
+                .enumerate()
+            {
+                for j in 0..n_params {
+                    grad_f32[j * n_samples + i] = g_row[j] as f32;
+                    hess_f32[j * n_samples + i] = h_row[j] as f32;
+                }
+            }
 
             // Update model with custom gradients
             let is_finished = booster
@@ -502,11 +520,21 @@ impl BackendModel for LightGBMModel {
             stopped_early,
         };
 
+        // Like LightGBM's early-stopping callback, record the best iteration
+        // whenever early stopping was enabled (also when training ran to the
+        // end without triggering it).
+        let model_best_iteration = if config.early_stopping_rounds.is_some() {
+            Some(best_iteration)
+        } else {
+            None
+        };
+
         Ok((
             Self {
                 booster,
                 n_params,
                 n_features,
+                best_iteration: model_best_iteration,
             },
             result,
         ))
@@ -520,17 +548,27 @@ impl BackendModel for LightGBMModel {
         let n_cols = data.ncols();
         let mat = MatBuf::from_vec(features_f32, n_samples, n_cols, lgbm::mat::RowMajor);
 
-        // Predict raw scores
+        // Predict raw scores. When early stopping recorded a best iteration,
+        // use trees [0, best_iteration]; LightGBM's Python predict does the
+        // same by defaulting num_iteration to best_iteration.
         let pred_params = Parameters::new();
+        let num_iteration = self.best_iteration.map(|b| b + 1);
         let prediction = self
             .booster
-            .predict_for_mat(&mat, PredictType::RawScore, 0, None, &pred_params)
+            .predict_for_mat(&mat, PredictType::RawScore, 0, num_iteration, &pred_params)
             .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
 
         prediction_to_array2(&prediction, n_samples, self.n_params)
     }
 
     fn save_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
+        // Persist best_iteration first (u64::MAX = none): LightGBM's model text
+        // format does not record it, but prediction parity requires it.
+        let best_iter_tag: u64 = self.best_iteration.map_or(u64::MAX, |b| b as u64);
+        writer
+            .write_all(&best_iter_tag.to_le_bytes())
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+
         let temp_dir = tempfile::tempdir()
             .map_err(|e| GradientLSSError::IoError(format!("Failed to create temp dir: {}", e)))?;
         let temp_path = temp_dir.path().join("model.txt");
@@ -550,6 +588,17 @@ impl BackendModel for LightGBMModel {
     }
 
     fn load_from_reader<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut best_iter_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut best_iter_bytes)
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+        let best_iter_tag = u64::from_le_bytes(best_iter_bytes);
+        let best_iteration = if best_iter_tag == u64::MAX {
+            None
+        } else {
+            Some(best_iter_tag as usize)
+        };
+
         let mut model_bytes = Vec::new();
         reader
             .read_to_end(&mut model_bytes)
@@ -572,6 +621,7 @@ impl BackendModel for LightGBMModel {
             booster,
             n_params,
             n_features,
+            best_iteration,
         })
     }
 

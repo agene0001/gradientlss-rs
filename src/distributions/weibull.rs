@@ -174,7 +174,7 @@ impl Distribution for Weibull {
                 let yi = y[i];
 
                 if yi <= 0.0 || !yi.is_finite() {
-                    return (0.0, 1e-6, 0.0, 1e-6);
+                    return (0.0, 0.0, 0.0, 0.0);
                 }
 
                 let t = yi / lambda;
@@ -189,12 +189,12 @@ impl Distribution for Weibull {
                 let r0 = rd_s[i];
                 let rs0 = rsd_s[i];
                 let g0 = grad_lambda * r0;
-                let h0 = (hess_lambda * r0 * r0 + grad_lambda * rs0).max(1e-6);
+                let h0 = hess_lambda * r0 * r0 + grad_lambda * rs0;
 
                 let r1 = rd_k[i];
                 let rs1 = rsd_k[i];
                 let g1 = grad_k * r1;
-                let h1 = (hess_k * r1 * r1 + grad_k * rs1).max(1e-6);
+                let h1 = hess_k * r1 * r1 + grad_k * rs1;
 
                 (g0, h0, g1, h1)
             };
@@ -232,12 +232,12 @@ impl Distribution for Weibull {
                 let r0 = scale_response_fn.derivative(p_scale[i]);
                 let rs0 = scale_response_fn.second_derivative(p_scale[i]);
                 let g0 = grad_lambda * r0;
-                let h0 = (hess_lambda * r0 * r0 + grad_lambda * rs0).max(1e-6);
+                let h0 = hess_lambda * r0 * r0 + grad_lambda * rs0;
 
                 let r1 = conc_response_fn.derivative(p_conc[i]);
                 let rs1 = conc_response_fn.second_derivative(p_conc[i]);
                 let g1 = grad_k * r1;
-                let h1 = (hess_k * r1 * r1 + grad_k * rs1).max(1e-6);
+                let h1 = hess_k * r1 * r1 + grad_k * rs1;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

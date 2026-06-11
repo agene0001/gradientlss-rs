@@ -162,7 +162,7 @@ impl Distribution for Logistic {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = one_minus_2sig / scale;
-                let h0 = (2.0 * sig_z * sig_1m / scale_sq).max(1e-6);
+                let h0 = 2.0 * sig_z * sig_1m / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let grad_scale_param = (z * one_minus_2sig + 1.0) / scale;
@@ -171,7 +171,7 @@ impl Distribution for Logistic {
                 let rd = resp_deriv[i];
                 let rsd = resp_second[i];
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 (g0, h0, g1, h1)
             };
@@ -203,7 +203,7 @@ impl Distribution for Logistic {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = one_minus_2sig / scale;
-                let h0 = (2.0 * sig_z * sig_1m / scale_sq).max(1e-6);
+                let h0 = 2.0 * sig_z * sig_1m / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let pred_scale = p_scale[i];
@@ -213,7 +213,7 @@ impl Distribution for Logistic {
                 let hess_scale_param =
                     (-2.0 * z * one_minus_2sig + 2.0 * z * z * sig_z * sig_1m - 1.0) / scale_sq;
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

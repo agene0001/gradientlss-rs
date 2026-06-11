@@ -67,7 +67,11 @@ impl ZAGamma {
         let is_zero = target == 0.0;
 
         // Clamp value away from 0 for continuous distributions (matches Python's epsilon clamp)
-        let clamped_target = if target <= 0.0 { f64::EPSILON } else { target };
+        let clamped_target = if target <= 0.0 {
+            crate::constants::ZERO_CLAMP_EPS
+        } else {
+            target
+        };
 
         // Gamma ln_pdf inlined
         let base_log_prob = concentration * rate.ln() + (concentration - 1.0) * clamped_target.ln()
@@ -186,7 +190,7 @@ mod tests {
 
         // Zero case: log(gate + (1-gate) * base_pdf(epsilon))
         let log_p_zero = dist.log_prob_scalar(&[2.0, 1.0, 0.1], 0.0);
-        let base_pdf_eps = gamma_ln_pdf(f64::EPSILON).exp();
+        let base_pdf_eps = gamma_ln_pdf(f32::EPSILON as f64).exp();
         let expected_zero = (0.1 + 0.9 * base_pdf_eps).ln();
         assert_relative_eq!(log_p_zero, expected_zero, epsilon = 1e-10);
 

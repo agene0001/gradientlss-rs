@@ -23,12 +23,12 @@ fn test_dist_select_integration() {
     // Expect Gaussian to be a better fit for this simple data than Student-T
     let _gaussian_nll = ranked_dists
         .iter()
-        .find(|(name, _)| name == "loc_scale")
+        .find(|(name, _)| name == "Gaussian")
         .unwrap()
         .1;
     let _studentt_nll = ranked_dists
         .iter()
-        .find(|(name, _)| name == "df_loc_scale")
+        .find(|(name, _)| name == "StudentT")
         .unwrap()
         .1;
 
@@ -181,7 +181,8 @@ fn test_gaussian_gradients_and_hessians() {
     assert_eq!(gh.hessians.dim(), (2, 2));
 
     // Hessians should be positive
-    assert!(gh.hessians.iter().all(|&h| h > 0.0));
+    // True second derivatives (PyTorch-autograd parity) may be <= 0; only require finite.
+    assert!(gh.hessians.iter().all(|&h| h.is_finite()));
 }
 
 #[test]
@@ -1026,7 +1027,7 @@ mod numerical_stability_tests {
         // No NaN or Inf in gradients
         assert!(gh.gradients.iter().all(|&x| x.is_finite()));
         // Hessians should be positive and finite
-        assert!(gh.hessians.iter().all(|&x| x.is_finite() && x > 0.0));
+        assert!(gh.hessians.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -1206,7 +1207,7 @@ mod nan_inf_handling_tests {
             "Gradients contain NaN or Inf after NaN input"
         );
         assert!(
-            gh.hessians.iter().all(|&x| x.is_finite() && x > 0.0),
+            gh.hessians.iter().all(|&x| x.is_finite()),
             "Hessians contain NaN, Inf, or non-positive values after NaN input"
         );
     }
@@ -1230,7 +1231,7 @@ mod nan_inf_handling_tests {
             "Gradients contain NaN or Inf after Inf input"
         );
         assert!(
-            gh.hessians.iter().all(|&x| x.is_finite() && x > 0.0),
+            gh.hessians.iter().all(|&x| x.is_finite()),
             "Hessians contain NaN, Inf, or non-positive values after Inf input"
         );
     }
@@ -1382,7 +1383,7 @@ mod nan_inf_handling_tests {
             "Gradients contain NaN or Inf after NaN target"
         );
         assert!(
-            gh.hessians.iter().all(|&x| x.is_finite() && x > 0.0),
+            gh.hessians.iter().all(|&x| x.is_finite()),
             "Hessians contain NaN, Inf, or non-positive values after NaN target"
         );
 

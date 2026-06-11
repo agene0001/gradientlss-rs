@@ -185,7 +185,7 @@ impl Distribution for ZIPoisson {
             let k = y[i];
 
             if !k.is_finite() || k < 0.0 {
-                return (0.0, 1e-6, 0.0, 1e-6);
+                return (0.0, 0.0, 0.0, 0.0);
             }
 
             let one_minus_gate = 1.0 - gate;
@@ -211,13 +211,13 @@ impl Distribution for ZIPoisson {
             let dr = rd_r[i];
             let sdr = rsd_r[i];
             let g0 = grad_rate * dr;
-            let h0 = (hess_rate * dr * dr + grad_rate * sdr).max(1e-6);
+            let h0 = hess_rate * dr * dr + grad_rate * sdr;
 
             // Chain rule through the gate response function.
             let dg = rd_g[i];
             let sdg = rsd_g[i];
             let g1 = grad_gate * dg;
-            let h1 = (hess_gate * dg * dg + grad_gate * sdg).max(1e-6);
+            let h1 = hess_gate * dg * dg + grad_gate * sdg;
 
             (g0, h0, g1, h1)
         };
@@ -345,6 +345,13 @@ mod tests {
                     analytical.0[[i, j]],
                     numerical.0[[i, j]],
                     epsilon = 1e-3
+                );
+                // True (unfloored) Hessians: both paths must agree on value AND sign.
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
                 );
             }
         }

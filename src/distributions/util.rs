@@ -4,9 +4,9 @@ use rayon::prelude::*;
 
 /// Sample count at or above which per-sample reductions are parallelized.
 ///
-/// Mirrors the threshold used by the analytical-gradient paths (e.g.
-/// `NegativeBinomial::analytical_gradients`) so the metric and gradient passes
-/// make the same sequential/parallel choice for a given batch size.
+/// Higher than the analytical-gradient paths' threshold (256): a summed NLL
+/// term is a handful of libm calls per sample, so rayon's fork/join overhead
+/// takes longer to amortize than in the heavier gradient passes.
 pub(crate) const PAR_THRESHOLD: usize = 4096;
 
 /// Sum `f(i)` over `0..n`, parallelizing with rayon at or above [`PAR_THRESHOLD`].

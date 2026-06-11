@@ -2,7 +2,7 @@ use crate::backend::{
     Backend, BackendDataset, BackendModel, FeatureImportance, FeatureImportanceType,
     PredictionOutput, TrainConfig, TrainingCallback, TrainingResult,
 };
-use crate::distributions::{Distribution, GradientsAndHessians};
+use crate::distributions::{Distribution, GradientsAndHessians, LossFn};
 use crate::error::{GradientLSSError, Result};
 use crate::hyper_opt;
 use crate::types::ResponseData;
@@ -180,12 +180,63 @@ impl<B: Backend> GradientLSS<B> {
         }
     }
 
+    /// Compute the configured training loss on transformed parameters. Python's
+    /// `metric_fn` evaluates whichever loss the distribution was set up with —
+    /// for "crps" it draws 30 samples (seed 123) and sums the empirical CRPS,
+    /// not the NLL.
+    fn metric_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+        match self.dist.loss_fn() {
+            LossFn::Nll => self.nll_on_transformed(transformed, labels),
+            LossFn::Crps => {
+                let samples = self.dist.sample(&transformed.view(), 30, 123);
+                let n_targets = self.dist.n_targets();
+                if n_targets == 1 {
+                    let target = ResponseData::Univariate(&labels.view());
+                    self.dist.crps_score(&target, &samples.view())
+                } else {
+                    let n_samples = labels.len() / n_targets;
+                    match labels.view().into_shape_with_order((n_samples, n_targets)) {
+                        Ok(reshaped) => {
+                            let target = ResponseData::Multivariate(&reshaped);
+                            self.dist.crps_score(&target, &samples.view())
+                        }
+                        Err(_) => f64::INFINITY,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replace non-finite raw margins with the per-parameter unconditional start
+    /// values, mirroring Python's `get_params_loss`:
+    ///   `predt[nan_inf_mask] = np.take(start_values, np.where(nan_inf_mask)[1])`
+    /// Returns `None` when nothing needs replacing (the common case) so callers
+    /// can avoid a copy.
+    fn clean_predictions(&self, predictions: &Array2<f64>) -> Option<Array2<f64>> {
+        let sv = self.start_values.as_ref()?;
+        if predictions.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let mut cleaned = predictions.clone();
+        for mut row in cleaned.rows_mut() {
+            for (j, v) in row.iter_mut().enumerate() {
+                if !v.is_finite() {
+                    *v = sv[j];
+                }
+            }
+        }
+        Some(cleaned)
+    }
+
     fn create_objective_fn(
         &self,
     ) -> impl Fn(&Array2<f64>, &Array1<f64>, Option<&Array1<f64>>) -> Result<GradientsAndHessians> + '_
     {
         let n_targets = self.dist.n_targets();
         move |predictions, labels, weights| {
+            // Non-finite margins are replaced with the start values, as in Python.
+            let cleaned = self.clean_predictions(predictions);
+            let predictions = cleaned.as_ref().unwrap_or(predictions);
             let w = weights.map(|w| w.view());
             if n_targets == 1 {
                 let target = ResponseData::Univariate(&labels.view());
@@ -206,8 +257,11 @@ impl<B: Backend> GradientLSS<B> {
 
     fn create_metric_fn(&self) -> impl Fn(&Array2<f64>, &Array1<f64>) -> f64 + '_ {
         move |predictions, labels| {
+            // Non-finite margins are replaced with the start values, as in Python.
+            let cleaned = self.clean_predictions(predictions);
+            let predictions = cleaned.as_ref().unwrap_or(predictions);
             let transformed = self.dist.transform_params(&predictions.view());
-            self.nll_on_transformed(&transformed, labels)
+            self.metric_on_transformed(&transformed, labels)
         }
     }
 
@@ -522,19 +576,16 @@ impl<B: Backend> GradientLSS<B> {
             .as_ref()
             .ok_or(GradientLSSError::ModelNotTrained)?;
 
-        let raw_preds = model.predict_raw(features)?;
-
-        let predictions = if let Some(ref start_vals) = self.start_values {
-            let mut preds = raw_preds.clone();
-            for mut row in preds.rows_mut() {
+        // `predict_raw` hands us an owned array — add the start values in place
+        // rather than cloning a second full matrix.
+        let mut predictions = model.predict_raw(features)?;
+        if let Some(ref start_vals) = self.start_values {
+            for mut row in predictions.rows_mut() {
                 for (j, val) in row.iter_mut().enumerate() {
                     *val += start_vals[j];
                 }
             }
-            preds
-        } else {
-            raw_preds
-        };
+        }
 
         let params = self.dist.transform_params(&predictions.view());
 
@@ -572,6 +623,11 @@ impl<B: Backend> GradientLSS<B> {
                         quant_result[[i, q_idx]] =
                             obs_samples[lo] + frac * (obs_samples[hi] - obs_samples[lo]);
                     }
+                }
+                // Python truncates quantiles to integers for discrete supports
+                // (`pred_quant_df.astype(int)`).
+                if self.dist.is_discrete() {
+                    quant_result.mapv_inplace(|v| v.trunc());
                 }
                 Ok(PredictionOutput::Quantiles(quant_result))
             }

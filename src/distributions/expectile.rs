@@ -195,6 +195,72 @@ impl Distribution for Expectile {
         }
     }
 
+    /// Analytical gradients for the expectile loss, matching PyTorch autograd of
+    /// Python's `Expectile_Torch.log_prob`:
+    ///
+    ///   loss = [Σ_p nansum_n w_{n,p} (y_n - e_{n,p})²] · (1 + penalty) / M
+    ///
+    /// with w = τ if y - e ≥ 0 else 1-τ. The crossing penalty is an indicator,
+    /// so autograd treats it as constant — but it still *scales* the loss, and
+    /// therefore every gradient and Hessian, by (1 + penalty). The previous
+    /// numerical fallback differentiated per-observation `log_prob`, which
+    /// hardcodes penalty = 0 and silently dropped that factor whenever
+    /// `penalize_crossing` was set.
+    ///
+    ///   dL/de  = -2 w (y - e) (1 + penalty) / M
+    ///   d²L/de² =  2 w (1 + penalty) / M    (w is piecewise-constant)
+    ///
+    /// Expectile parameters always use the identity response, so no chain rule.
+    fn analytical_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
+        if self.loss_fn != LossFn::Nll {
+            return None;
+        }
+        let y = match target {
+            ResponseData::Univariate(arr) => arr,
+            ResponseData::Multivariate(_) => return None,
+        };
+
+        let n_samples = predictions.nrows();
+        let m = self.expectiles.len();
+
+        // Batch-level crossing penalty, matching Python:
+        //   penalty = mean((~all(diff(predt, dim=1) > 0, dim=1)).float())
+        let penalty = if self.penalize_crossing && m > 1 {
+            let crossing_count: f64 = crate::distributions::util::par_sum(n_samples, |i| {
+                let row = transformed.row(i);
+                let crossed = (1..m).any(|p| row[p] <= row[p - 1]);
+                if crossed { 1.0 } else { 0.0 }
+            });
+            crossing_count / n_samples as f64
+        } else {
+            0.0
+        };
+        let scale = (1.0 + penalty) / m as f64;
+
+        let mut gradients = Array2::zeros((n_samples, m));
+        let mut hessians = Array2::zeros((n_samples, m));
+        for i in 0..n_samples {
+            let yi = y[i];
+            if !yi.is_finite() {
+                // nansum masks these observations in Python → zero grad/hess.
+                continue;
+            }
+            for (p, &tau) in self.expectiles.iter().enumerate() {
+                let e = transformed[[i, p]];
+                let w = if yi - e >= 0.0 { tau } else { 1.0 - tau };
+                gradients[[i, p]] = -2.0 * w * (yi - e) * scale;
+                hessians[[i, p]] = 2.0 * w * scale;
+            }
+        }
+
+        Some((gradients, hessians))
+    }
+
     fn sample(&self, params: &ArrayView2<f64>, n_samples: usize, seed: u64) -> Array2<f64> {
         let n_obs = params.nrows();
         let mut result = Array2::zeros((n_samples, n_obs));
@@ -307,6 +373,75 @@ mod tests {
 
         let nll = dist.nll(&params.view(), &target_response);
         assert!(nll.is_finite());
+    }
+
+    #[test]
+    fn test_expectile_analytical_matches_numerical() {
+        let dist = Expectile::new(
+            vec![0.1, 0.5, 0.9],
+            false,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+        let predictions = array![[1.0, 1.5, 2.0], [2.2, 1.8, 1.1]];
+        let targets = array![1.2, 1.4];
+        let target = ResponseData::Univariate(&targets.view());
+
+        let transformed = dist.transform_params(&predictions.view());
+        let analytical = dist
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return analytical gradients");
+        let numerical = dist
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return numerical gradients");
+
+        for i in 0..2 {
+            for j in 0..3 {
+                assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-3);
+                assert_relative_eq!(analytical.1[[i, j]], numerical.1[[i, j]], epsilon = 1e-2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_expectile_crossing_penalty_scales_gradients() {
+        // One of the two rows has crossed expectiles → penalty = 0.5. Python's
+        // autograd keeps the (1 + penalty) loss scaling in every gradient and
+        // hessian; verify ours does too.
+        let predictions = array![[1.0, 1.5, 2.0], [2.0, 1.5, 1.0]];
+        let targets = array![1.2, 1.4];
+        let target = ResponseData::Univariate(&targets.view());
+
+        let base = Expectile::new(
+            vec![0.1, 0.5, 0.9],
+            false,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+        let penalized = Expectile::new(
+            vec![0.1, 0.5, 0.9],
+            true,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+
+        let transformed = base.transform_params(&predictions.view());
+        let (g0, h0) = base
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .unwrap();
+        let (g1, h1) = penalized
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .unwrap();
+
+        for (a, b) in g0.iter().zip(g1.iter()) {
+            assert_relative_eq!(*b, a * 1.5, epsilon = 1e-12);
+        }
+        for (a, b) in h0.iter().zip(h1.iter()) {
+            assert_relative_eq!(*b, a * 1.5, epsilon = 1e-12);
+        }
     }
 
     #[test]
