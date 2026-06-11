@@ -143,7 +143,7 @@ impl Distribution for Poisson {
             let k = y[i];
 
             if !k.is_finite() || k < 0.0 {
-                return (0.0, 1e-6);
+                return (0.0, 0.0);
             }
 
             let grad_lambda = 1.0 - k / lambda;
@@ -152,7 +152,7 @@ impl Distribution for Poisson {
             let d = rd[i];
             let sd = rsd[i];
             let g = grad_lambda * d;
-            let h = (hess_lambda * d * d + grad_lambda * sd).max(1e-6);
+            let h = hess_lambda * d * d + grad_lambda * sd;
             (g, h)
         };
 
@@ -255,6 +255,13 @@ mod tests {
 
         for i in 0..3 {
             assert_relative_eq!(analytical.0[[i, 0]], numerical.0[[i, 0]], epsilon = 1e-3);
+            // True (unfloored) Hessians: both paths must agree on value AND sign.
+            assert_relative_eq!(
+                analytical.1[[i, 0]],
+                numerical.1[[i, 0]],
+                epsilon = 1e-2,
+                max_relative = 1e-2
+            );
         }
     }
 

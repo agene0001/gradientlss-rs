@@ -203,7 +203,7 @@ impl Distribution for ZINB {
             let k = y[i];
 
             if !k.is_finite() || k < 0.0 {
-                return (0.0, 1e-6, 0.0, 1e-6, 0.0, 1e-6);
+                return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
             }
 
             let p = 1.0 - probs; // statrs convention; NB pmf(0) = p^r
@@ -243,17 +243,17 @@ impl Distribution for ZINB {
             let dr = rd_r[i];
             let sdr = rsd_r[i];
             let g0 = grad_r * dr;
-            let h0 = (hess_r * dr * dr + grad_r * sdr).max(1e-6);
+            let h0 = hess_r * dr * dr + grad_r * sdr;
 
             let dp = rd_p[i];
             let sdp = rsd_p[i];
             let g1 = grad_probs * dp;
-            let h1 = (hess_probs * dp * dp + grad_probs * sdp).max(1e-6);
+            let h1 = hess_probs * dp * dp + grad_probs * sdp;
 
             let dg = rd_g[i];
             let sdg = rsd_g[i];
             let g2 = grad_gate * dg;
-            let h2 = (hess_gate * dg * dg + grad_gate * sdg).max(1e-6);
+            let h2 = hess_gate * dg * dg + grad_gate * sdg;
 
             (g0, h0, g1, h1, g2, h2)
         };
@@ -401,6 +401,13 @@ mod tests {
                     analytical.0[[i, j]],
                     numerical.0[[i, j]],
                     epsilon = 1e-2
+                );
+                // True (unfloored) Hessians: both paths must agree on value AND sign.
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
                 );
             }
         }

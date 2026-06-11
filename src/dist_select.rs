@@ -37,7 +37,10 @@ pub fn dist_select<'a>(
     let results: Vec<_> = candidate_distributions
         .into_par_iter()
         .map(|dist| {
-            let dist_name = dist.param_names().join("_");
+            // Use the distribution's name (like Python's class name) — joining
+            // parameter names collides for e.g. Gaussian/Laplace/Cauchy/Gumbel/
+            // Logistic, which all share "loc"/"scale".
+            let dist_name = dist.name().to_string();
             let result = dist.calculate_start_values(&response_data, max_iter);
             (dist_name, result)
         })
@@ -118,7 +121,8 @@ pub fn dist_select_with_params<'a>(
     let results: Vec<_> = candidate_distributions
         .into_par_iter()
         .map(|dist| {
-            let dist_name = dist.param_names().join("_");
+            // Distribution name, not joined param names — see `dist_select`.
+            let dist_name = dist.name().to_string();
             let result = dist.calculate_start_values(&response_data, max_iter);
             (dist_name, result, dist)
         })
@@ -257,7 +261,7 @@ mod tests {
         let result = dist_select(&target.view(), candidates, 100).unwrap();
         assert_eq!(result.len(), 2);
         // Check that the gaussian distribution is in the results
-        assert!(result.iter().any(|(name, _)| name == "loc_scale"));
+        assert!(result.iter().any(|(name, _)| name == "Gaussian"));
     }
 
     #[test]

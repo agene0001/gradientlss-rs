@@ -195,7 +195,7 @@ impl Distribution for StudentT {
                 let yi = y[i];
 
                 if !yi.is_finite() {
-                    return ([0.0, 0.0, 0.0], [1e-6, 1e-6, 1e-6]);
+                    return ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
                 }
 
                 let d = (yi - mu) / sigma;
@@ -206,7 +206,7 @@ impl Distribution for StudentT {
                 let sigma_sq = sigma * sigma;
 
                 let g1 = -(nu_p1) * d / (sigma * nu_plus_d2);
-                let h1 = (nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2)).max(1e-6);
+                let h1 = nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2);
 
                 let grad_sigma = 1.0 / sigma - nu_p1 * d2 / (sigma * nu_plus_d2);
                 let hess_sigma_param = -1.0 / sigma_sq
@@ -214,7 +214,7 @@ impl Distribution for StudentT {
                 let rs = rd_scale[i];
                 let rss = rsd_scale[i];
                 let g2 = grad_sigma * rs;
-                let h2 = (hess_sigma_param * rs * rs + grad_sigma * rss).max(1e-6);
+                let h2 = hess_sigma_param * rs * rs + grad_sigma * rss;
 
                 let half_nu_p1 = nu_p1 / 2.0;
                 let half_nu = nu / 2.0;
@@ -227,7 +227,7 @@ impl Distribution for StudentT {
                 let rd = rd_df[i];
                 let rsd = rsd_df[i];
                 let g0 = grad_nu * rd;
-                let h0 = (hess_nu_param * rd * rd + grad_nu * rsd).max(1e-6);
+                let h0 = hess_nu_param * rd * rd + grad_nu * rsd;
 
                 ([g0, g1, g2], [h0, h1, h2])
             };
@@ -264,7 +264,7 @@ impl Distribution for StudentT {
 
                 gradients[[i, 1]] = -(nu_p1) * d / (sigma * nu_plus_d2);
                 hessians[[i, 1]] =
-                    (nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2)).max(1e-6);
+                    nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2);
 
                 let grad_sigma = 1.0 / sigma - nu_p1 * d2 / (sigma * nu_plus_d2);
                 let hess_sigma_param = -1.0 / sigma_sq
@@ -273,7 +273,7 @@ impl Distribution for StudentT {
                 let rs = scale_response_fn.derivative(pred_scale);
                 let rss = scale_response_fn.second_derivative(pred_scale);
                 gradients[[i, 2]] = grad_sigma * rs;
-                hessians[[i, 2]] = (hess_sigma_param * rs * rs + grad_sigma * rss).max(1e-6);
+                hessians[[i, 2]] = hess_sigma_param * rs * rs + grad_sigma * rss;
 
                 let half_nu_p1 = nu_p1 / 2.0;
                 let half_nu = nu / 2.0;
@@ -287,7 +287,7 @@ impl Distribution for StudentT {
                 let rd = df_response_fn.derivative(pred_df);
                 let rsd = df_response_fn.second_derivative(pred_df);
                 gradients[[i, 0]] = grad_nu * rd;
-                hessians[[i, 0]] = (hess_nu_param * rd * rd + grad_nu * rsd).max(1e-6);
+                hessians[[i, 0]] = hess_nu_param * rd * rd + grad_nu * rsd;
             }
         }
 

@@ -427,16 +427,12 @@ impl BackendModel for XGBoostModel {
             let gh = objective_fn(&predictions, &labels, train_weights.as_ref())?;
 
             // Flatten gradients/hessians row-major: [g_s0_p0, g_s0_p1, ..., g_s1_p0, ...]
-            // This matches Python which concatenates per-param gradients along axis=1
-            let mut grad_f32 = Vec::with_capacity(n_samples * n_params);
-            let mut hess_f32 = Vec::with_capacity(n_samples * n_params);
-
-            for i in 0..n_samples {
-                for j in 0..n_params {
-                    grad_f32.push(gh.gradients[[i, j]] as f32);
-                    hess_f32.push(gh.hessians[[i, j]] as f32);
-                }
-            }
+            // This matches Python which concatenates per-param gradients along axis=1.
+            // The arrays are C-order, so ndarray's iter IS row-major order — a single
+            // contiguous cast pass that LLVM can vectorize, instead of per-element
+            // `[[i, j]]` index arithmetic.
+            let grad_f32: Vec<f32> = gh.gradients.iter().map(|&v| v as f32).collect();
+            let hess_f32: Vec<f32> = gh.hessians.iter().map(|&v| v as f32).collect();
 
             // Set gradient data for the trampoline
             OBJECTIVE_DATA.with(|data| {

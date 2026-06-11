@@ -175,7 +175,7 @@ impl Distribution for Laplace {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = -diff.signum() / scale;
-                let h0 = (1.0 / scale_sq).max(1e-6);
+                let h0 = 1.0 / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let grad_scale_param = 1.0 / scale - abs_diff / scale_sq;
@@ -183,7 +183,7 @@ impl Distribution for Laplace {
                 let rd = resp_deriv[i];
                 let rsd = resp_second[i];
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 (g0, h0, g1, h1)
             };
@@ -206,7 +206,7 @@ impl Distribution for Laplace {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = -diff.signum() / scale;
-                let h0 = (1.0 / scale_sq).max(1e-6);
+                let h0 = 1.0 / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let pred_scale = p_scale[i];
@@ -215,7 +215,7 @@ impl Distribution for Laplace {
                 let grad_scale_param = 1.0 / scale - abs_diff / scale_sq;
                 let hess_scale_param = -1.0 / scale_sq + 2.0 * abs_diff / (scale_sq * scale);
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

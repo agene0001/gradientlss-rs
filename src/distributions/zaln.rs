@@ -69,7 +69,11 @@ impl ZALN {
         }
 
         // Clamp value away from 0 for continuous distributions (matches Python's epsilon clamp)
-        let clamped_target = if target <= 0.0 { f64::EPSILON } else { target };
+        let clamped_target = if target <= 0.0 {
+            crate::constants::ZERO_CLAMP_EPS
+        } else {
+            target
+        };
 
         // Compute LogNormal log probability
         let log_target = clamped_target.ln();

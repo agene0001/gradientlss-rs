@@ -252,7 +252,13 @@ pub trait Distribution: Send + Sync {
     ) -> Result<(Array2<f64>, Array2<f64>)> {
         let n_samples = predictions.nrows();
         let n_params = self.n_params();
-        let eps = 1e-7;
+        // Step size for central differences. The Hessian uses the second
+        // difference (f⁺ - 2f⁰ + f⁻)/h², whose round-off error is ~4·ε_machine·|f|/h²,
+        // so the optimal h is ~ε_machine^(1/4) ≈ 1e-4. The previous 1e-7 amplified
+        // f64 round-off by 1e14 and made the Hessians mostly noise. At h = 1e-4 the
+        // gradient's central difference is also still accurate (truncation
+        // ~h²·|f‴|/6, round-off ~ε_machine·|f|/h — both negligible).
+        let eps = 1e-4;
         let use_crps = self.loss_fn() == LossFn::Crps;
 
         let mut gradients = Array2::zeros((n_samples, n_params));
@@ -358,8 +364,11 @@ pub trait Distribution: Send + Sync {
                     let loss_minus = -self.log_prob(&params_buf, y_slice);
 
                     grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
-                    let hess = (loss_plus - 2.0 * loss_center + loss_minus) * inv_eps_sq;
-                    hess_row[p] = hess.max(1e-6); // Ensure positive hessian
+                    // True second difference, no positivity floor: PyTorch autograd
+                    // hands XGBoost/LightGBM the exact (possibly negative) diagonal
+                    // Hessian, and both boosters accept it — flooring changed leaf
+                    // values relative to the Python implementations.
+                    hess_row[p] = (loss_plus - 2.0 * loss_center + loss_minus) * inv_eps_sq;
                 }
 
                 // Restore original value
@@ -699,8 +708,8 @@ pub trait Distribution: Send + Sync {
 /// Replace NaN values in array with column means.
 fn replace_nans_with_mean(arr: &mut Array2<f64>) {
     // Fast clean-path: a single contiguous, branch-light scan over the whole
-    // backing buffer. The analytical gradient paths clamp their inputs and
-    // floor hessians, so non-finite values are the exception, not the rule —
+    // backing buffer. The analytical gradient paths clamp their inputs, so
+    // non-finite values are the exception, not the rule —
     // and this runs on both gradients and hessians every boosting round.
     // When the buffer is already finite (the common case) we skip the strided
     // per-column mean/fix-up work entirely. C-order arrays are contiguous, so
@@ -741,17 +750,17 @@ fn stabilize_mad(arr: &mut Array2<f64>) {
     let mut buf = vec![0.0f64; n_rows];
 
     for mut col in arr.columns_mut() {
-        // Copy column to buffer and sort in-place (no allocation)
+        // Copy column to buffer and select the median in-place (no allocation)
         for (j, &v) in col.iter().enumerate() {
             buf[j] = v;
         }
-        let median = median_of_sorted_buf(&mut buf);
+        let median = median_inplace(&mut buf);
 
-        // Compute deviations in-place in the buffer, then sort for MAD
+        // Compute deviations in-place in the buffer, then select for MAD
         for (j, &v) in col.iter().enumerate() {
             buf[j] = (v - median).abs();
         }
-        let mad = median_of_sorted_buf(&mut buf).max(1e-4);
+        let mad = median_inplace(&mut buf).max(1e-4);
 
         let inv_mad = 1.0 / mad;
         for v in col.iter_mut() {
@@ -760,20 +769,19 @@ fn stabilize_mad(arr: &mut Array2<f64>) {
     }
 }
 
-/// Compute median by sorting the buffer in-place. Zero-allocation.
-/// Uses lower median for even-length, matching torch.nanmedian behavior.
+/// Compute the lower median via quickselect — O(n) instead of a full
+/// O(n log n) sort, and this runs twice per parameter column every boosting
+/// round under MAD stabilization. Lower median for even lengths matches
+/// torch.nanmedian; (len-1)/2 selects it for both parities.
 /// Assumes all values are finite (NaNs already replaced by replace_nans_with_mean).
-fn median_of_sorted_buf(buf: &mut [f64]) -> f64 {
+fn median_inplace(buf: &mut [f64]) -> f64 {
     if buf.is_empty() {
         return 0.0;
     }
-    buf.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = buf.len() / 2;
-    if buf.len() % 2 == 0 {
-        buf[mid - 1]
-    } else {
-        buf[mid]
-    }
+    let mid = (buf.len() - 1) / 2;
+    let (_, m, _) = buf
+        .select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    *m
 }
 
 /// L2 stabilization.
@@ -891,11 +899,13 @@ mod tests {
     }
 
     #[test]
-    fn test_median_of_sorted_buf() {
-        assert_eq!(median_of_sorted_buf(&mut [1.0, 2.0, 3.0]), 2.0);
+    fn test_median_inplace() {
+        assert_eq!(median_inplace(&mut [1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(median_inplace(&mut [3.0, 1.0, 2.0]), 2.0);
         // Even-length: lower median (matches torch.nanmedian)
-        assert_eq!(median_of_sorted_buf(&mut [1.0, 2.0, 3.0, 4.0]), 2.0);
-        assert_eq!(median_of_sorted_buf(&mut []), 0.0);
+        assert_eq!(median_inplace(&mut [1.0, 2.0, 3.0, 4.0]), 2.0);
+        assert_eq!(median_inplace(&mut [4.0, 2.0, 3.0, 1.0]), 2.0);
+        assert_eq!(median_inplace(&mut []), 0.0);
     }
 
     #[test]

@@ -189,7 +189,7 @@ impl Distribution for Beta {
                 let yi = y[i];
 
                 if yi <= 0.0 || yi >= 1.0 || !yi.is_finite() {
-                    return (0.0, 1e-6, 0.0, 1e-6);
+                    return (0.0, 0.0, 0.0, 0.0);
                 }
 
                 let ln_y = yi.ln();
@@ -206,12 +206,12 @@ impl Distribution for Beta {
                 let r0 = rd_a[i];
                 let rs0 = rsd_a[i];
                 let g0 = grad_a * r0;
-                let h0 = (hess_a * r0 * r0 + grad_a * rs0).max(1e-6);
+                let h0 = hess_a * r0 * r0 + grad_a * rs0;
 
                 let r1 = rd_b[i];
                 let rs1 = rsd_b[i];
                 let g1 = grad_b * r1;
-                let h1 = (hess_b * r1 * r1 + grad_b * rs1).max(1e-6);
+                let h1 = hess_b * r1 * r1 + grad_b * rs1;
 
                 (g0, h0, g1, h1)
             };
@@ -251,12 +251,12 @@ impl Distribution for Beta {
                 let r0 = conc1_response_fn.derivative(p_conc1[i]);
                 let rs0 = conc1_response_fn.second_derivative(p_conc1[i]);
                 let g0 = grad_a * r0;
-                let h0 = (hess_a * r0 * r0 + grad_a * rs0).max(1e-6);
+                let h0 = hess_a * r0 * r0 + grad_a * rs0;
 
                 let r1 = conc0_response_fn.derivative(p_conc0[i]);
                 let rs1 = conc0_response_fn.second_derivative(p_conc0[i]);
                 let g1 = grad_b * r1;
-                let h1 = (hess_b * r1 * r1 + grad_b * rs1).max(1e-6);
+                let h1 = hess_b * r1 * r1 + grad_b * rs1;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

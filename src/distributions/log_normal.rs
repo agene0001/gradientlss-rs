@@ -153,7 +153,7 @@ impl Distribution for LogNormal {
                 let yi = y[i];
 
                 if yi <= 0.0 {
-                    return (0.0, 1e-6, 0.0, 1e-6);
+                    return (0.0, 0.0, 0.0, 0.0);
                 }
 
                 let d = (yi.ln() - loc) / scale;
@@ -161,7 +161,7 @@ impl Distribution for LogNormal {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = -d / scale;
-                let h0 = (1.0 / scale_sq).max(1e-6);
+                let h0 = 1.0 / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let grad_scale_param = 1.0 / scale - d * d / scale;
@@ -169,7 +169,7 @@ impl Distribution for LogNormal {
                 let rd = resp_deriv[i];
                 let rsd = resp_second[i];
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 (g0, h0, g1, h1)
             };
@@ -200,7 +200,7 @@ impl Distribution for LogNormal {
 
                 // Gradient/Hessian w.r.t. loc (identity response)
                 let g0 = -d / scale;
-                let h0 = (1.0 / scale_sq).max(1e-6);
+                let h0 = 1.0 / scale_sq;
 
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let pred_scale = p_scale[i];
@@ -209,7 +209,7 @@ impl Distribution for LogNormal {
                 let grad_scale_param = 1.0 / scale - d * d / scale;
                 let hess_scale_param = -1.0 / scale_sq + 3.0 * d * d / scale_sq;
                 let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
+                let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
                 gradients[[i, 0]] = g0;
                 hessians[[i, 0]] = h0;

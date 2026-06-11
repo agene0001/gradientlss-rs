@@ -160,55 +160,66 @@ impl Distribution for Gaussian {
         let t_scale = transformed.column(1);
         let p_scale = predictions.column(1);
 
+        // Batch response-fn derivatives (auto-vectorized, one shared `exp`),
+        // hoisted above the branch so the sequential path no longer pays two
+        // scalar `exp` calls per sample via `derivative`/`second_derivative`.
+        let (resp_deriv, resp_second) = scale_response_fn.derivative_batches(&p_scale);
+
+        let compute = |i: usize| -> (f64, f64, f64, f64) {
+            let loc = t_loc[i];
+            let scale = t_scale[i].max(1e-6);
+            let scale_sq = scale * scale;
+            let yi = y[i];
+            let diff = yi - loc;
+            let diff_sq = diff * diff;
+            let g0 = -diff / scale_sq;
+            let h0 = 1.0 / scale_sq;
+            let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
+            let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
+            let rd = resp_deriv[i];
+            let rsd = resp_second[i];
+            let g1 = grad_scale_param * rd;
+            let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
+            (g0, h0, g1, h1)
+        };
+
         let mut gradients = Array2::zeros((n_samples, 2));
         let mut hessians = Array2::zeros((n_samples, 2));
+        // C-order rows are [param0, param1] per sample; write straight into the
+        // contiguous backing slices (same pattern as NegativeBinomial).
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
 
-        if n_samples >= 4096 {
-            let (resp_deriv, resp_second) = scale_response_fn.derivative_batches(&p_scale);
-
-            let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
-                let loc = t_loc[i];
-                let scale = t_scale[i].max(1e-6);
-                let scale_sq = scale * scale;
-                let yi = y[i];
-                let diff = yi - loc;
-                let diff_sq = diff * diff;
-                let g0 = -diff / scale_sq;
-                let h0 = (1.0 / scale_sq).max(1e-6);
-                let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
-                let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
-                let rd = resp_deriv[i];
-                let rsd = resp_second[i];
-                let g1 = grad_scale_param * rd;
-                let h1 = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
-                (g0, h0, g1, h1)
-            };
-
-            let results: Vec<_> = (0..n_samples).into_par_iter().map(compute_sample).collect();
-            for (i, (g0, h0, g1, h1)) in results.into_iter().enumerate() {
-                gradients[[i, 0]] = g0;
-                hessians[[i, 0]] = h0;
-                gradients[[i, 1]] = g1;
-                hessians[[i, 1]] = h1;
-            }
+        // Threshold matches the other analytical paths (256).
+        const PAR_MIN: usize = 256;
+        if n_samples >= PAR_MIN {
+            g_slice
+                .par_chunks_mut(2)
+                .zip(h_slice.par_chunks_mut(2))
+                .enumerate()
+                .for_each(|(i, (gc, hc))| {
+                    let (g0, h0, g1, h1) = compute(i);
+                    gc[0] = g0;
+                    gc[1] = g1;
+                    hc[0] = h0;
+                    hc[1] = h1;
+                });
         } else {
-            for i in 0..n_samples {
-                let loc = t_loc[i];
-                let scale = t_scale[i].max(1e-6);
-                let scale_sq = scale * scale;
-                let yi = y[i];
-                let diff = yi - loc;
-                let diff_sq = diff * diff;
-                gradients[[i, 0]] = -diff / scale_sq;
-                hessians[[i, 0]] = (1.0 / scale_sq).max(1e-6);
-                let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
-                let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
-                let pred_scale = p_scale[i];
-                let rd = scale_response_fn.derivative(pred_scale);
-                let rsd = scale_response_fn.second_derivative(pred_scale);
-                gradients[[i, 1]] = grad_scale_param * rd;
-                hessians[[i, 1]] = (hess_scale_param * rd * rd + grad_scale_param * rsd).max(1e-6);
-            }
+            g_slice
+                .chunks_mut(2)
+                .zip(h_slice.chunks_mut(2))
+                .enumerate()
+                .for_each(|(i, (gc, hc))| {
+                    let (g0, h0, g1, h1) = compute(i);
+                    gc[0] = g0;
+                    gc[1] = g1;
+                    hc[0] = h0;
+                    hc[1] = h1;
+                });
         }
 
         Some((gradients, hessians))
