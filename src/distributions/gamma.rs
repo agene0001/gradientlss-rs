@@ -165,8 +165,8 @@ impl Distribution for Gamma {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_conc, rsd_conc) = conc_response_fn.derivative_batches(&p_conc);
-            let (rd_rate, rsd_rate) = rate_response_fn.derivative_batches(&p_rate);
+            let (rd_conc, rsd_conc) = conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
+            let (rd_rate, rsd_rate) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let alpha = t_conc[i].max(1e-6);

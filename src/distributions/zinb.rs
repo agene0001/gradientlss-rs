@@ -192,9 +192,9 @@ impl Distribution for ZINB {
         let p_gate = predictions.column(2);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let (rd_r, rsd_r) = r_response_fn.derivative_batches(&p_r);
-        let (rd_p, rsd_p) = probs_response_fn.derivative_batches(&p_probs);
-        let (rd_g, rsd_g) = gate_response_fn.derivative_batches(&p_gate);
+        let (rd_r, rsd_r) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
+        let (rd_p, rsd_p) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
+        let (rd_g, rsd_g) = gate_response_fn.derivative_batches_from_transformed(&p_gate, &t_gate);
 
         let compute = |i: usize| -> (f64, f64, f64, f64, f64, f64) {
             let r = t_r[i].max(1e-6);

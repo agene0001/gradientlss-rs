@@ -180,8 +180,8 @@ impl Distribution for Beta {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_a, rsd_a) = conc1_response_fn.derivative_batches(&p_conc1);
-            let (rd_b, rsd_b) = conc0_response_fn.derivative_batches(&p_conc0);
+            let (rd_a, rsd_a) = conc1_response_fn.derivative_batches_from_transformed(&p_conc1, &t_conc1);
+            let (rd_b, rsd_b) = conc0_response_fn.derivative_batches_from_transformed(&p_conc0, &t_conc0);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let a = t_conc1[i].max(1e-6);

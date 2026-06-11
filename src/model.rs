@@ -13,7 +13,19 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Cache mapping a raw training margin to its transformed parameters, shared
+/// between the metric closure (writer) and the objective closure (reader).
+///
+/// Every boosting round the metric transforms the post-update train margin, and
+/// the next round's objective receives that *exact* margin — so caching the
+/// transform skips one full response-transform pass (exp/sigmoid over
+/// n_samples × n_params) per round. Entries are keyed by exact value equality
+/// on the raw margin, so a mismatch is never wrong, just a recompute. Two slots
+/// because the validation metric runs right after the train metric each round
+/// and must not evict the train entry.
+type TransformCache = Arc<Mutex<Vec<(Array2<f64>, Array2<f64>)>>>;
 
 /// Prediction types for the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,18 +242,36 @@ impl<B: Backend> GradientLSS<B> {
 
     fn create_objective_fn(
         &self,
+        cache: TransformCache,
     ) -> impl Fn(&Array2<f64>, &Array1<f64>, Option<&Array1<f64>>) -> Result<GradientsAndHessians> + '_
     {
         let n_targets = self.dist.n_targets();
         move |predictions, labels, weights| {
+            // Reuse the transform the metric pass computed for this exact margin
+            // at the end of the previous round (keyed on the raw, pre-clean
+            // margin; a miss just recomputes).
+            let cached = {
+                let mut guard = cache.lock().unwrap();
+                guard
+                    .iter()
+                    .position(|(key, _)| key == predictions)
+                    .map(|i| guard.swap_remove(i).1)
+            };
+
             // Non-finite margins are replaced with the start values, as in Python.
             let cleaned = self.clean_predictions(predictions);
             let predictions = cleaned.as_ref().unwrap_or(predictions);
+            let transformed =
+                cached.unwrap_or_else(|| self.dist.transform_params(&predictions.view()));
             let w = weights.map(|w| w.view());
             if n_targets == 1 {
                 let target = ResponseData::Univariate(&labels.view());
-                self.dist
-                    .compute_gradients_and_hessians(&predictions.view(), &target, w.as_ref())
+                self.dist.compute_gradients_and_hessians_with_transformed(
+                    &predictions.view(),
+                    &transformed.view(),
+                    &target,
+                    w.as_ref(),
+                )
             } else {
                 let n_samples = labels.len() / n_targets;
                 let reshaped = labels
@@ -249,19 +279,39 @@ impl<B: Backend> GradientLSS<B> {
                     .into_shape_with_order((n_samples, n_targets))
                     .map_err(GradientLSSError::from)?;
                 let target = ResponseData::Multivariate(&reshaped);
-                self.dist
-                    .compute_gradients_and_hessians(&predictions.view(), &target, w.as_ref())
+                self.dist.compute_gradients_and_hessians_with_transformed(
+                    &predictions.view(),
+                    &transformed.view(),
+                    &target,
+                    w.as_ref(),
+                )
             }
         }
     }
 
-    fn create_metric_fn(&self) -> impl Fn(&Array2<f64>, &Array1<f64>) -> f64 + '_ {
+    fn create_metric_fn(
+        &self,
+        cache: TransformCache,
+    ) -> impl Fn(&Array2<f64>, &Array1<f64>) -> f64 + '_ {
         move |predictions, labels| {
             // Non-finite margins are replaced with the start values, as in Python.
             let cleaned = self.clean_predictions(predictions);
-            let predictions = cleaned.as_ref().unwrap_or(predictions);
-            let transformed = self.dist.transform_params(&predictions.view());
-            self.metric_on_transformed(&transformed, labels)
+            let cleaned_preds = cleaned.as_ref().unwrap_or(predictions);
+            let transformed = self.dist.transform_params(&cleaned_preds.view());
+            let loss = self.metric_on_transformed(&transformed, labels);
+
+            // Stash (raw margin → transform) for the next round's objective; see
+            // `TransformCache`. Oldest entry is evicted at 2 slots.
+            let mut guard = cache.lock().unwrap();
+            if let Some(i) = guard.iter().position(|(key, _)| key == predictions) {
+                guard.swap_remove(i);
+            }
+            if guard.len() >= 2 {
+                guard.remove(0);
+            }
+            guard.push((predictions.clone(), transformed));
+
+            loss
         }
     }
 
@@ -363,13 +413,16 @@ impl<B: Backend> GradientLSS<B> {
 
         self.set_init_score(train_data)?;
 
+        // Shared per-run transform cache — see `TransformCache`.
+        let transform_cache: TransformCache = Arc::new(Mutex::new(Vec::with_capacity(2)));
+
         let (model, result) = B::Model::train_with_objective_and_callbacks(
             &params,
             train_data,
             valid_data,
             &config,
-            self.create_objective_fn(),
-            self.create_metric_fn(),
+            self.create_objective_fn(Arc::clone(&transform_cache)),
+            self.create_metric_fn(transform_cache),
             self.start_values.as_ref(),
             callbacks,
         )?;
@@ -963,6 +1016,7 @@ mod lightgbm_tests {
             num_boost_round: 100,
             early_stopping_rounds: Some(5),
             verbose: false,
+            collect_train_metrics: true,
             seed: 42,
         };
 

@@ -207,8 +207,8 @@ impl Distribution for NegativeBinomial {
         // Batch response-fn derivatives (auto-vectorized); shared by the
         // sequential and parallel paths so we no longer branch on the per-sample
         // scalar derivative calls.
-        let (rd_r, rsd_r) = r_response_fn.derivative_batches(&p_r);
-        let (rd_p, rsd_p) = probs_response_fn.derivative_batches(&p_probs);
+        let (rd_r, rsd_r) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
+        let (rd_p, rsd_p) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
 
         // Per-sample (grad_r, hess_r, grad_probs, hess_probs) in prediction space.
         let compute = |i: usize| -> (f64, f64, f64, f64) {

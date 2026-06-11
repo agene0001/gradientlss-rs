@@ -18,6 +18,14 @@ pub struct TrainConfig {
     pub verbose: bool,
     /// Random seed.
     pub seed: u64,
+    /// Whether to compute and record the per-round training-set metric even
+    /// when nothing else needs it. The train metric is a full NLL/CRPS pass
+    /// over the training set every round; with a validation set driving early
+    /// stopping it is pure reporting. Setting this to `false` skips that pass
+    /// (leaving `TrainingResult::train_history` empty) — except when something
+    /// still requires it: no validation set (train loss drives early stopping),
+    /// `verbose` logging, or registered callbacks.
+    pub collect_train_metrics: bool,
 }
 
 impl Default for TrainConfig {
@@ -26,6 +34,7 @@ impl Default for TrainConfig {
             num_boost_round: 100,
             early_stopping_rounds: Some(20),
             verbose: true,
+            collect_train_metrics: true,
             seed: 123,
         }
     }

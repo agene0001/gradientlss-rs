@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_boost_round: 10, // Small number for quick demo
         early_stopping_rounds: None,
         verbose: true,
+        collect_train_metrics: true,
         seed: 123,
     };
 

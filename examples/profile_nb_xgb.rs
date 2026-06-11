@@ -122,6 +122,7 @@ fn main() {
         num_boost_round: rounds,
         early_stopping_rounds: None,
         verbose: false,
+        collect_train_metrics: true,
         seed: 123,
     };
 

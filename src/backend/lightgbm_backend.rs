@@ -366,6 +366,16 @@ impl BackendModel for LightGBMModel {
             }
         }
 
+        // Whether the per-round train metric is needed at all: it drives early
+        // stopping when there is no validation set, feeds verbose logging and
+        // callbacks, and is recorded when `collect_train_metrics` asks for it.
+        // When none of those apply, skipping it saves a full NLL pass over the
+        // training set every round.
+        let need_train_metric = config.collect_train_metrics
+            || config.verbose
+            || callbacks.is_some()
+            || valid_mat.is_none();
+
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
         let mut rounds_without_improvement = 0;
@@ -439,9 +449,14 @@ impl BackendModel for LightGBMModel {
             let delta = prediction_to_array2(&delta, n_samples, n_params)?;
             predictions += &delta;
 
-            // Compute training loss
-            let train_loss = metric_fn(&predictions, &labels);
-            train_history.push(train_loss);
+            // Compute training loss (only when something consumes it)
+            let train_loss = if need_train_metric {
+                let loss = metric_fn(&predictions, &labels);
+                train_history.push(loss);
+                Some(loss)
+            } else {
+                None
+            };
 
             // Compute validation loss if available — same per-iteration accumulation
             // into the running `valid_predictions` margin (carries start_values).
@@ -462,21 +477,27 @@ impl BackendModel for LightGBMModel {
             };
 
             // Determine the evaluation loss for early stopping
-            let eval_loss = valid_loss.unwrap_or(train_loss);
+            let eval_loss = valid_loss
+                .or(train_loss)
+                .expect("train metric is computed whenever no validation set is present");
 
             if config.verbose && round % 10 == 0 {
+                // `need_train_metric` is true when verbose, so this is Some.
+                let tl = train_loss.unwrap_or(f64::NAN);
                 match valid_loss {
                     Some(vl) => println!(
                         "[{}] train_loss: {:.6}, valid_loss: {:.6}",
-                        round, train_loss, vl
+                        round, tl, vl
                     ),
-                    None => println!("[{}] train_loss: {:.6}", round, train_loss),
+                    None => println!("[{}] train_loss: {:.6}", round, tl),
                 }
             }
 
             // Invoke callbacks
             if let Some(ref mut cb) = callbacks {
-                if cb.on_iteration_end(round, train_loss, valid_loss) == CallbackAction::Stop {
+                // `need_train_metric` is true when callbacks are present.
+                let tl = train_loss.unwrap_or(f64::NAN);
+                if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
                     stopped_early = true;
                     break;
                 }

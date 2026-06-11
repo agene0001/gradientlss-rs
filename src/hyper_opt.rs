@@ -441,6 +441,7 @@ pub fn hyper_opt_with_config<B: Backend>(
             num_boost_round: config.num_boost_round,
             early_stopping_rounds: config.early_stopping_rounds,
             verbose: false,
+            collect_train_metrics: true,
             seed: config.seed + trial as u64,
         };
 

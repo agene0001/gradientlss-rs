@@ -46,13 +46,29 @@ Control thread count via:
 export RAYON_NUM_THREADS=8
 ```
 
-### 4. Memory Optimizations
+### 4. Skipping the Per-Round Train Metric
+
+With a validation set driving early stopping, the per-round training-set NLL is
+pure reporting — and it costs a full pass over the training set every boosting
+round. Disable it when you do not need `TrainingResult::train_history`:
+
+```rust
+let config = TrainConfig {
+    collect_train_metrics: false, // skipped only when a valid set is present
+    ..TrainConfig::default()
+};
+```
+
+It is computed regardless whenever something still needs it: no validation set
+(train loss drives early stopping), `verbose: true`, or registered callbacks.
+
+### 5. Memory Optimizations
 
 - Pre-allocated buffers for gradients/hessians in training loops
 - In-place response function transformations (`apply_into`)
 - Buffer reuse in numerical differentiation
 
-### 5. Cached Constants
+### 6. Cached Constants
 
 Mathematical constants like `ln(2*pi)` are pre-computed in the `constants` module to avoid repeated computation.
 

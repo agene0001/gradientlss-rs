@@ -457,8 +457,11 @@ impl ResponseFn {
                 let mut d1 = Array1::zeros(n);
                 let mut d2 = Array1::zeros(n);
                 for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
-                    *o1 = 0.5 * (1.0 + v / (v * v + 4.0).sqrt());
-                    *o2 = 2.0 / (v * v + 4.0).powf(1.5);
+                    // Share one sqrt: (x²+4)^(3/2) = s³ with s = sqrt(x²+4),
+                    // replacing the much costlier powf(1.5).
+                    let s = (v * v + 4.0).sqrt();
+                    *o1 = 0.5 * (1.0 + v / s);
+                    *o2 = 2.0 / (s * s * s);
                 }
                 (d1, d2)
             }
@@ -477,6 +480,40 @@ impl ResponseFn {
                 x.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 }),
                 Array1::zeros(n),
             ),
+        }
+    }
+
+    /// Like [`Self::derivative_batches`], but reuses the already-transformed
+    /// values θ = f(x) where that recovers the derivatives without a libm call:
+    ///
+    /// - Exp:   θ = eˣ + ε     → f' = f'' = θ − ε       (skips the exp)
+    /// - ExpDf: θ = eˣ + ε + 2 → f' = f'' = θ − ε − 2   (skips the exp)
+    ///
+    /// The analytical-gradient paths always have θ in hand (it's the
+    /// `transformed` matrix), so for Exp-linked parameters this removes the
+    /// only remaining exp in the per-round gradient pass. The subtraction
+    /// cancels catastrophically only when eˣ ≪ ε, where the true derivative is
+    /// ~0 anyway and the absolute error is ≤ ~1 ulp of ε. Variants whose
+    /// derivatives aren't exactly recoverable from θ (Softplus needs an exp
+    /// either way; Sigmoid's output is clamped, so inverting θ is wrong at the
+    /// boundaries) fall back to [`Self::derivative_batches`].
+    pub fn derivative_batches_from_transformed(
+        &self,
+        x: &ArrayView1<f64>,
+        theta: &ArrayView1<f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        match self {
+            ResponseFn::Exp => {
+                let d1 = theta.mapv(|t| t - EPSILON);
+                let d2 = d1.clone();
+                (d1, d2)
+            }
+            ResponseFn::ExpDf => {
+                let d1 = theta.mapv(|t| t - EPSILON - 2.0);
+                let d2 = d1.clone();
+                (d1, d2)
+            }
+            _ => self.derivative_batches(x),
         }
     }
 }

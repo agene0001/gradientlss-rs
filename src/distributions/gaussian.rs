@@ -163,7 +163,7 @@ impl Distribution for Gaussian {
         // Batch response-fn derivatives (auto-vectorized, one shared `exp`),
         // hoisted above the branch so the sequential path no longer pays two
         // scalar `exp` calls per sample via `derivative`/`second_derivative`.
-        let (resp_deriv, resp_second) = scale_response_fn.derivative_batches(&p_scale);
+        let (resp_deriv, resp_second) = scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
 
         let compute = |i: usize| -> (f64, f64, f64, f64) {
             let loc = t_loc[i];
