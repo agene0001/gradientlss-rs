@@ -52,6 +52,51 @@ Both XGBoost and LightGBM backends require native libraries to be compiled:
    sudo apt-get install llvm-dev libclang-dev clang
    ```
 
+## Breaking Changes
+
+If you're updating from an earlier build, two changes require action:
+
+### `TrainConfig` has a new required field: `collect_train_metrics`
+
+Any code constructing `TrainConfig` as an exhaustive struct literal will fail to
+compile until the field is added:
+
+```rust
+let config = TrainConfig {
+    num_boost_round: 100,
+    early_stopping_rounds: Some(20),
+    verbose: false,
+    seed: 123,
+    collect_train_metrics: false, // <-- new field
+};
+
+// or sidestep future additions entirely:
+let config = TrainConfig {
+    num_boost_round: 100,
+    ..TrainConfig::default()
+};
+```
+
+The field controls whether the per-round training-set metric is computed when
+nothing else needs it. It **defaults to `false`** because skipping the pass
+measured ~20% faster end-to-end training with a validation set (see
+`examples/bench_collect_train_metrics.rs` and OPTIMIZATION.md). Consequences:
+
+- `TrainingResult::train_history` is now **empty by default** when a validation
+  set drives early stopping. Set `collect_train_metrics: true` to get the
+  per-round train loss curve back.
+- Nothing else changes: the train metric is still force-computed whenever it is
+  actually consumed — no validation set (train loss drives early stopping),
+  `verbose: true`, or registered callbacks — so early stopping, callbacks, and
+  the trained model itself are identical either way.
+
+### LightGBM saved-model format changed
+
+LightGBM models now persist `best_iteration` (an 8-byte header before the model
+text) so that predictions after early stopping use the best round, matching
+LightGBM's Python behavior. **Models saved with an older build will fail to
+load** — retrain and re-save them.
+
 ## Usage
 
 ### Basic Example
@@ -88,6 +133,7 @@ let dist = Gaussian::new(
         early_stopping_rounds: Some(20),
         verbose: true,
         seed: 123,
+        collect_train_metrics: false,  // set true to record per-round train loss
     };
     
     model.train(&mut train_data, None, params, config)?;

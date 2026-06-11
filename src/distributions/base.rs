@@ -208,17 +208,39 @@ pub trait Distribution: Send + Sync {
         target: &ResponseData,
         weights: Option<&ArrayView1<f64>>,
     ) -> Result<GradientsAndHessians> {
+        // Transform predictions to parameter space
+        let transformed = self.transform_params(predictions);
+        self.compute_gradients_and_hessians_with_transformed(
+            predictions,
+            &transformed.view(),
+            target,
+            weights,
+        )
+    }
+
+    /// Like [`Self::compute_gradients_and_hessians`], but takes the transformed
+    /// parameters as input instead of recomputing them. The training loop's
+    /// metric pass transforms the post-update margin every round, and the next
+    /// round's objective receives that exact margin — the model layer caches the
+    /// transform across the two calls and enters here, skipping one full
+    /// response-transform pass per boosting round.
+    ///
+    /// `transformed` MUST equal `self.transform_params(predictions)`.
+    fn compute_gradients_and_hessians_with_transformed(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+        weights: Option<&ArrayView1<f64>>,
+    ) -> Result<GradientsAndHessians> {
         let n_samples = predictions.nrows();
         let n_params = self.n_params();
 
-        // Transform predictions to parameter space
-        let transformed = self.transform_params(predictions);
-
         // Try analytical gradients first, fall back to numerical
         let (mut gradients, mut hessians) = self
-            .analytical_gradients(predictions, &transformed.view(), target)
+            .analytical_gradients(predictions, transformed, target)
             .unwrap_or_else(|| {
-                self.numerical_gradients_hessians(predictions, &transformed.view(), target)
+                self.numerical_gradients_hessians(predictions, transformed, target)
                     .unwrap_or_else(|_| {
                         (
                             Array2::zeros((n_samples, n_params)),

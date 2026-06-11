@@ -176,8 +176,8 @@ impl Distribution for ZIPoisson {
         let p_gate = predictions.column(1);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let (rd_r, rsd_r) = rate_response_fn.derivative_batches(&p_rate);
-        let (rd_g, rsd_g) = gate_response_fn.derivative_batches(&p_gate);
+        let (rd_r, rsd_r) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
+        let (rd_g, rsd_g) = gate_response_fn.derivative_batches_from_transformed(&p_gate, &t_gate);
 
         let compute = |i: usize| -> (f64, f64, f64, f64) {
             let lambda = t_rate[i].max(1e-6);

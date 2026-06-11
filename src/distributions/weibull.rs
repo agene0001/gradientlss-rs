@@ -165,8 +165,8 @@ impl Distribution for Weibull {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_s, rsd_s) = scale_response_fn.derivative_batches(&p_scale);
-            let (rd_k, rsd_k) = conc_response_fn.derivative_batches(&p_conc);
+            let (rd_s, rsd_s) = scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
+            let (rd_k, rsd_k) = conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let lambda = t_scale[i].max(1e-6);

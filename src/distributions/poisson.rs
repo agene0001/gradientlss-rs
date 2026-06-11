@@ -136,7 +136,7 @@ impl Distribution for Poisson {
         let p_rate = predictions.column(0);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let (rd, rsd) = rate_response_fn.derivative_batches(&p_rate);
+        let (rd, rsd) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
 
         let compute = |i: usize| -> (f64, f64) {
             let lambda = t_rate[i].max(1e-6);
