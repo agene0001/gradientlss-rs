@@ -27,10 +27,12 @@ thread_local! {
 /// Trampoline function that matches the signature required by xgboost::update_custom
 fn objective_trampoline(_preds: &[f32], _dtrain: &DMatrix) -> (Vec<f32>, Vec<f32>) {
     OBJECTIVE_DATA.with(|data| {
-        data.borrow()
-            .as_ref()
+        // Move the buffers out rather than cloning — they're rebuilt each round
+        // before `update_custom`, so there's no need to keep a copy here. Avoids
+        // a per-round memcpy of both (n_samples * n_params) f32 vectors.
+        data.borrow_mut()
+            .take()
             .expect("Objective data was not set before update_custom call")
-            .clone()
     })
 }
 
@@ -116,6 +118,8 @@ pub struct XGBoostDataset {
     features: Vec<f32>,
     /// Full labels (may be longer than n_rows for multivariate targets)
     full_labels: Vec<f64>,
+    /// Per-sample training weights, applied to grad/hess in the objective.
+    weights: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for XGBoostDataset {
@@ -154,6 +158,7 @@ impl BackendDataset for XGBoostDataset {
             n_cols,
             features: features_f32,
             full_labels: labels.to_vec(),
+            weights: None,
         })
     }
 
@@ -182,6 +187,9 @@ impl BackendDataset for XGBoostDataset {
         self.dmatrix.set_weights(&weights_f32).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
         })?;
+        // Keep a copy: XGBoost ignores DMatrix weights for custom objectives, so
+        // the training loop reads these back and weights grad/hess itself.
+        self.weights = Some(weights.to_owned());
         Ok(())
     }
 
@@ -195,6 +203,10 @@ impl BackendDataset for XGBoostDataset {
 
     fn get_labels(&self) -> Result<Array1<f64>> {
         Ok(Array1::from(self.full_labels.clone()))
+    }
+
+    fn get_weights(&self) -> Option<&Array1<f64>> {
+        self.weights.as_ref()
     }
 }
 
@@ -311,6 +323,11 @@ impl BackendModel for XGBoostModel {
 
         let labels = train_data.get_labels()?;
 
+        // Per-sample weights (if any). XGBoost does not apply DMatrix weights to
+        // custom-objective grad/hess, so we read them here and hand them to the
+        // objective, which scales grad/hess per-sample — matching XGBoostLSS.
+        let train_weights = train_data.get_weights().cloned();
+
         // For validation-based early stopping.
         let (valid_features, valid_labels) = if let Some(ref vd) = valid_data {
             let vl = vd.get_labels()?;
@@ -390,19 +407,24 @@ impl BackendModel for XGBoostModel {
 
         let mut final_round = 0;
 
-        for round in 0..config.num_boost_round {
-            final_round = round;
-
-            // Current margin from trees [0, round). The train DMatrix is cached at
-            // booster creation and XGBoost refreshes its prediction cache inside
-            // the previous TrainOneIter, so this is an O(new-trees) cache read.
+        // Initial train margin = trees [0, 0) (just the base_margin). We carry the
+        // margin across rounds: each round's post-update prediction is reused as
+        // the next round's pre-update (gradient) input, so the train matrix is
+        // predicted once per round (＋1 here) rather than twice. The train DMatrix
+        // is cached at booster creation, so each predict is an O(new-trees) cache
+        // read.
+        let mut predictions = {
             let raw_preds = booster
                 .predict(&train_data.dmatrix)
                 .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-            let predictions = prediction_to_array2(&raw_preds, n_samples, n_params);
+            prediction_to_array2(&raw_preds, n_samples, n_params)
+        };
 
-            // Gradients/hessians for all distribution parameters.
-            let gh = objective_fn(&predictions, &labels, None)?;
+        for round in 0..config.num_boost_round {
+            final_round = round;
+
+            // Gradients/hessians on the current margin = trees [0, round).
+            let gh = objective_fn(&predictions, &labels, train_weights.as_ref())?;
 
             // Flatten gradients/hessians row-major: [g_s0_p0, g_s0_p1, ..., g_s1_p0, ...]
             // This matches Python which concatenates per-param gradients along axis=1
@@ -421,14 +443,24 @@ impl BackendModel for XGBoostModel {
                 *data.borrow_mut() = Some((grad_f32, hess_f32));
             });
 
-            // Training loss reflects trees [0, round) (pre-update), matching prior behavior.
-            let train_loss = metric_fn(&predictions, &labels);
-            train_history.push(train_loss);
-
             // Update the single booster with all parameters' gradients
             booster
                 .update_custom(&train_data.dmatrix, round as i32, objective_trampoline)
                 .map_err(|e| GradientLSSError::BackendError(format!("Update failed: {}", e)))?;
+
+            // Refresh the train margin to the post-update model (trees [0, round]).
+            // The train loss is therefore measured AFTER this round's tree is added,
+            // matching the validation loss below (both reflect trees [0, round]) —
+            // so train-only early stopping no longer lags the model by one tree.
+            // This same array is carried into the next round as its pre-update
+            // (gradient) margin, keeping it at one predict per round.
+            let raw_preds = booster
+                .predict(&train_data.dmatrix)
+                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
+            predictions = prediction_to_array2(&raw_preds, n_samples, n_params);
+
+            let train_loss = metric_fn(&predictions, &labels);
+            train_history.push(train_loss);
 
             // Validation loss (post-update → trees [0, round]). The validation
             // DMatrix is also cached, so this is likewise a cache read.

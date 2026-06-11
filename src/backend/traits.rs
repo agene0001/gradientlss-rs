@@ -730,6 +730,19 @@ pub trait BackendDataset: Sized {
     /// Get the labels.
     fn get_labels(&self) -> Result<Array1<f64>>;
 
+    /// Get the per-sample training weights set via [`set_weights`], if any.
+    ///
+    /// Returned by reference so the training loop can hand them to the objective.
+    /// Custom-objective boosting does NOT apply dataset weights to user-supplied
+    /// gradients/hessians (only built-in objectives do), so the backend must read
+    /// these back and weight the grad/hess itself — matching XGBoostLSS, which
+    /// does `grad *= weights; hess *= weights`.
+    ///
+    /// [`set_weights`]: BackendDataset::set_weights
+    fn get_weights(&self) -> Option<&Array1<f64>> {
+        None
+    }
+
     /// Get the number of target dimensions (for multivariate support).
     fn n_targets(&self) -> usize {
         1

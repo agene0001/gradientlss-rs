@@ -375,6 +375,88 @@ mod xgboost_tests {
         );
     }
 
+    /// End-to-end proof that per-sample weights actually influence the fit.
+    /// XGBoost does NOT apply DMatrix weights to a custom objective's grad/hess,
+    /// so the backend must read them back and scale grad/hess itself. This test
+    /// pins two invariants that a no-op `set_weights` (the prior bug) would break:
+    ///   1. weight ≡ 1.0 trains identically to no weights at all, and
+    ///   2. a non-uniform weight vector produces a measurably different model.
+    #[test]
+    fn test_xgboost_weights_affect_training() {
+        // A relationship the model must learn, so weighting actually matters.
+        let features = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 6.0],
+            [6.0, 5.0],
+            [7.0, 8.0],
+            [8.0, 7.0]
+        ];
+        let labels = array![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let test_features = array![[2.5, 3.5], [6.5, 5.5]];
+
+        let config = gradientlss::backend::TrainConfig {
+            num_boost_round: 25,
+            early_stopping_rounds: None,
+            verbose: false,
+            seed: 7,
+        };
+
+        let train_and_predict = |weights: Option<Array1<f64>>| -> ndarray::Array2<f64> {
+            let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+            let mut train_data = match weights {
+                Some(w) => <XGBoostBackend as Backend>::Dataset::from_data_with_weights(
+                    features.view(),
+                    labels.view(),
+                    w.view(),
+                )
+                .unwrap(),
+                None => <XGBoostBackend as Backend>::Dataset::from_data(
+                    features.view(),
+                    labels.view(),
+                )
+                .unwrap(),
+            };
+            let params = XGBoostBackend::create_params(model.n_params());
+            model
+                .train(&mut train_data, None, params, config.clone())
+                .unwrap();
+            match model
+                .predict(&test_features.view(), PredType::Parameters, 0, &[], 1)
+                .unwrap()
+            {
+                gradientlss::backend::PredictionOutput::Parameters(p) => p,
+                _ => unreachable!(),
+            }
+        };
+
+        let unweighted = train_and_predict(None);
+        let ones = train_and_predict(Some(Array1::from_elem(labels.len(), 1.0)));
+        let skewed = train_and_predict(Some(array![5.0, 5.0, 5.0, 5.0, 0.1, 0.1, 0.1, 0.1]));
+
+        // (1) weight ≡ 1 must match unweighted training exactly (same grad/hess).
+        for (a, b) in unweighted.iter().zip(ones.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "weight=1 must equal unweighted: {a} vs {b}",
+            );
+        }
+
+        // (2) a skewed weighting must move the predicted parameters. If weights
+        // were silently ignored, `skewed` would equal `unweighted` here.
+        let max_diff = unweighted
+            .iter()
+            .zip(skewed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff > 1e-6,
+            "skewed weights must change the fit (max diff {max_diff})",
+        );
+    }
+
     #[test]
     fn test_xgboost_prediction() {
         let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));

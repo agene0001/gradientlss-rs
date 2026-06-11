@@ -95,6 +95,8 @@ pub struct LightGBMDataset {
     labels: Array1<f64>,
     /// Store features for prediction during training
     features: Vec<f32>,
+    /// Per-sample training weights, applied to grad/hess in the objective.
+    weights: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for LightGBMDataset {
@@ -147,6 +149,7 @@ impl BackendDataset for LightGBMDataset {
             n_cols,
             labels: labels.to_owned(),
             features: features_f32,
+            weights: None,
         })
     }
 
@@ -203,11 +206,18 @@ impl BackendDataset for LightGBMDataset {
         ds.set_field(Field::<f32>::WEIGHT, &weights_f32).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
         })?;
+        // Keep a copy: LightGBM ignores dataset weights for custom objectives, so
+        // the training loop reads these back and weights grad/hess itself.
+        self.weights = Some(weights.to_owned());
         Ok(())
     }
 
     fn supports_weights() -> bool {
         true
+    }
+
+    fn get_weights(&self) -> Option<&Array1<f64>> {
+        self.weights.as_ref()
     }
 }
 
@@ -306,6 +316,11 @@ impl BackendModel for LightGBMModel {
         let n_features = train_data.n_cols();
         let labels = train_data.get_labels()?;
 
+        // Per-sample weights (if any). LightGBM does not apply dataset weights to
+        // custom-objective grad/hess, so we read them here and hand them to the
+        // objective, which scales grad/hess per-sample — matching LightGBMLSS.
+        let train_weights = train_data.get_weights().cloned();
+
         // Create booster
         let mut booster =
             Booster::new(train_data.dataset.clone(), params.inner()).map_err(|e| {
@@ -368,7 +383,7 @@ impl BackendModel for LightGBMModel {
             final_round = round;
 
             // Compute gradients and hessians using our distribution
-            let gh = objective_fn(&predictions, &labels, None)?;
+            let gh = objective_fn(&predictions, &labels, train_weights.as_ref())?;
 
             // Flatten gradients and hessians in Fortran order (column-major)
             // lgbm expects: [grad_param0_sample0, grad_param0_sample1, ..., grad_param1_sample0, ...]

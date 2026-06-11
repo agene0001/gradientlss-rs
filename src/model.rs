@@ -144,15 +144,40 @@ impl<B: Backend> GradientLSS<B> {
         if let Some(ref start_vals) = self.start_values {
             let n_samples = dataset.num_rows();
             let n_params = self.n_params();
+            // Row-major (sample-major) layout: [s0_p0, s0_p1, ..., s1_p0, ...],
+            // matching what the backends' `set_init_score` / `set_base_margin`
+            // expect for multi-output. (The XGBoost training path overwrites this
+            // and LightGBM's setter is a no-op, so this is currently inert — but
+            // the column-major layout it previously built would be a latent bug.)
             let mut init_score = Array1::zeros(n_samples * n_params);
-            for j in 0..n_params {
-                for i in 0..n_samples {
-                    init_score[j * n_samples + i] = start_vals[j];
+            for i in 0..n_samples {
+                for j in 0..n_params {
+                    init_score[i * n_params + j] = start_vals[j];
                 }
             }
             dataset.set_init_score(&init_score)?;
         }
         Ok(())
+    }
+
+    /// Compute the NLL of already-transformed parameters against `labels`,
+    /// handling the univariate/multivariate reshape. Shared by the metric closure
+    /// (both the cache-hit and recompute paths).
+    fn nll_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+        let n_targets = self.dist.n_targets();
+        if n_targets == 1 {
+            let target = ResponseData::Univariate(&labels.view());
+            self.dist.nll(&transformed.view(), &target)
+        } else {
+            let n_samples = labels.len() / n_targets;
+            match labels.view().into_shape_with_order((n_samples, n_targets)) {
+                Ok(reshaped) => {
+                    let target = ResponseData::Multivariate(&reshaped);
+                    self.dist.nll(&transformed.view(), &target)
+                }
+                Err(_) => f64::INFINITY,
+            }
+        }
     }
 
     fn create_objective_fn(
@@ -161,13 +186,11 @@ impl<B: Backend> GradientLSS<B> {
     {
         let n_targets = self.dist.n_targets();
         move |predictions, labels, weights| {
+            let w = weights.map(|w| w.view());
             if n_targets == 1 {
                 let target = ResponseData::Univariate(&labels.view());
-                self.dist.compute_gradients_and_hessians(
-                    &predictions.view(),
-                    &target,
-                    weights.map(|w| w.view()).as_ref(),
-                )
+                self.dist
+                    .compute_gradients_and_hessians(&predictions.view(), &target, w.as_ref())
             } else {
                 let n_samples = labels.len() / n_targets;
                 let reshaped = labels
@@ -175,32 +198,16 @@ impl<B: Backend> GradientLSS<B> {
                     .into_shape_with_order((n_samples, n_targets))
                     .map_err(GradientLSSError::from)?;
                 let target = ResponseData::Multivariate(&reshaped);
-                self.dist.compute_gradients_and_hessians(
-                    &predictions.view(),
-                    &target,
-                    weights.map(|w| w.view()).as_ref(),
-                )
+                self.dist
+                    .compute_gradients_and_hessians(&predictions.view(), &target, w.as_ref())
             }
         }
     }
 
     fn create_metric_fn(&self) -> impl Fn(&Array2<f64>, &Array1<f64>) -> f64 + '_ {
-        let n_targets = self.dist.n_targets();
         move |predictions, labels| {
             let transformed = self.dist.transform_params(&predictions.view());
-            if n_targets == 1 {
-                let target = ResponseData::Univariate(&labels.view());
-                self.dist.nll(&transformed.view(), &target)
-            } else {
-                let n_samples = labels.len() / n_targets;
-                match labels.view().into_shape_with_order((n_samples, n_targets)) {
-                    Ok(reshaped) => {
-                        let target = ResponseData::Multivariate(&reshaped);
-                        self.dist.nll(&transformed.view(), &target)
-                    }
-                    Err(_) => f64::INFINITY,
-                }
-            }
+            self.nll_on_transformed(&transformed, labels)
         }
     }
 
@@ -354,12 +361,15 @@ impl<B: Backend> GradientLSS<B> {
             let mut model = GradientLSS::<B>::new(self.dist.clone());
             model.train(&mut train_data, None, params.clone(), config.clone())?;
 
-            let raw_preds = model
-                .model
-                .as_ref()
-                .unwrap()
-                .predict_raw(&test_features.view())?;
-            let score = (self.create_metric_fn())(&raw_preds, &test_labels.to_owned());
+            // Score on the predicted *parameters*, which add the model's start
+            // values (base margin) before transforming — `predict_raw` omits them,
+            // so scoring its output transforms the wrong point. Mirrors hyper_opt.
+            let preds = match model.predict(&test_features, PredType::Parameters, 0, &[], 0)? {
+                PredictionOutput::Parameters(p) => p,
+                _ => unreachable!("PredType::Parameters yields Parameters"),
+            };
+            let target = ResponseData::Univariate(&test_labels);
+            let score = self.dist.nll(&preds.view(), &target);
             scores.push(score);
         }
 
@@ -471,12 +481,14 @@ impl<B: Backend> GradientLSS<B> {
             let mut model = GradientLSS::<B>::new(self.dist.clone());
             model.train(&mut train_data, None, params.clone(), config.clone())?;
 
-            let raw_preds = model
-                .model
-                .as_ref()
-                .unwrap()
-                .predict_raw(&test_features.view())?;
-            let score = (self.create_metric_fn())(&raw_preds, &test_labels);
+            // Score on predicted parameters (start values added) — see `cv`.
+            let preds = match model.predict(&test_features.view(), PredType::Parameters, 0, &[], 0)? {
+                PredictionOutput::Parameters(p) => p,
+                _ => unreachable!("PredType::Parameters yields Parameters"),
+            };
+            let test_labels_view = test_labels.view();
+            let target = ResponseData::Univariate(&test_labels_view);
+            let score = self.dist.nll(&preds.view(), &target);
             scores.push(score);
         }
 
@@ -545,9 +557,20 @@ impl<B: Backend> GradientLSS<B> {
                     obs_samples
                         .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+                    let n = obs_samples.len();
+                    if n == 0 {
+                        continue;
+                    }
                     for (q_idx, &q) in quantiles.iter().enumerate() {
-                        let idx = ((obs_samples.len() as f64 - 1.0) * q) as usize;
-                        quant_result[[i, q_idx]] = obs_samples[idx.min(obs_samples.len() - 1)];
+                        // Linear interpolation between order statistics, matching
+                        // numpy/pandas' default `quantile` (interpolation="linear").
+                        // A floor index biases discrete/tail quantiles low.
+                        let pos = (n as f64 - 1.0) * q.clamp(0.0, 1.0);
+                        let lo = pos.floor() as usize;
+                        let hi = pos.ceil() as usize;
+                        let frac = pos - lo as f64;
+                        quant_result[[i, q_idx]] =
+                            obs_samples[lo] + frac * (obs_samples[hi] - obs_samples[lo]);
                     }
                 }
                 Ok(PredictionOutput::Quantiles(quant_result))
