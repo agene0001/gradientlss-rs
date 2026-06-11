@@ -57,7 +57,7 @@ impl ZINB {
 
     /// NB ln_pmf inlined: ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
     fn nb_ln_pmf(r: f64, p: f64, k: f64) -> f64 {
-        ln_gamma(r + k) - ln_gamma(r) - ln_gamma(k + 1.0) + r * p.ln() + k * (-p).ln_1p()
+        ln_gamma(r + k) - ln_gamma(r) - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0)) + r * p.ln() + k * (-p).ln_1p()
     }
 
     /// Helper method for scalar log probability (inlined formula)
@@ -192,12 +192,9 @@ impl Distribution for ZINB {
         let p_gate = predictions.column(2);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let rd_r = r_response_fn.derivative_batch(&p_r);
-        let rsd_r = r_response_fn.second_derivative_batch(&p_r);
-        let rd_p = probs_response_fn.derivative_batch(&p_probs);
-        let rsd_p = probs_response_fn.second_derivative_batch(&p_probs);
-        let rd_g = gate_response_fn.derivative_batch(&p_gate);
-        let rsd_g = gate_response_fn.second_derivative_batch(&p_gate);
+        let (rd_r, rsd_r) = r_response_fn.derivative_batches(&p_r);
+        let (rd_p, rsd_p) = probs_response_fn.derivative_batches(&p_probs);
+        let (rd_g, rsd_g) = gate_response_fn.derivative_batches(&p_gate);
 
         let compute = |i: usize| -> (f64, f64, f64, f64, f64, f64) {
             let r = t_r[i].max(1e-6);

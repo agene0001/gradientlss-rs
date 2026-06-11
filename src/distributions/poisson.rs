@@ -54,7 +54,7 @@ impl Poisson {
             return f64::NEG_INFINITY;
         }
         // ln_pmf = -λ + k*ln(λ) - ln(k!) = -λ + k*ln(λ) - ln_gamma(k+1)
-        -rate + k * rate.ln() - ln_gamma(k + 1.0)
+        -rate + k * rate.ln() - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
     }
 }
 
@@ -136,8 +136,7 @@ impl Distribution for Poisson {
         let p_rate = predictions.column(0);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let rd = rate_response_fn.derivative_batch(&p_rate);
-        let rsd = rate_response_fn.second_derivative_batch(&p_rate);
+        let (rd, rsd) = rate_response_fn.derivative_batches(&p_rate);
 
         let compute = |i: usize| -> (f64, f64) {
             let lambda = t_rate[i].max(1e-6);

@@ -420,6 +420,65 @@ impl ResponseFn {
             ResponseFn::Relu | ResponseFn::ReluDf => Array1::zeros(x.len()),
         }
     }
+
+    /// Compute first and second derivatives together for an entire column.
+    ///
+    /// The analytical gradient paths always need both, and for the
+    /// transcendental response functions (Exp, Softplus, Sigmoid) the two
+    /// derivatives share the same `exp` evaluation — computing them in one
+    /// pass halves the libm calls, which dominate the batch cost. Values are
+    /// identical to calling `derivative_batch` and `second_derivative_batch`
+    /// separately: same formulas, fed by the same single `exp` result.
+    pub fn derivative_batches(&self, x: &ArrayView1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let n = x.len();
+        match self {
+            ResponseFn::Identity => (Array1::ones(n), Array1::zeros(n)),
+            ResponseFn::Exp | ResponseFn::ExpDf => {
+                let mut d1 = Array1::zeros(n);
+                let mut d2 = Array1::zeros(n);
+                for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
+                    let e = v.exp();
+                    *o1 = e;
+                    *o2 = e;
+                }
+                (d1, d2)
+            }
+            ResponseFn::Softplus | ResponseFn::SoftplusDf => {
+                let mut d1 = Array1::zeros(n);
+                let mut d2 = Array1::zeros(n);
+                for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
+                    let s = 1.0 / (1.0 + (-v).exp());
+                    *o1 = s;
+                    *o2 = s * (1.0 - s);
+                }
+                (d1, d2)
+            }
+            ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
+                let mut d1 = Array1::zeros(n);
+                let mut d2 = Array1::zeros(n);
+                for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
+                    *o1 = 0.5 * (1.0 + v / (v * v + 4.0).sqrt());
+                    *o2 = 2.0 / (v * v + 4.0).powf(1.5);
+                }
+                (d1, d2)
+            }
+            ResponseFn::Sigmoid => {
+                let mut d1 = Array1::zeros(n);
+                let mut d2 = Array1::zeros(n);
+                for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
+                    let s = 1.0 / (1.0 + (-v).exp());
+                    let d = s * (1.0 - s);
+                    *o1 = d;
+                    *o2 = d * (1.0 - 2.0 * s);
+                }
+                (d1, d2)
+            }
+            ResponseFn::Relu | ResponseFn::ReluDf => (
+                x.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 }),
+                Array1::zeros(n),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

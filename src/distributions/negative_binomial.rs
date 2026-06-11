@@ -105,7 +105,7 @@ impl NegativeBinomial {
         // They are complementary: statrs_p = 1 - probs
         let p = 1.0 - probs;
         // ln_pmf = ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
-        ln_gamma(r + k) - ln_gamma(r) - ln_gamma(k + 1.0) + r * p.ln() + k * (-p).ln_1p()
+        ln_gamma(r + k) - ln_gamma(r) - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0)) + r * p.ln() + k * (-p).ln_1p()
     }
 }
 
@@ -202,10 +202,8 @@ impl Distribution for NegativeBinomial {
         // Batch response-fn derivatives (auto-vectorized); shared by the
         // sequential and parallel paths so we no longer branch on the per-sample
         // scalar derivative calls.
-        let rd_r = r_response_fn.derivative_batch(&p_r);
-        let rsd_r = r_response_fn.second_derivative_batch(&p_r);
-        let rd_p = probs_response_fn.derivative_batch(&p_probs);
-        let rsd_p = probs_response_fn.second_derivative_batch(&p_probs);
+        let (rd_r, rsd_r) = r_response_fn.derivative_batches(&p_r);
+        let (rd_p, rsd_p) = probs_response_fn.derivative_batches(&p_probs);
 
         // Per-sample (grad_r, hess_r, grad_probs, hess_probs) in prediction space.
         let compute = |i: usize| -> (f64, f64, f64, f64) {

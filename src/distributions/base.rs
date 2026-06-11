@@ -698,6 +698,22 @@ pub trait Distribution: Send + Sync {
 
 /// Replace NaN values in array with column means.
 fn replace_nans_with_mean(arr: &mut Array2<f64>) {
+    // Fast clean-path: a single contiguous, branch-light scan over the whole
+    // backing buffer. The analytical gradient paths clamp their inputs and
+    // floor hessians, so non-finite values are the exception, not the rule —
+    // and this runs on both gradients and hessians every boosting round.
+    // When the buffer is already finite (the common case) we skip the strided
+    // per-column mean/fix-up work entirely. C-order arrays are contiguous, so
+    // `as_slice` is Some; a non-contiguous view falls through to the columns.
+    if let Some(slice) = arr.as_slice() {
+        // OR-reduce instead of short-circuiting: no per-element branch, fully
+        // auto-vectorizable. NaN/±inf are exactly the non-finite values.
+        let any_bad = slice.iter().fold(false, |acc, &v| acc | !v.is_finite());
+        if !any_bad {
+            return;
+        }
+    }
+
     for mut col in arr.columns_mut() {
         // Single-pass mean computation avoids intermediate Vec allocation
         let (sum, count) = col.iter().fold((0.0, 0usize), |(s, c), &v| {

@@ -53,6 +53,32 @@ pub fn trigamma(mut x: f64) -> f64 {
     result
 }
 
+/// ln(k!) = ln_gamma(k+1) for integer k, served from a lazily-built table.
+///
+/// Every discrete distribution's log-pmf pays a `ln_gamma(k + 1)` per sample
+/// per NLL evaluation, but the target `k` never changes across boosting
+/// rounds and real-world counts are small integers. The table entries are
+/// computed with `ln_gamma` itself, so a hit is bit-identical to the direct
+/// call — this is a cache, not an approximation. Non-integer, negative, or
+/// large `k` fall back to `None` (caller computes `ln_gamma(k + 1.0)`).
+pub(crate) fn ln_factorial(k: f64) -> Option<f64> {
+    const TABLE_SIZE: usize = 256;
+    static TABLE: std::sync::OnceLock<[f64; TABLE_SIZE]> = std::sync::OnceLock::new();
+
+    if k >= 0.0 && k < TABLE_SIZE as f64 && k == k.trunc() {
+        let table = TABLE.get_or_init(|| {
+            let mut t = [0.0; TABLE_SIZE];
+            for (i, v) in t.iter_mut().enumerate() {
+                *v = statrs::function::gamma::ln_gamma(i as f64 + 1.0);
+            }
+            t
+        });
+        Some(table[k as usize])
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +96,18 @@ mod tests {
         // ψ₁(0.5) = π²/2
         let expected_half = std::f64::consts::PI * std::f64::consts::PI / 2.0;
         assert!((trigamma(0.5) - expected_half).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_ln_factorial_matches_ln_gamma() {
+        use statrs::function::gamma::ln_gamma;
+        for k in [0.0, 1.0, 2.0, 5.0, 64.0, 255.0] {
+            assert_eq!(ln_factorial(k), Some(ln_gamma(k + 1.0)));
+        }
+        // Outside the table or non-integer → caller falls back to ln_gamma.
+        assert_eq!(ln_factorial(256.0), None);
+        assert_eq!(ln_factorial(2.5), None);
+        assert_eq!(ln_factorial(-1.0), None);
     }
 
     #[test]

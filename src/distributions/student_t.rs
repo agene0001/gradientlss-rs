@@ -185,10 +185,8 @@ impl Distribution for StudentT {
         let mut hessians = Array2::zeros((n_samples, 3));
 
         if n_samples >= 4096 {
-            let rd_df = df_response_fn.derivative_batch(&p_df);
-            let rsd_df = df_response_fn.second_derivative_batch(&p_df);
-            let rd_scale = scale_response_fn.derivative_batch(&p_scale);
-            let rsd_scale = scale_response_fn.second_derivative_batch(&p_scale);
+            let (rd_df, rsd_df) = df_response_fn.derivative_batches(&p_df);
+            let (rd_scale, rsd_scale) = scale_response_fn.derivative_batches(&p_scale);
 
             let compute_sample = |i: usize| -> ([f64; 3], [f64; 3]) {
                 let nu = t_df[i].max(1e-6);

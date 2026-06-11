@@ -163,8 +163,7 @@ impl Distribution for Laplace {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for scale (loc uses Identity: deriv=1, second=0)
-            let resp_deriv = scale_response_fn.derivative_batch(&p_scale);
-            let resp_second = scale_response_fn.second_derivative_batch(&p_scale);
+            let (resp_deriv, resp_second) = scale_response_fn.derivative_batches(&p_scale);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let loc = t_loc[i];

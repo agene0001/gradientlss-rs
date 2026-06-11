@@ -51,7 +51,7 @@ impl ZIPoisson {
 
     /// Poisson ln_pmf inlined: -λ + k*ln(λ) - ln_gamma(k+1)
     fn poisson_ln_pmf(rate: f64, k: f64) -> f64 {
-        -rate + k * rate.ln() - ln_gamma(k + 1.0)
+        -rate + k * rate.ln() - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
     }
 
     /// Helper method for scalar log probability (inlined formula)
@@ -176,10 +176,8 @@ impl Distribution for ZIPoisson {
         let p_gate = predictions.column(1);
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
-        let rd_r = rate_response_fn.derivative_batch(&p_rate);
-        let rsd_r = rate_response_fn.second_derivative_batch(&p_rate);
-        let rd_g = gate_response_fn.derivative_batch(&p_gate);
-        let rsd_g = gate_response_fn.second_derivative_batch(&p_gate);
+        let (rd_r, rsd_r) = rate_response_fn.derivative_batches(&p_rate);
+        let (rd_g, rsd_g) = gate_response_fn.derivative_batches(&p_gate);
 
         let compute = |i: usize| -> (f64, f64, f64, f64) {
             let lambda = t_rate[i].max(1e-6);
