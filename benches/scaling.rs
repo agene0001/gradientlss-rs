@@ -334,7 +334,7 @@ mod xgboost_scaling {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -376,7 +376,7 @@ mod xgboost_scaling {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -418,7 +418,7 @@ mod xgboost_scaling {
                             num_boost_round: rounds,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -455,7 +455,7 @@ mod xgboost_scaling {
             num_boost_round: 100,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -531,7 +531,7 @@ mod lightgbm_scaling {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -573,7 +573,7 @@ mod lightgbm_scaling {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(

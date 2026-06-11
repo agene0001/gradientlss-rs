@@ -83,7 +83,7 @@ mod xgboost_benchmarks {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -123,7 +123,7 @@ mod xgboost_benchmarks {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -164,7 +164,7 @@ mod xgboost_benchmarks {
                             num_boost_round: rounds,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -206,7 +206,7 @@ mod xgboost_benchmarks {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -269,7 +269,7 @@ mod lightgbm_benchmarks {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -309,7 +309,7 @@ mod lightgbm_benchmarks {
                             num_boost_round: 50,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -350,7 +350,7 @@ mod lightgbm_benchmarks {
                             num_boost_round: rounds,
                             early_stopping_rounds: None,
                             verbose: false,
-                            collect_train_metrics: true,
+                            collect_train_metrics: false,
                             seed: 42,
                         };
                         model.train(
@@ -410,7 +410,7 @@ mod backend_comparison {
                         num_boost_round: 50,
                         early_stopping_rounds: None,
                         verbose: false,
-                        collect_train_metrics: true,
+                        collect_train_metrics: false,
                         seed: 42,
                     };
                     model.train(
@@ -439,7 +439,7 @@ mod backend_comparison {
                         num_boost_round: 50,
                         early_stopping_rounds: None,
                         verbose: false,
-                        collect_train_metrics: true,
+                        collect_train_metrics: false,
                         seed: 42,
                     };
                     model.train(

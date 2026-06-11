@@ -21,10 +21,14 @@ pub struct TrainConfig {
     /// Whether to compute and record the per-round training-set metric even
     /// when nothing else needs it. The train metric is a full NLL/CRPS pass
     /// over the training set every round; with a validation set driving early
-    /// stopping it is pure reporting. Setting this to `false` skips that pass
-    /// (leaving `TrainingResult::train_history` empty) — except when something
-    /// still requires it: no validation set (train loss drives early stopping),
-    /// `verbose` logging, or registered callbacks.
+    /// stopping it is pure reporting, and skipping it measured ~20% faster
+    /// end-to-end training (NB + XGBoost, 50k×20, valid set, quiet — see
+    /// `examples/bench_collect_train_metrics.rs`).
+    ///
+    /// Defaults to `false`: `TrainingResult::train_history` stays empty unless
+    /// you opt in. The metric is still computed whenever something requires
+    /// it, regardless of this flag: no validation set (train loss drives early
+    /// stopping), `verbose` logging, or registered callbacks.
     pub collect_train_metrics: bool,
 }
 
@@ -34,7 +38,7 @@ impl Default for TrainConfig {
             num_boost_round: 100,
             early_stopping_rounds: Some(20),
             verbose: true,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 123,
         }
     }
@@ -78,7 +82,10 @@ pub struct TrainingResult {
     pub best_iteration: Option<usize>,
     /// Best score achieved (if early stopping was used).
     pub best_score: Option<f64>,
-    /// Training loss history.
+    /// Training loss history. Empty when the per-round train metric was
+    /// skipped — see `TrainConfig::collect_train_metrics` (default `false`);
+    /// it is populated whenever early stopping ran on the train loss (no
+    /// validation set), `verbose` was on, or callbacks were registered.
     pub train_history: Vec<f64>,
     /// Validation loss history (if validation data was provided).
     pub valid_history: Vec<f64>,

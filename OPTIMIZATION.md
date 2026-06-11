@@ -46,15 +46,18 @@ Control thread count via:
 export RAYON_NUM_THREADS=8
 ```
 
-### 4. Skipping the Per-Round Train Metric
+### 4. Per-Round Train Metric (off by default)
 
 With a validation set driving early stopping, the per-round training-set NLL is
 pure reporting — and it costs a full pass over the training set every boosting
-round. Disable it when you do not need `TrainingResult::train_history`:
+round. Skipping it measured ~20% faster end-to-end training (NB + XGBoost,
+50k×20, validation set, quiet; see `examples/bench_collect_train_metrics.rs`),
+so it is **off by default**. Opt in when you want per-round train curves in
+`TrainingResult::train_history`:
 
 ```rust
 let config = TrainConfig {
-    collect_train_metrics: false, // skipped only when a valid set is present
+    collect_train_metrics: true,
     ..TrainConfig::default()
 };
 ```

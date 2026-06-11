@@ -402,7 +402,7 @@ mod xgboost_tests {
             num_boost_round: 25,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 7,
         };
 
@@ -1875,7 +1875,7 @@ mod save_load_tests {
             num_boost_round: 10,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
@@ -2620,7 +2620,7 @@ mod training_callback_integration_tests {
             num_boost_round: 20,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
@@ -2681,7 +2681,7 @@ mod training_callback_integration_tests {
             num_boost_round: 20,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
@@ -2744,7 +2744,7 @@ mod training_callback_integration_tests {
             num_boost_round: 1000,       // High number, should stop early
             early_stopping_rounds: None, // Rely on callback instead
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
@@ -2801,7 +2801,7 @@ mod xgboost_callback_integration_tests {
             num_boost_round: 15,
             early_stopping_rounds: None,
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
@@ -2841,7 +2841,7 @@ mod xgboost_callback_integration_tests {
             num_boost_round: 500,
             early_stopping_rounds: None, // Use callback
             verbose: false,
-            collect_train_metrics: true,
+            collect_train_metrics: false,
             seed: 42,
         };
 
