@@ -133,7 +133,7 @@ impl Distribution for Weibull {
     /// - dNLL/dk = -1/k + ln(t)*(t^k - 1)
     ///
     /// Hessians:
-    /// - d²NLL/dλ² = k*((k+1)*t^k - k) / λ²
+    /// - d²NLL/dλ² = k*((k+1)*t^k - 1) / λ²
     /// - d²NLL/dk² = 1/k² + t^k * ln(t)²
     fn analytical_gradients(
         &self,
@@ -182,7 +182,7 @@ impl Distribution for Weibull {
                 let t_k = t.powf(k);
 
                 let grad_lambda = k * (1.0 - t_k) / lambda;
-                let hess_lambda = k * ((k + 1.0) * t_k - k) / (lambda * lambda);
+                let hess_lambda = k * ((k + 1.0) * t_k - 1.0) / (lambda * lambda);
                 let grad_k = -1.0 / k + ln_t * (t_k - 1.0);
                 let hess_k = 1.0 / (k * k) + t_k * ln_t * ln_t;
 
@@ -225,7 +225,7 @@ impl Distribution for Weibull {
                 let t_k = t.powf(k);
 
                 let grad_lambda = k * (1.0 - t_k) / lambda;
-                let hess_lambda = k * ((k + 1.0) * t_k - k) / (lambda * lambda);
+                let hess_lambda = k * ((k + 1.0) * t_k - 1.0) / (lambda * lambda);
                 let grad_k = -1.0 / k + ln_t * (t_k - 1.0);
                 let hess_k = 1.0 / (k * k) + t_k * ln_t * ln_t;
 
@@ -315,6 +315,15 @@ mod tests {
         for i in 0..3 {
             for j in 0..2 {
                 assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-2);
+                // Hessians must agree too — the scale Hessian previously used
+                // k*((k+1)*t^k - k)/λ² (only correct at k=1) instead of
+                // k*((k+1)*t^k - 1)/λ².
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
+                );
             }
         }
     }

@@ -110,6 +110,11 @@ impl Distribution for Cauchy {
     /// Gradients:
     /// - ∂NLL/∂μ = -2z / (s*(1+z²))
     /// - ∂NLL/∂s = (1 - z²) / (s*(1+z²))
+    ///
+    /// Hessians:
+    /// - ∂²NLL/∂μ² = 2*(1-z²) / (s²*(1+z²)²)
+    /// - ∂²NLL/∂s² = (z⁴ + 4z² - 1) / (s²*(1+z²)²)
+    ///   (note z depends on s: with c = x-μ, NLL(s) = ln(s²+c²) - ln(s) up to consts)
     fn analytical_gradients(
         &self,
         predictions: &ArrayView2<f64>,
@@ -158,7 +163,7 @@ impl Distribution for Cauchy {
                 // Gradient/Hessian w.r.t. scale with chain rule
                 let grad_scale_param = (1.0 - z2) / (scale * denom);
                 let z4 = z2 * z2;
-                let hess_scale_param = (3.0 * z4 - 6.0 * z2 - 1.0) / (scale_sq * denom_sq);
+                let hess_scale_param = (z4 + 4.0 * z2 - 1.0) / (scale_sq * denom_sq);
                 let rd = resp_deriv[i];
                 let rsd = resp_second[i];
                 let g1 = grad_scale_param * rd;
@@ -196,7 +201,7 @@ impl Distribution for Cauchy {
                 let rsd = scale_response_fn.second_derivative(pred_scale);
                 let grad_scale_param = (1.0 - z2) / (scale * denom);
                 let z4 = z2 * z2;
-                let hess_scale_param = (3.0 * z4 - 6.0 * z2 - 1.0) / (scale_sq * denom_sq);
+                let hess_scale_param = (z4 + 4.0 * z2 - 1.0) / (scale_sq * denom_sq);
                 let g1 = grad_scale_param * rd;
                 let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
 
@@ -248,5 +253,39 @@ mod tests {
         let log_p = dist.log_prob_scalar(&[0.0, 1.0], 0.0);
         let expected = -LOG_PI;
         assert_relative_eq!(log_p, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_cauchy_analytical_vs_numerical_gradients() {
+        use crate::distributions::base::Distribution;
+        use crate::types::ResponseData;
+        use ndarray::array;
+
+        let dist = Cauchy::default();
+        let predictions = array![[0.0, 0.0], [0.5, 0.3], [-0.2, 0.6]];
+        let targets = array![1.0, 2.0, -1.5];
+        let target = ResponseData::Univariate(&targets.view());
+
+        let transformed = dist.transform_params(&predictions.view());
+        let analytical = dist
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return analytical gradients");
+        let numerical = dist
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("Should return numerical gradients");
+
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-3);
+                // The scale Hessian previously used (3z⁴-6z²-1) instead of
+                // (z⁴+4z²-1) in the numerator — wrong sign at |z| ≈ 1.
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
+                );
+            }
+        }
     }
 }

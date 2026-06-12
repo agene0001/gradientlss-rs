@@ -155,6 +155,12 @@ impl Distribution for StudentT {
     /// - ∂NLL/∂μ = -(ν+1)*d / (σ*(ν+d²))
     /// - ∂NLL/∂σ = 1/σ - (ν+1)*d² / (σ*(ν+d²))
     /// - ∂NLL/∂ν = -0.5*digamma((ν+1)/2) + 0.5*digamma(ν/2) + 0.5*ln(z) - 0.5*(ν+1)*d²/(ν²*z) + 0.5/ν
+    ///
+    /// Hessians w.r.t. distribution parameters:
+    /// - ∂²NLL/∂μ² = (ν+1)*(ν-d²) / (σ²*(ν+d²)²)
+    /// - ∂²NLL/∂σ² = -1/σ² + (ν+1)*d²*(3ν+d²) / (σ²*(ν+d²)²)
+    /// - ∂²NLL/∂ν² = -0.25*trigamma((ν+1)/2) + 0.25*trigamma(ν/2) - 0.5/ν²
+    ///               + d²*(2ν + d²*(1-ν)) / (2ν²*(ν+d²)²)
     fn analytical_gradients(
         &self,
         predictions: &ArrayView2<f64>,
@@ -222,8 +228,12 @@ impl Distribution for StudentT {
                 let grad_nu = -0.5 * digamma(half_nu_p1) + 0.5 * digamma(half_nu) + 0.5 * ln_z
                     - 0.5 * nu_p1 * d2 / (nu * nu * z)
                     + 0.5 / nu;
-                let hess_nu_param =
-                    -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu) - 0.5 / (nu * nu);
+                // d/dν of the two data-dependent grad terms (0.5·ln z and
+                // −(ν+1)d²/(2ν²z)) combines to d²(2ν + d²(1−ν))/(2ν²(ν+d²)²).
+                let hess_nu_param = -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu)
+                    - 0.5 / (nu * nu)
+                    + d2 * (2.0 * nu + d2 * (1.0 - nu))
+                        / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
                 let rd = rd_df[i];
                 let rsd = rsd_df[i];
                 let g0 = grad_nu * rd;
@@ -281,8 +291,12 @@ impl Distribution for StudentT {
                 let grad_nu = -0.5 * digamma(half_nu_p1) + 0.5 * digamma(half_nu) + 0.5 * ln_z
                     - 0.5 * nu_p1 * d2 / (nu * nu * z)
                     + 0.5 / nu;
-                let hess_nu_param =
-                    -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu) - 0.5 / (nu * nu);
+                // See the parallel path: includes the data-dependent term from
+                // differentiating 0.5·ln z − (ν+1)d²/(2ν²z) w.r.t. ν.
+                let hess_nu_param = -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu)
+                    - 0.5 / (nu * nu)
+                    + d2 * (2.0 * nu + d2 * (1.0 - nu))
+                        / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
                 let pred_df = p_df[i];
                 let rd = df_response_fn.derivative(pred_df);
                 let rsd = df_response_fn.second_derivative(pred_df);
@@ -355,6 +369,14 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-2);
+                // Hessians must agree too — the df Hessian previously dropped its
+                // data-dependent terms, which only a Hessian comparison catches.
+                assert_relative_eq!(
+                    analytical.1[[i, j]],
+                    numerical.1[[i, j]],
+                    epsilon = 1e-2,
+                    max_relative = 1e-2
+                );
             }
         }
     }
