@@ -431,7 +431,11 @@ impl SplineFlow {
     /// Linear rational spline forward transform.
     ///
     /// Implementation based on Dolatabadi et al., 2020 "Invertible Generative Modeling
-    /// using Linear Rational Splines"
+    /// using Linear Rational Splines", matching pyro's `_monotonic_rational_spline`:
+    /// each bin is a *two-piece* Möbius (linear rational) function split at θ = λ,
+    /// built from weights wa = 1, wb = √(d_k/d_{k+1}), and a middle weight/value
+    /// (wc, yc) chosen so the map is C¹, hits both knots, and has slopes d_k/d_{k+1}
+    /// at the knots.
     fn linear_rational_spline_forward(&self, x: f64, params: &SplineParams) -> f64 {
         let (widths, heights, derivatives) = self.compute_spline_knots(params);
         let lambdas = self.compute_lambdas(params);
@@ -445,153 +449,44 @@ impl SplineFlow {
         }
 
         // Find the bin
-        let (bin_idx, xi) = self.find_bin(x, &widths);
+        let (bin_idx, theta) = self.find_bin(x, &widths);
 
-        let w_k = widths[bin_idx];
-        let h_k = heights[bin_idx];
-        let d_k = derivatives[bin_idx];
-        let d_k1 = derivatives[bin_idx + 1];
-        let lambda_k = lambdas[bin_idx];
-        let y_k = self.cumsum_heights(&heights, bin_idx);
-
-        // Linear rational spline transform
-        let s_k = h_k / w_k;
-
-        // Compute using linear rational formula (Dolatabadi et al., 2020)
-        let t = xi;
-        let one_minus_t = 1.0 - t;
-
-        let numerator = d_k * one_minus_t + s_k * t;
-        let denominator = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
-
-        if denominator.abs() < 1e-10 {
-            return y_k + h_k * t;
-        }
-
-        y_k + h_k * t * numerator / denominator
+        let bin = LrsBin::new(
+            widths[bin_idx],
+            heights[bin_idx],
+            derivatives[bin_idx],
+            derivatives[bin_idx + 1],
+            lambdas[bin_idx],
+            self.cumsum_heights(&heights, bin_idx),
+        );
+        bin.forward(theta)
     }
 
     /// Linear rational spline inverse transform.
     fn linear_rational_spline_inverse(&self, y: f64, params: &SplineParams) -> (f64, f64) {
         let (widths, heights, derivatives) = self.compute_spline_knots(params);
         let lambdas = self.compute_lambdas(params);
-
-        // Handle values outside the bounding box with identity
-        if y <= -self.bound {
-            return (y, 0.0);
-        }
-        if y >= self.bound {
-            return (y, 0.0);
-        }
-
-        // Find the bin based on y
-        let (bin_idx, _) = self.find_bin_y(y, &heights);
-
-        let w_k = widths[bin_idx];
-        let h_k = heights[bin_idx];
-        let d_k = derivatives[bin_idx];
-        let d_k1 = derivatives[bin_idx + 1];
-        let lambda_k = lambdas[bin_idx];
-        let x_k = self.cumsum_widths(&widths, bin_idx);
-        let y_k = self.cumsum_heights(&heights, bin_idx);
-
-        let s_k = h_k / w_k;
-        let y_rel = (y - y_k) / h_k;
-
-        // For linear rational splines, we solve a quadratic equation
-        // This is a simplified version - for numerical stability we use iterative refinement
-        let t = self.solve_linear_rational_inverse(y_rel, d_k, d_k1, s_k, lambda_k);
-
-        let x = x_k + t * w_k;
-
-        // Compute log determinant
-        let one_minus_t = 1.0 - t;
-
-        // Derivative computation for linear rational spline
-        let numerator =
-            d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
-        let denom1 = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
-
-        let dy_dt = h_k * numerator / (denom1 * denom1);
-        let dy_dx = dy_dt / w_k;
-
-        let log_det = -dy_dx.abs().ln();
-
-        (x, log_det)
-    }
-
-    /// Solve for t in linear rational spline inverse using Newton's method.
-    ///
-    /// Inverts g(t) = t * (d_k*(1-t) + s_k*t) / (d_k*(1-t) + d_{k+1}*t + lambda_k*s_k*t*(1-t))
-    /// from Dolatabadi et al. (2020).
-    fn solve_linear_rational_inverse(
-        &self,
-        y_rel: f64,
-        d_k: f64,
-        d_k1: f64,
-        s_k: f64,
-        lambda_k: f64,
-    ) -> f64 {
-        // Initial guess
-        let mut t = y_rel.clamp(0.0, 1.0);
-
-        // Newton-Raphson iterations
-        for _ in 0..20 {
-            let one_minus_t = 1.0 - t;
-
-            // Forward formula numerator and denominator (linear form)
-            let numerator = d_k * one_minus_t + s_k * t;
-            let denom = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
-
-            if denom.abs() < 1e-10 {
-                break;
-            }
-
-            let f_t = t * numerator / denom - y_rel;
-
-            // Derivative of f(t) = t * numerator / denom
-            // Using the derivative of the linear rational spline (Dolatabadi et al., 2020):
-            // g'(t) = [d_k*(1-t)^2 + 2*s_k*t*(1-t) + d_{k+1}*t^2] / denom^2
-            let deriv_numerator =
-                d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
-            let df_dt = deriv_numerator / (denom * denom);
-
-            if df_dt.abs() < 1e-10 {
-                break;
-            }
-
-            let t_new = t - f_t / df_dt;
-            if (t_new - t).abs() < 1e-10 {
-                t = t_new.clamp(0.0, 1.0);
-                break;
-            }
-            t = t_new.clamp(0.0, 1.0);
-        }
-
-        t
+        self.linear_rational_spline_inverse_buf(y, &widths, &heights, &derivatives, &lambdas)
     }
 
     /// Compute normalized widths, heights, and derivatives from parameters.
     fn compute_spline_knots(&self, params: &SplineParams) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        // Apply softmax to widths and heights to ensure they sum to 2*bound
-        let widths = softmax(params.widths);
-        let widths: Vec<f64> = widths.iter().map(|&w| w * 2.0 * self.bound).collect();
-
-        let heights = softmax(params.heights);
-        let heights: Vec<f64> = heights.iter().map(|&h| h * 2.0 * self.bound).collect();
-
-        // Apply softplus to derivatives to ensure positivity, with boundary conditions
-        let mut derivatives = vec![1.0]; // d_0 = 1
-        for &d in params.derivatives {
-            derivatives.push(softplus(d));
-        }
-        derivatives.push(1.0); // d_K = 1
-
+        let n_deriv = params.derivatives.len() + 2;
+        let mut widths = vec![0.0; self.count_bins];
+        let mut heights = vec![0.0; self.count_bins];
+        let mut derivatives = vec![0.0; n_deriv];
+        self.compute_spline_knots_into(params, &mut widths, &mut heights, &mut derivatives);
         (widths, heights, derivatives)
     }
 
     /// Compute normalized widths, heights, and derivatives into pre-allocated buffers.
     /// Avoids heap allocation in hot loops.
+    ///
+    /// Matches pyro's `_monotonic_rational_spline` normalization: softmax'd bin
+    /// fractions are floored at `MIN_BIN_WIDTH`/`MIN_BIN_HEIGHT` (so no bin can
+    /// collapse and slopes stay finite), and the inner softplus'd derivatives are
+    /// floored at `MIN_DERIVATIVE`. Boundary derivatives are exactly 1 so the
+    /// spline meets the identity tails smoothly.
     fn compute_spline_knots_into(
         &self,
         params: &SplineParams,
@@ -599,44 +494,42 @@ impl SplineFlow {
         heights: &mut [f64],
         derivatives: &mut [f64],
     ) {
-        // Apply softmax to widths in-place
-        softmax_into(params.widths, widths);
+        let k = self.count_bins as f64;
         let scale = 2.0 * self.bound;
+
+        // widths = (min_w + (1 - min_w*K) * softmax(w)) * 2*bound
+        softmax_into(params.widths, widths);
         for w in widths.iter_mut() {
-            *w *= scale;
+            *w = (MIN_BIN_WIDTH + (1.0 - MIN_BIN_WIDTH * k) * *w) * scale;
         }
 
-        // Apply softmax to heights in-place
         softmax_into(params.heights, heights);
         for h in heights.iter_mut() {
-            *h *= scale;
+            *h = (MIN_BIN_HEIGHT + (1.0 - MIN_BIN_HEIGHT * k) * *h) * scale;
         }
 
-        // Apply softplus to derivatives with boundary conditions
+        // Inner derivatives: min_derivative + softplus(d); boundaries exactly 1.
         derivatives[0] = 1.0;
         for (i, &d) in params.derivatives.iter().enumerate() {
-            derivatives[i + 1] = softplus(d);
+            derivatives[i + 1] = MIN_DERIVATIVE + softplus(d);
         }
         derivatives[params.derivatives.len() + 1] = 1.0;
     }
 
     /// Compute lambda parameters for linear rational splines.
     fn compute_lambdas(&self, params: &SplineParams) -> Vec<f64> {
-        match params.lambdas {
-            Some(lambdas) => {
-                // Apply sigmoid to constrain lambdas to (0, 1)
-                lambdas.iter().map(|&l| sigmoid(l)).collect()
-            }
-            None => vec![0.5; self.count_bins], // Default value
-        }
+        let mut out = vec![0.0; self.count_bins];
+        self.compute_lambdas_into(params, &mut out);
+        out
     }
 
     /// Compute lambda parameters into pre-allocated buffer. Zero-allocation.
+    /// λ = min_λ + (1 - 2·min_λ)·sigmoid(l) ∈ [0.025, 0.975], as in pyro.
     fn compute_lambdas_into(&self, params: &SplineParams, out: &mut [f64]) {
         match params.lambdas {
             Some(lambdas) => {
                 for (o, &l) in out.iter_mut().zip(lambdas.iter()) {
-                    *o = sigmoid(l);
+                    *o = MIN_LAMBDA + (1.0 - 2.0 * MIN_LAMBDA) * sigmoid(l);
                 }
             }
             None => {
@@ -742,6 +635,8 @@ impl SplineFlow {
     }
 
     /// Linear rational spline inverse using pre-computed buffers.
+    /// Returns (x, log|det dx/dy|) = (x, -ln(dy/dx)). The inverse of each Möbius
+    /// piece is closed-form, so no iterative solver is needed.
     fn linear_rational_spline_inverse_buf(
         &self,
         y: f64,
@@ -759,28 +654,20 @@ impl SplineFlow {
 
         let (bin_idx, _) = self.find_bin_y(y, heights);
 
-        let w_k = widths[bin_idx];
-        let h_k = heights[bin_idx];
-        let d_k = derivatives[bin_idx];
-        let d_k1 = derivatives[bin_idx + 1];
-        let lambda_k = lambdas[bin_idx];
+        let bin = LrsBin::new(
+            widths[bin_idx],
+            heights[bin_idx],
+            derivatives[bin_idx],
+            derivatives[bin_idx + 1],
+            lambdas[bin_idx],
+            self.cumsum_heights(heights, bin_idx),
+        );
         let x_k = self.cumsum_widths(widths, bin_idx);
-        let y_k = self.cumsum_heights(heights, bin_idx);
 
-        let s_k = h_k / w_k;
-        let y_rel = (y - y_k) / h_k;
-
-        let t = self.solve_linear_rational_inverse(y_rel, d_k, d_k1, s_k, lambda_k);
-        let x = x_k + t * w_k;
-
-        let one_minus_t = 1.0 - t;
-        let numerator =
-            d_k * one_minus_t * one_minus_t + 2.0 * s_k * t * one_minus_t + d_k1 * t * t;
-        let denom1 = d_k * one_minus_t + d_k1 * t + lambda_k * s_k * t * one_minus_t;
-
-        let dy_dt = h_k * numerator / (denom1 * denom1);
-        let dy_dx = dy_dt / w_k;
-        let log_det = -dy_dx.abs().ln();
+        let theta = bin.inverse(y);
+        let x = x_k + theta * bin.w;
+        let dy_dx = bin.derivative(theta) / bin.w;
+        let log_det = -dy_dx.ln();
 
         (x, log_det)
     }
@@ -829,6 +716,89 @@ struct SplineParams<'a> {
     heights: &'a [f64],
     derivatives: &'a [f64],
     lambdas: Option<&'a [f64]>,
+}
+
+/// One bin of a linear rational spline (Dolatabadi et al., 2020), in the
+/// two-piece Möbius form used by pyro's `_monotonic_rational_spline`.
+///
+/// Within the bin, in local coordinate θ = (x - x_k)/w ∈ [0, 1], the map is a
+/// rational linear (Möbius) function on [0, λ] and another on [λ, 1], glued at
+/// the middle value yc with weights chosen so that the map interpolates
+/// (0, y_k) → (1, y_k + h), has derivative d_k at θ=0 and d_{k+1} at θ=1, and
+/// is C¹ at θ=λ:
+///   wa = 1,  wb = √(d_k / d_{k+1}),
+///   wc = (λ·wa·d_k + (1-λ)·wb·d_{k+1}) / s,   with s = h/w,
+///   yc = ((1-λ)·wa·y_k + λ·wb·y_{k+1}) / ((1-λ)·wa + λ·wb).
+struct LrsBin {
+    w: f64,
+    y_k: f64,
+    y_k1: f64,
+    lambda: f64,
+    wa: f64,
+    wb: f64,
+    wc: f64,
+    yc: f64,
+}
+
+impl LrsBin {
+    fn new(w: f64, h: f64, d_k: f64, d_k1: f64, lambda: f64, y_k: f64) -> Self {
+        let s = h / w;
+        let wa = 1.0;
+        let wb = (d_k / d_k1).sqrt() * wa;
+        let wc = (lambda * wa * d_k + (1.0 - lambda) * wb * d_k1) / s;
+        let y_k1 = y_k + h;
+        let yc = ((1.0 - lambda) * wa * y_k + lambda * wb * y_k1)
+            / ((1.0 - lambda) * wa + lambda * wb);
+        Self {
+            w,
+            y_k,
+            y_k1,
+            lambda,
+            wa,
+            wb,
+            wc,
+            yc,
+        }
+    }
+
+    /// Forward map θ ∈ [0,1] → y.
+    fn forward(&self, theta: f64) -> f64 {
+        if theta <= self.lambda {
+            let num = self.wa * self.y_k * (self.lambda - theta) + self.wc * self.yc * theta;
+            let den = self.wa * (self.lambda - theta) + self.wc * theta;
+            num / den
+        } else {
+            let num = self.wc * self.yc * (1.0 - theta)
+                + self.wb * self.y_k1 * (theta - self.lambda);
+            let den = self.wc * (1.0 - theta) + self.wb * (theta - self.lambda);
+            num / den
+        }
+    }
+
+    /// dy/dθ at θ (divide by the bin width for dy/dx). Strictly positive.
+    fn derivative(&self, theta: f64) -> f64 {
+        if theta <= self.lambda {
+            let den = self.wa * (self.lambda - theta) + self.wc * theta;
+            self.lambda * self.wa * self.wc * (self.yc - self.y_k) / (den * den)
+        } else {
+            let den = self.wc * (1.0 - theta) + self.wb * (theta - self.lambda);
+            (1.0 - self.lambda) * self.wb * self.wc * (self.y_k1 - self.yc) / (den * den)
+        }
+    }
+
+    /// Closed-form inverse: y in [y_k, y_{k+1}] → θ ∈ [0,1]. Each Möbius piece
+    /// inverts exactly; the branch is chosen by comparing y with yc.
+    fn inverse(&self, y: f64) -> f64 {
+        let theta = if y <= self.yc {
+            self.lambda * self.wa * (self.y_k - y)
+                / ((self.wc - self.wa) * y + self.wa * self.y_k - self.wc * self.yc)
+        } else {
+            ((self.wc - self.lambda * self.wb) * y - self.wc * self.yc
+                + self.lambda * self.wb * self.y_k1)
+                / ((self.wc - self.wb) * y - self.wc * self.yc + self.wb * self.y_k1)
+        };
+        theta.clamp(0.0, 1.0)
+    }
 }
 
 #[typetag::serde]
@@ -1128,6 +1098,14 @@ impl Distribution for SplineFlow {
 // Helper functions
 // ============================================================================
 
+/// Knot-normalization floors, matching pyro's `_monotonic_rational_spline`
+/// defaults (DEFAULT_MIN_BIN_WIDTH / HEIGHT / DERIVATIVE / LAMBDA). They keep
+/// bins from collapsing under softmax and slopes/λ away from degenerate values.
+const MIN_BIN_WIDTH: f64 = 1e-3;
+const MIN_BIN_HEIGHT: f64 = 1e-3;
+const MIN_DERIVATIVE: f64 = 1e-3;
+const MIN_LAMBDA: f64 = 0.025;
+
 /// Softplus function: ln(1 + exp(x))
 fn softplus(x: f64) -> f64 {
     if x > 20.0 {
@@ -1313,6 +1291,181 @@ mod tests {
 
         // All samples should be non-negative for positive support
         assert!(samples.iter().all(|&x| x >= 0.0));
+    }
+
+    /// Pseudo-random but deterministic parameter vector exercising uneven bins,
+    /// varied derivatives and asymmetric lambdas.
+    fn varied_params(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| ((i as f64 * 0.7).sin() * 1.3) + ((i % 3) as f64 - 1.0) * 0.4)
+            .collect()
+    }
+
+    #[test]
+    fn test_linear_spline_forward_interpolates_knots() {
+        // The forward map must be continuous across bins: approaching a knot from
+        // the left and right must agree (the old single-piece formula violated
+        // this whenever s_k != d_{k+1}).
+        let dist = SplineFlow::new(
+            TargetSupport::Real,
+            6,
+            3.0,
+            SplineOrder::Linear,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+        let params = varied_params(dist.n_params());
+        let sp = dist.split_params(&params);
+        let (widths, _, _) = dist.compute_spline_knots(&sp);
+
+        let mut knot = -dist.bound;
+        for w in widths.iter().take(widths.len() - 1) {
+            knot += w;
+            let eps = 1e-7;
+            let left = dist.forward_transform(knot - eps, &params);
+            let right = dist.forward_transform(knot + eps, &params);
+            assert!(
+                (left - right).abs() < 1e-4,
+                "forward discontinuous at knot {}: {} vs {}",
+                knot,
+                left,
+                right
+            );
+        }
+
+        // Identity tails: at the boundary the spline must meet y = x.
+        let at_bound = dist.forward_transform(dist.bound - 1e-9, &params);
+        assert!(
+            (at_bound - dist.bound).abs() < 1e-5,
+            "spline does not meet identity tail at +bound: {}",
+            at_bound
+        );
+        let at_lower = dist.forward_transform(-dist.bound + 1e-9, &params);
+        assert!(
+            (at_lower + dist.bound).abs() < 1e-5,
+            "spline does not meet identity tail at -bound: {}",
+            at_lower
+        );
+    }
+
+    #[test]
+    fn test_linear_spline_roundtrip_and_log_det() {
+        let dist = SplineFlow::new(
+            TargetSupport::Real,
+            6,
+            3.0,
+            SplineOrder::Linear,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+        let params = varied_params(dist.n_params());
+        let sp = dist.split_params(&params);
+        let (widths, heights, derivatives) = dist.compute_spline_knots(&sp);
+        let lambdas = dist.compute_lambdas(&sp);
+
+        let mut prev_x = f64::NEG_INFINITY;
+        for i in 0..200 {
+            let y = -2.95 + 5.9 * (i as f64) / 199.0;
+            let (x, log_det) = dist.linear_rational_spline_inverse_buf(
+                y,
+                &widths,
+                &heights,
+                &derivatives,
+                &lambdas,
+            );
+            assert!(x.is_finite() && log_det.is_finite());
+            // Monotone inverse
+            assert!(x > prev_x, "inverse not monotone at y={}", y);
+            prev_x = x;
+
+            // Round-trip: forward(inverse(y)) == y
+            let y_rt = dist.forward_transform(x, &params);
+            assert!(
+                (y_rt - y).abs() < 1e-8,
+                "round-trip failed: y={}, forward(inverse(y))={}",
+                y,
+                y_rt
+            );
+
+            // log_det must equal -ln(dy/dx) of the actual forward map
+            let h = 1e-6;
+            let dy_dx_fd =
+                (dist.forward_transform(x + h, &params) - dist.forward_transform(x - h, &params))
+                    / (2.0 * h);
+            assert!(
+                ((-dy_dx_fd.ln()) - log_det).abs() < 1e-4,
+                "log_det mismatch at y={}: analytic={}, fd={}",
+                y,
+                log_det,
+                -dy_dx_fd.ln()
+            );
+        }
+    }
+
+    #[test]
+    fn test_quadratic_spline_roundtrip_and_log_det() {
+        let dist = SplineFlow::new(
+            TargetSupport::Real,
+            6,
+            3.0,
+            SplineOrder::Quadratic,
+            Stabilization::None,
+            LossFn::Nll,
+            false,
+        );
+        let params = varied_params(dist.n_params());
+
+        for i in 0..200 {
+            let y = -2.95 + 5.9 * (i as f64) / 199.0;
+            let sp = dist.split_params(&params);
+            let (x, log_det) = dist.rational_quadratic_spline_inverse(y, &sp);
+            assert!(x.is_finite() && log_det.is_finite());
+
+            let y_rt = dist.forward_transform(x, &params);
+            assert!(
+                (y_rt - y).abs() < 1e-7,
+                "round-trip failed: y={}, forward(inverse(y))={}",
+                y,
+                y_rt
+            );
+
+            let h = 1e-6;
+            let dy_dx_fd =
+                (dist.forward_transform(x + h, &params) - dist.forward_transform(x - h, &params))
+                    / (2.0 * h);
+            assert!(
+                ((-dy_dx_fd.ln()) - log_det).abs() < 1e-4,
+                "log_det mismatch at y={}: analytic={}, fd={}",
+                y,
+                log_det,
+                -dy_dx_fd.ln()
+            );
+        }
+    }
+
+    #[test]
+    fn test_lrs_bin_c1_at_lambda() {
+        // The two Möbius pieces must agree in value and derivative at θ = λ.
+        let bin = LrsBin::new(0.8, 1.3, 0.4, 2.1, 0.3, -0.5);
+        let eps = 1e-9;
+        let v_left = bin.forward(bin.lambda - eps);
+        let v_right = bin.forward(bin.lambda + eps);
+        assert!((v_left - v_right).abs() < 1e-6);
+        let d_left = bin.derivative(bin.lambda - eps);
+        let d_right = bin.derivative(bin.lambda + eps);
+        assert!(
+            (d_left - d_right).abs() / d_left < 1e-5,
+            "derivative not continuous at lambda: {} vs {}",
+            d_left,
+            d_right
+        );
+        // Knot interpolation and end slopes (defining properties of the LRS).
+        assert!((bin.forward(0.0) - bin.y_k).abs() < 1e-12);
+        assert!((bin.forward(1.0) - bin.y_k1).abs() < 1e-12);
+        assert!((bin.derivative(0.0) / bin.w - 0.4).abs() < 1e-9);
+        assert!((bin.derivative(1.0) / bin.w - 2.1).abs() < 1e-9);
     }
 
     #[test]
