@@ -25,7 +25,7 @@ all = ["xgboost", "lightgbm", "plotting"]
 # Core dependencies
 ndarray = { version = "0.17.2", features = ["serde"] }
 thiserror = "2.0.18"
-rand = "0.10.0"
+rand = "0.10.2"
 rand_distr = "0.6"
 rand_chacha = "0.10.0"
 
@@ -40,7 +40,7 @@ argmin-math = { version = "0.5.1", features = ["vec"] }
 rayon = "1.11.0"
 
 # Hyperparameter optimization (tpe uses rand 0.8)
-tpe = "0.2.0"
+tpe = "0.3.1"
 rand_compat = { package = "rand", version = "0.8" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -65,7 +65,7 @@ xgb = { git = "https://github.com/agene0001/rust-xgboost", branch = "master" }
 [dev-dependencies]
 approx = "0.5.1"
 tempfile = "3.24"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "distribution_ops"
