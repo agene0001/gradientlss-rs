@@ -861,6 +861,233 @@ mod tests {
         );
     }
 
+    // ---- best_iteration / early-stopping truncation tests ----
+
+    /// Noisy single-parameter regression where the model provably overfits:
+    /// validation loss bottoms out early, later trees fit training noise.
+    fn overfit_dataset() -> (Array2<f64>, Array1<f64>, Array2<f64>, Array1<f64>) {
+        let f = 8usize;
+        let n_train = 300usize;
+        let n_valid = 150usize;
+
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (u32::MAX as f64)
+        };
+
+        let make = |rows: usize, next: &mut dyn FnMut() -> f64| {
+            let mut feats = Array2::<f64>::zeros((rows, f));
+            let mut labels = Array1::<f64>::zeros(rows);
+            for i in 0..rows {
+                let mut signal = 0.0;
+                for j in 0..f {
+                    let x = next();
+                    feats[[i, j]] = x;
+                    if j < 2 {
+                        signal += x;
+                    }
+                }
+                let noise = (next() - 0.5) * 4.0;
+                labels[i] = signal + noise;
+            }
+            (feats, labels)
+        };
+
+        let (tf, tl) = make(n_train, &mut next);
+        let (vf, vl) = make(n_valid, &mut next);
+        (tf, tl, vf, vl)
+    }
+
+    fn sq_objective(
+        preds: &Array2<f64>,
+        labels: &Array1<f64>,
+        _w: Option<&Array1<f64>>,
+    ) -> Result<GradientsAndHessians> {
+        let n = preds.nrows();
+        let mut g = Array2::<f64>::zeros((n, 1));
+        let mut h = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            g[[i, 0]] = preds[[i, 0]] - labels[i];
+            h[[i, 0]] = 1.0;
+        }
+        Ok(GradientsAndHessians {
+            gradients: g,
+            hessians: h,
+        })
+    }
+
+    fn sq_metric(preds: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+        let n = preds.nrows();
+        let mut s = 0.0;
+        for i in 0..n {
+            let d = preds[[i, 0]] - labels[i];
+            s += d * d;
+        }
+        s / n as f64
+    }
+
+    fn train_overfit_model() -> (LightGBMModel, TrainingResult) {
+        let (tf, tl, vf, vl) = overfit_dataset();
+        let mut train = LightGBMDataset::from_data(tf.view(), tl.view()).unwrap();
+        let mut valid = LightGBMDataset::from_data(vf.view(), vl.view()).unwrap();
+
+        let mut params = LightGBMParams::default();
+        params.set_n_dist_params(1);
+        params.inner.push("learning_rate", "0.3");
+        params.inner.push("num_leaves", "63");
+        params.inner.push("min_data_in_leaf", "1");
+
+        let config = TrainConfig {
+            num_boost_round: 80,
+            early_stopping_rounds: Some(5),
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: false,
+        };
+
+        LightGBMModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
+            &params,
+            &mut train,
+            Some(&mut valid),
+            &config,
+            sq_objective,
+            sq_metric,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_best_iteration_truncates_prediction() {
+        let (model, result) = train_overfit_model();
+
+        let best = model.best_iteration.expect("best_iteration should be Some");
+        assert!(
+            best + 1 < result.n_iterations,
+            "expected best_iteration ({}) + 1 < total trees ({})",
+            best,
+            result.n_iterations
+        );
+
+        let (tf, _, _, _) = overfit_dataset();
+        let feats_f32: Vec<f32> = tf.iter().map(|&x| x as f32).collect();
+        let mat = MatBuf::from_vec(feats_f32, tf.nrows(), tf.ncols(), lgbm::mat::RowMajor);
+        let pp = Parameters::new();
+
+        // Reference bounded to best+1 iterations from the start.
+        let bounded = model
+            .booster
+            .predict_for_mat(&mat, PredictType::RawScore, 0, Some(best + 1), &pp)
+            .unwrap();
+        let bounded = prediction_to_array2(&bounded, tf.nrows(), 1).unwrap();
+
+        // All-trees prediction (what the buggy predict_raw did).
+        let all_trees = model
+            .booster
+            .predict_for_mat(&mat, PredictType::RawScore, 0, None, &pp)
+            .unwrap();
+        let all_trees = prediction_to_array2(&all_trees, tf.nrows(), 1).unwrap();
+
+        let pr = model.predict_raw(&tf.view()).unwrap();
+        let max_diff_bounded = (&pr - &bounded)
+            .iter()
+            .fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff_bounded < 1e-5,
+            "predict_raw must match best_iteration-bounded prediction (max diff {max_diff_bounded})"
+        );
+
+        let max_diff_all = (&pr - &all_trees).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff_all > 1e-6,
+            "predict_raw should differ from all-trees prediction (max diff {max_diff_all})"
+        );
+    }
+
+    #[test]
+    fn test_best_iteration_survives_save_load() {
+        let (model, _) = train_overfit_model();
+        let best = model.best_iteration.expect("best_iteration should be Some");
+
+        let (tf, _, _, _) = overfit_dataset();
+        let pre = model.predict_raw(&tf.view()).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        model.save_to_writer(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let loaded = LightGBMModel::load_from_reader(&mut cursor).unwrap();
+
+        assert_eq!(
+            loaded.best_iteration,
+            Some(best),
+            "best_iteration must round-trip through save/load"
+        );
+
+        let post = loaded.predict_raw(&tf.view()).unwrap();
+        let max_diff = (&pre - &post).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff < 1e-5,
+            "post-load predictions must match pre-load (max diff {max_diff})"
+        );
+    }
+
+    #[test]
+    fn test_no_early_stopping_predicts_all_trees() {
+        let (tf, tl, vf, vl) = overfit_dataset();
+        let mut train = LightGBMDataset::from_data(tf.view(), tl.view()).unwrap();
+        let mut valid = LightGBMDataset::from_data(vf.view(), vl.view()).unwrap();
+
+        let mut params = LightGBMParams::default();
+        params.set_n_dist_params(1);
+
+        let config = TrainConfig {
+            num_boost_round: 15,
+            early_stopping_rounds: None,
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: false,
+        };
+
+        let (model, _) = LightGBMModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
+            &params,
+            &mut train,
+            Some(&mut valid),
+            &config,
+            sq_objective,
+            sq_metric,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(model.best_iteration.is_none());
+
+        let feats_f32: Vec<f32> = tf.iter().map(|&x| x as f32).collect();
+        let mat = MatBuf::from_vec(feats_f32, tf.nrows(), tf.ncols(), lgbm::mat::RowMajor);
+        let pp = Parameters::new();
+        let all_trees = model
+            .booster
+            .predict_for_mat(&mat, PredictType::RawScore, 0, None, &pp)
+            .unwrap();
+        let all_trees = prediction_to_array2(&all_trees, tf.nrows(), 1).unwrap();
+        let pr = model.predict_raw(&tf.view()).unwrap();
+        let max_diff = (&pr - &all_trees).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(max_diff < 1e-6, "no-early-stopping must predict all trees");
+    }
+
     /// Manual benchmark proving the LightGBM per-iteration fix is a real speedup
     /// (no XGBoost-style regression):
     /// `cargo test --release --features full --lib lgb_predict_strategy_timing -- --ignored --nocapture`

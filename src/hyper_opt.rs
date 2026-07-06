@@ -6,9 +6,10 @@
 use crate::backend::{Backend, BackendParams, ParamValue, TrainConfig};
 use crate::model::GradientLSS;
 use ndarray::{Array1, Array2};
-// Note: tpe uses rand 0.8, so we use rand_compat (rand 0.8) for RNG compatibility
-use rand_compat::SeedableRng;
-use rand_compat::rngs::StdRng;
+// tpe 0.3 uses the same rand as the rest of the crate (the old rand_compat
+// shim was only needed for tpe 0.2's rand 0.8).
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde_json::Value;
 use std::collections::HashMap;
 use tpe::{TpeOptimizer, parzen_estimator, range};

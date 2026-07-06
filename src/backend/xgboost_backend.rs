@@ -236,12 +236,19 @@ impl XGBoostDataset {
 pub struct XGBoostModel {
     booster: Booster,
     n_params: usize,
+    /// 0-based index of the best boosting iteration selected by early stopping.
+    /// `Some(b)` means predictions must use trees for iterations `[0, b]`
+    /// (i.e. `b + 1` iterations), truncating the overfit tail that early
+    /// stopping trained past the best. `None` means no early stopping was in
+    /// effect — predict with all trees.
+    best_iteration: Option<usize>,
 }
 
 impl std::fmt::Debug for XGBoostModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("XGBoostModel")
             .field("n_params", &self.n_params)
+            .field("best_iteration", &self.best_iteration)
             .finish()
     }
 }
@@ -551,7 +558,26 @@ impl BackendModel for XGBoostModel {
             stopped_early,
         };
 
-        Ok((Self { booster, n_params }, result))
+        // Only honor best_iteration at predict time when early stopping was
+        // actually in effect: there must be a validation set to score against
+        // AND `early_stopping_rounds` configured. Otherwise the model was
+        // trained to the full `num_boost_round` and predictions should use all
+        // trees (None).
+        let effective_best_iteration = if valid_dmat.is_some() && config.early_stopping_rounds.is_some()
+        {
+            Some(best_iteration)
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                booster,
+                n_params,
+                best_iteration: effective_best_iteration,
+            },
+            result,
+        ))
     }
 
     fn predict_raw(&self, data: &ArrayView2<f64>) -> Result<Array2<f64>> {
@@ -562,10 +588,33 @@ impl BackendModel for XGBoostModel {
             GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
         })?;
 
-        let raw_preds = self
-            .booster
-            .predict(&dmatrix)
-            .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
+        let raw_preds = match self.best_iteration {
+            // Early stopping selected a best iteration: predict over trees for
+            // iterations [0, best_iteration] only. XGBoost's iteration_range is
+            // [begin, end) (half-open), so end = best_iteration + 1. This drops
+            // the overfit tail (up to early_stopping_rounds extra iterations)
+            // that training added past the best. `PredictType::Normal` matches
+            // the semantics of the plain `predict()` used below.
+            Some(best_iteration) => {
+                let cfg = xgb::PredictConfig {
+                    _type: xgb::PredictType::Normal,
+                    training: false,
+                    iteration_begin: 0,
+                    iteration_end: (best_iteration + 1) as i64,
+                    strict_shape: false,
+                };
+                let (preds, _shape) =
+                    self.booster.predict_matrix(&dmatrix, &cfg.as_json()).map_err(|e| {
+                        GradientLSSError::BackendError(format!("Prediction failed: {}", e))
+                    })?;
+                preds
+            }
+            // No early stopping in effect: use all trees.
+            None => self
+                .booster
+                .predict(&dmatrix)
+                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?,
+        };
 
         Ok(prediction_to_array2(&raw_preds, n_samples, self.n_params))
     }
@@ -595,6 +644,18 @@ impl BackendModel for XGBoostModel {
             .write_all(&model_bytes)
             .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
+        // Append best_iteration at the END of the format so older readers that
+        // stop after the booster bytes are unaffected, and this reader can fall
+        // back to None on EOF for models saved before this field existed.
+        // Sentinel: -1 => None (predict all trees); >= 0 => Some(value).
+        let best_iter_sentinel: i64 = match self.best_iteration {
+            Some(b) => b as i64,
+            None => -1,
+        };
+        writer
+            .write_all(&best_iter_sentinel.to_le_bytes())
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -622,7 +683,28 @@ impl BackendModel for XGBoostModel {
             GradientLSSError::BackendError(format!("Failed to load booster from buffer: {}", e))
         })?;
 
-        Ok(Self { booster, n_params })
+        // Read the trailing best_iteration field. Older saved models predate
+        // this field, so a clean EOF here means "no early stopping recorded"
+        // → None (predict all trees). Any other read error is a real failure.
+        let mut best_iter_bytes = [0u8; 8];
+        let best_iteration = match reader.read_exact(&mut best_iter_bytes) {
+            Ok(()) => {
+                let sentinel = i64::from_le_bytes(best_iter_bytes);
+                if sentinel < 0 {
+                    None
+                } else {
+                    Some(sentinel as usize)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+            Err(e) => return Err(GradientLSSError::IoError(e.to_string())),
+        };
+
+        Ok(Self {
+            booster,
+            n_params,
+            best_iteration,
+        })
     }
 
     fn feature_importance(
@@ -858,4 +940,235 @@ mod tests {
         assert_eq!(result[[2, 1]], 6.0);
     }
 
+    // ---- best_iteration / early-stopping truncation tests ----
+
+    /// Build a noisy single-parameter regression problem where the model
+    /// provably overfits: the validation loss bottoms out early, then rises as
+    /// later trees fit training noise. Returns (train_feats, train_labels,
+    /// valid_feats, valid_labels).
+    fn overfit_dataset() -> (Array2<f64>, Array1<f64>, Array2<f64>, Array1<f64>) {
+        let f = 8usize;
+        let n_train = 200usize;
+        let n_valid = 120usize;
+
+        // Simple deterministic LCG so the test is reproducible without rand deps.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (u32::MAX as f64)
+        };
+
+        let make = |rows: usize, next: &mut dyn FnMut() -> f64| {
+            let mut feats = Array2::<f64>::zeros((rows, f));
+            let mut labels = Array1::<f64>::zeros(rows);
+            for i in 0..rows {
+                let mut signal = 0.0;
+                for j in 0..f {
+                    let x = next();
+                    feats[[i, j]] = x;
+                    if j < 2 {
+                        signal += x; // only 2 features carry real signal
+                    }
+                }
+                // Heavy label noise so extra trees fit noise, not signal.
+                let noise = (next() - 0.5) * 4.0;
+                labels[i] = signal + noise;
+            }
+            (feats, labels)
+        };
+
+        let (tf, tl) = make(n_train, &mut next);
+        let (vf, vl) = make(n_valid, &mut next);
+        (tf, tl, vf, vl)
+    }
+
+    /// Gaussian-mean squared-error objective (1 param): gradient = pred - label,
+    /// hessian = 1. Metric = MSE.
+    fn sq_objective(
+        preds: &Array2<f64>,
+        labels: &Array1<f64>,
+        _w: Option<&Array1<f64>>,
+    ) -> Result<GradientsAndHessians> {
+        let n = preds.nrows();
+        let mut g = Array2::<f64>::zeros((n, 1));
+        let mut h = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            g[[i, 0]] = preds[[i, 0]] - labels[i];
+            h[[i, 0]] = 1.0;
+        }
+        Ok(GradientsAndHessians {
+            gradients: g,
+            hessians: h,
+        })
+    }
+
+    fn sq_metric(preds: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+        let n = preds.nrows();
+        let mut s = 0.0;
+        for i in 0..n {
+            let d = preds[[i, 0]] - labels[i];
+            s += d * d;
+        }
+        s / n as f64
+    }
+
+    fn train_overfit_model() -> (XGBoostModel, TrainingResult) {
+        let (tf, tl, vf, vl) = overfit_dataset();
+        let mut train = XGBoostDataset::from_data(tf.view(), tl.view()).unwrap();
+        let mut valid = XGBoostDataset::from_data(vf.view(), vl.view()).unwrap();
+
+        let mut params = XGBoostParams::default();
+        params.set_n_dist_params(1);
+        // Aggressive learning + deep trees + many rounds => overfits well before
+        // num_boost_round, so early stopping fires with a best in the interior.
+        params.inner.insert("eta".to_string(), "0.3".to_string());
+        params.inner.insert("max_depth".to_string(), "8".to_string());
+
+        let config = TrainConfig {
+            num_boost_round: 80,
+            early_stopping_rounds: Some(5),
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: false,
+        };
+
+        XGBoostModel::train_with_objective_and_callbacks::<_, _, super::super::traits::HistoryCallback>(
+            &params,
+            &mut train,
+            Some(&mut valid),
+            &config,
+            sq_objective,
+            sq_metric,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_best_iteration_truncates_prediction() {
+        let (model, result) = train_overfit_model();
+
+        // Early stopping selected an interior best.
+        let best = model.best_iteration.expect("best_iteration should be Some");
+        assert!(
+            best + 1 < result.n_iterations,
+            "expected best_iteration ({}) + 1 < total trees ({}); early stopping did not overfit past best",
+            best,
+            result.n_iterations
+        );
+
+        // Reference prediction bounded to exactly best+1 trees, computed directly.
+        let (tf, _, _, _) = overfit_dataset();
+        let feats_f32: Vec<f32> = tf.iter().map(|&x| x as f32).collect();
+        let dmat = DMatrix::from_dense(&feats_f32, tf.nrows()).unwrap();
+
+        let bounded_cfg = xgb::PredictConfig {
+            _type: xgb::PredictType::Normal,
+            training: false,
+            iteration_begin: 0,
+            iteration_end: (best + 1) as i64,
+            strict_shape: false,
+        };
+        let (bounded_ref, _) = model
+            .booster
+            .predict_matrix(&dmat, &bounded_cfg.as_json())
+            .unwrap();
+        let bounded_ref = prediction_to_array2(&bounded_ref, tf.nrows(), 1);
+
+        // All-trees prediction (what the buggy predict_raw did).
+        let all_trees = model.booster.predict(&dmat).unwrap();
+        let all_trees = prediction_to_array2(&all_trees, tf.nrows(), 1);
+
+        // predict_raw must equal the bounded reference...
+        let pr = model.predict_raw(&tf.view()).unwrap();
+        let max_diff_bounded = (&pr - &bounded_ref)
+            .iter()
+            .fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff_bounded < 1e-5,
+            "predict_raw must match best_iteration-bounded prediction (max diff {max_diff_bounded})"
+        );
+
+        // ...and DIFFER from the all-trees prediction (proves truncation happens).
+        let max_diff_all = (&pr - &all_trees).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff_all > 1e-6,
+            "predict_raw should differ from all-trees prediction, but max diff was {max_diff_all}"
+        );
+    }
+
+    #[test]
+    fn test_best_iteration_survives_save_load() {
+        let (model, _) = train_overfit_model();
+        let best = model.best_iteration.expect("best_iteration should be Some");
+
+        let (tf, _, _, _) = overfit_dataset();
+        let pre = model.predict_raw(&tf.view()).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        model.save_to_writer(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let loaded = XGBoostModel::load_from_reader(&mut cursor).unwrap();
+
+        assert_eq!(
+            loaded.best_iteration,
+            Some(best),
+            "best_iteration must round-trip through save/load"
+        );
+
+        let post = loaded.predict_raw(&tf.view()).unwrap();
+        let max_diff = (&pre - &post).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(
+            max_diff < 1e-5,
+            "post-load predictions must match pre-load (max diff {max_diff})"
+        );
+    }
+
+    #[test]
+    fn test_no_early_stopping_predicts_all_trees() {
+        // With early_stopping_rounds = None, best_iteration must be None so
+        // predict_raw uses all trees (unchanged legacy behavior).
+        let (tf, tl, vf, vl) = overfit_dataset();
+        let mut train = XGBoostDataset::from_data(tf.view(), tl.view()).unwrap();
+        let mut valid = XGBoostDataset::from_data(vf.view(), vl.view()).unwrap();
+
+        let mut params = XGBoostParams::default();
+        params.set_n_dist_params(1);
+
+        let config = TrainConfig {
+            num_boost_round: 15,
+            early_stopping_rounds: None,
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: false,
+        };
+
+        let (model, _) = XGBoostModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
+            &params,
+            &mut train,
+            Some(&mut valid),
+            &config,
+            sq_objective,
+            sq_metric,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(model.best_iteration.is_none());
+
+        // predict_raw should equal the plain all-trees predict().
+        let feats_f32: Vec<f32> = tf.iter().map(|&x| x as f32).collect();
+        let dmat = DMatrix::from_dense(&feats_f32, tf.nrows()).unwrap();
+        let all_trees = prediction_to_array2(&model.booster.predict(&dmat).unwrap(), tf.nrows(), 1);
+        let pr = model.predict_raw(&tf.view()).unwrap();
+        let max_diff = (&pr - &all_trees).iter().fold(0f64, |m, &x| m.max(x.abs()));
+        assert!(max_diff < 1e-6, "no-early-stopping must predict all trees");
+    }
 }

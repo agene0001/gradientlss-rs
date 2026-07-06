@@ -166,9 +166,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.66"
+version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
+checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
  "shlex 2.0.1",
@@ -802,7 +802,6 @@ dependencies = [
  "ndarray",
  "plotters",
  "rand 0.10.2",
- "rand 0.8.6",
  "rand_chacha 0.10.0",
  "rand_distr 0.6.0",
  "rayon",
@@ -1073,9 +1072,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.8"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+checksum = "c863e9ab5e7bf9c99ba75e1050f1e4d624ae87ed3532d6238ffbdc7b585dbbe6"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -2063,7 +2062,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "xgb"
 version = "3.2.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#ddf91e98d4e74422d7211fa1c63d96c45c3e7ff5"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#af49f464f769693bbdc63ebf115c6e14b98f8104"
 dependencies = [
  "derive_builder",
  "indexmap",
@@ -2076,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "xgboost_lib-sys"
 version = "3.2.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#ddf91e98d4e74422d7211fa1c63d96c45c3e7ff5"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#af49f464f769693bbdc63ebf115c6e14b98f8104"
 dependencies = [
  "bindgen",
  "cmake",
