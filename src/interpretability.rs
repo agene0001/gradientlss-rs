@@ -86,6 +86,38 @@ pub struct IcePlot {
     pub predictions: Vec<Vec<f64>>,
 }
 
+/// Validate PDP/ICE arguments up front so bad indices return an error (like
+/// `plot_feature_importance`) instead of panicking inside ndarray, and a
+/// degenerate grid (`grid_size < 2` ⇒ division by zero ⇒ NaN grid) is rejected.
+fn validate_pdp_args(
+    features: &ArrayView2<f64>,
+    feature_idx: usize,
+    param_idx: usize,
+    n_params: usize,
+    grid_size: usize,
+) -> Result<()> {
+    if feature_idx >= features.ncols() {
+        return Err(GradientLSSError::InvalidParameter(format!(
+            "feature_idx {} out of range (n_features = {})",
+            feature_idx,
+            features.ncols()
+        )));
+    }
+    if param_idx >= n_params {
+        return Err(GradientLSSError::InvalidParameter(format!(
+            "param_idx {} out of range (n_params = {})",
+            param_idx, n_params
+        )));
+    }
+    if grid_size < 2 {
+        return Err(GradientLSSError::InvalidParameter(format!(
+            "grid_size must be at least 2, got {}",
+            grid_size
+        )));
+    }
+    Ok(())
+}
+
 impl<B: Backend> GradientLSS<B> {
     /// Export data for SHAP analysis.
     ///
@@ -111,6 +143,7 @@ impl<B: Backend> GradientLSS<B> {
         };
 
         // Get feature importance if available
+        let n_feature_cols = features.ncols();
         let feature_importance = self
             .feature_importance(FeatureImportanceType::Gain, feature_names.clone())
             .ok()
@@ -118,10 +151,21 @@ impl<B: Backend> GradientLSS<B> {
                 let mut map = HashMap::new();
                 let param_names = self.param_names();
                 for (param_idx, param_name) in param_names.iter().enumerate() {
-                    let scores: Vec<f64> = fi
-                        .scores
-                        .column(param_idx.min(fi.scores.ncols() - 1))
-                        .to_vec();
+                    let col = fi.scores.column(param_idx.min(fi.scores.ncols() - 1));
+                    // `fi.scores` rows are in the backend's row order (XGBoost:
+                    // a lexicographically sorted subset of the features that
+                    // appear in splits). Scatter them through `feature_indices`
+                    // into natural feature order so consumers can zip the
+                    // exported vector with `feature_names` directly; features
+                    // never used in a split keep importance 0.
+                    let mut scores = vec![0.0; n_feature_cols];
+                    for (row, &s) in col.iter().enumerate() {
+                        if let Some(&feat_idx) = fi.feature_indices.get(row) {
+                            if feat_idx < n_feature_cols {
+                                scores[feat_idx] = s;
+                            }
+                        }
+                    }
                     map.insert(param_name.clone(), scores);
                 }
                 map
@@ -172,6 +216,8 @@ impl<B: Backend> GradientLSS<B> {
     ) -> Result<PartialDependence> {
         let grid_size = grid_size.unwrap_or(50);
         let n_samples = features.nrows();
+
+        validate_pdp_args(features, feature_idx, param_idx, self.n_params(), grid_size)?;
 
         // Get feature range
         let feature_col = features.column(feature_idx);
@@ -245,6 +291,8 @@ impl<B: Backend> GradientLSS<B> {
     ) -> Result<IcePlot> {
         let grid_size = grid_size.unwrap_or(50);
         let n_samples = features.nrows();
+
+        validate_pdp_args(features, feature_idx, param_idx, self.n_params(), grid_size)?;
 
         // Get feature range
         let feature_col = features.column(feature_idx);
