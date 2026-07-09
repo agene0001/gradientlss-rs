@@ -55,6 +55,10 @@ pub struct GradientLSS<B: Backend> {
     dist: Arc<dyn Distribution>,
     model: Option<B::Model>,
     start_values: Option<Array1<f64>>,
+    /// One-shot flag: the next `train` call reuses the preset `start_values`
+    /// instead of recomputing them (see `preset_start_values`). Consumed by
+    /// that call, so any later train recomputes as usual. Not serialized.
+    start_values_preset: bool,
     _backend: PhantomData<B>,
 }
 
@@ -64,8 +68,19 @@ impl<B: Backend> GradientLSS<B> {
             dist,
             model: None,
             start_values: None,
+            start_values_preset: false,
             _backend: PhantomData,
         }
+    }
+
+    /// Pre-set the unconditional start values so the NEXT `train` call skips
+    /// the L-BFGS start-value fit. Intended for callers that retrain on the
+    /// same labels repeatedly (e.g. `hyper_opt` reuses each CV fold's start
+    /// values across trials — they depend only on the fold's train labels).
+    /// The preset applies to exactly one train call.
+    pub(crate) fn preset_start_values(&mut self, start_values: Array1<f64>) {
+        self.start_values = Some(start_values);
+        self.start_values_preset = true;
     }
 
     /// Save the model to a file.
@@ -126,6 +141,7 @@ impl<B: Backend> GradientLSS<B> {
             dist: Arc::from(state.dist),
             model: Some(model),
             start_values: state.start_values,
+            start_values_preset: false,
             _backend: PhantomData,
         })
     }
@@ -397,18 +413,24 @@ impl<B: Backend> GradientLSS<B> {
         callbacks: Option<&mut C>,
     ) -> Result<((), TrainingResult)> {
         let labels = train_data.get_labels()?;
-        if self.dist.is_univariate() {
-            let target = ResponseData::Univariate(&labels.view());
-            self.calculate_start_values(&target)?;
-        } else {
-            // For multivariate, we need to reshape the labels
-            // This assumes the backend provides labels in the correct multivariate format
-            let n_samples = labels.len() / self.dist.n_targets();
-            let reshaped = labels
-                .view()
-                .into_shape_with_order((n_samples, self.dist.n_targets()))?;
-            let target = ResponseData::Multivariate(&reshaped);
-            self.calculate_start_values(&target)?;
+        // A preset (see `preset_start_values`) is consumed by exactly this one
+        // train call; the caller vouches that the preset values were computed
+        // on these labels.
+        let use_preset = std::mem::take(&mut self.start_values_preset) && self.start_values.is_some();
+        if !use_preset {
+            if self.dist.is_univariate() {
+                let target = ResponseData::Univariate(&labels.view());
+                self.calculate_start_values(&target)?;
+            } else {
+                // For multivariate, we need to reshape the labels
+                // This assumes the backend provides labels in the correct multivariate format
+                let n_samples = labels.len() / self.dist.n_targets();
+                let reshaped = labels
+                    .view()
+                    .into_shape_with_order((n_samples, self.dist.n_targets()))?;
+                let target = ResponseData::Multivariate(&reshaped);
+                self.calculate_start_values(&target)?;
+            }
         }
 
         self.set_init_score(train_data)?;

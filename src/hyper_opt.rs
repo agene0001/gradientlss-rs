@@ -12,7 +12,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde_json::Value;
 use std::collections::HashMap;
-use tpe::{TpeOptimizer, parzen_estimator, range};
+use tpe::{TpeOptimizer, categorical_range, histogram_estimator, parzen_estimator, range};
 
 /// Hyperparameter specification for optimization.
 #[derive(Debug, Clone)]
@@ -365,16 +365,42 @@ pub fn hyper_opt_with_config<B: Backend>(
                 optimizers.insert(spec.name.clone(), optimizer);
             }
             HyperParamType::Categorical { choices } => {
-                // For categorical, use indices as float range
+                // Categorical choices are unordered: model them with the
+                // histogram estimator over [0, n) index bins (like Optuna's
+                // suggest_categorical) instead of a parzen estimator, which
+                // would treat adjacent indices as "similar" values.
                 let n_choices = choices.len();
                 if n_choices > 0 {
                     let optimizer =
-                        TpeOptimizer::new(parzen_estimator(), range(0.0, n_choices as f64 - 0.01)?);
+                        TpeOptimizer::new(histogram_estimator(), categorical_range(n_choices)?);
                     optimizers.insert(spec.name.clone(), optimizer);
                 }
             }
         }
     }
+
+    // One shuffled row permutation, fixed for the entire search, so `seed`
+    // actually drives CV fold generation as documented and every trial is
+    // scored on the SAME folds (like xgb.cv / Optuna). TimeSeries keeps row
+    // order (shuffling would leak future rows); the single holdout keeps its
+    // documented "first 80% / last 20%" split.
+    let fold_perm: Option<Vec<usize>> =
+        if matches!(config.cv_scheme, CvScheme::KFold) && config.n_folds >= 2 {
+            use rand::seq::SliceRandom;
+            let mut perm: Vec<usize> = (0..features.nrows()).collect();
+            perm.shuffle(&mut StdRng::seed_from_u64(config.seed));
+            Some(perm)
+        } else {
+            None
+        };
+
+    // Start values depend only on each fold's train labels, which are fixed
+    // across trials — compute them on the first trial that reaches a fold and
+    // reuse them afterwards. Saves one L-BFGS start-value fit per trial × fold
+    // (significant for distributions with numerical-gradient fits like
+    // NegativeBinomial on large data).
+    let n_fold_slots = if config.n_folds <= 1 { 1 } else { config.n_folds };
+    let mut fold_start_values: Vec<Option<Array1<f64>>> = vec![None; n_fold_slots];
 
     let mut best_score = f64::INFINITY;
     let mut best_params: HashMap<String, Value> = HashMap::new();
@@ -446,12 +472,14 @@ pub fn hyper_opt_with_config<B: Backend>(
             seed: config.seed + trial as u64,
         };
 
-        let (cv_score, pruned, intermediate_scores) = cv_with_pruning(
+        let (cv_score, pruned, intermediate_scores, fold_best_rounds) = cv_with_pruning(
             model,
             features,
             labels,
             config.n_folds,
             config.cv_scheme,
+            fold_perm.as_deref(),
+            &mut fold_start_values,
             backend_params,
             train_config,
             &config.pruning,
@@ -459,13 +487,10 @@ pub fn hyper_opt_with_config<B: Backend>(
             n_completed_trials,
         );
 
-        // Report result to optimizers (even for pruned trials)
-        let mut report_score = if pruned {
-            // For pruned trials, use the last intermediate score or infinity
-            intermediate_scores.last().copied().unwrap_or(f64::INFINITY)
-        } else {
-            cv_score
-        };
+        // Report result to optimizers (even for pruned trials). `cv_score` is
+        // the mean over the folds run so far, so pruned and completed trials
+        // feed the TPE estimator the same quantity on the same scale.
+        let mut report_score = cv_score;
 
         // Prevent TPE from crashing on NaN values
         if report_score.is_nan() {
@@ -482,13 +507,26 @@ pub fn hyper_opt_with_config<B: Backend>(
         if !pruned && cv_score < best_score {
             best_score = cv_score;
             best_params = trial_params.clone();
-            best_rounds = config.num_boost_round;
+            // Like Python's hyper_opt (test-mean idxmin + 1), take opt_rounds
+            // from the best trial's early-stopped optimum: the mean of the
+            // folds' best iteration counts.
+            best_rounds = if fold_best_rounds.is_empty() {
+                config.num_boost_round
+            } else {
+                let mean = fold_best_rounds.iter().sum::<usize>() as f64
+                    / fold_best_rounds.len() as f64;
+                (mean.round() as usize).max(1)
+            };
         }
 
-        // Record intermediate scores for future pruning decisions
+        // Record intermediate values for future pruning decisions. Store the
+        // CUMULATIVE mean at each step — the same quantity `should_prune`
+        // receives — so median/percentile pruning compares like with like.
         if !pruned {
+            let mut cum = 0.0;
             for (step, &score) in intermediate_scores.iter().enumerate() {
-                pruner_state.record(step, score);
+                cum += score;
+                pruner_state.record(step, cum / (step + 1) as f64);
             }
             n_completed_trials += 1;
         }
@@ -530,19 +568,27 @@ pub fn hyper_opt_with_config<B: Backend>(
 /// 20%) — one fit, no cross-fold pruning. The holdout mode is much cheaper and
 /// matches a plain train/val split for hyperparameter search.
 ///
-/// Returns (final_score, was_pruned, intermediate_scores)
+/// `fold_perm` is an optional seeded row permutation: when present, k-fold
+/// test/train rows are gathered through it (shuffled folds); when absent the
+/// folds are contiguous row ranges.
+///
+/// Returns (final_score, was_pruned, intermediate_scores, fold_best_rounds)
+/// where `fold_best_rounds` holds each successful fold's early-stopped
+/// optimal round count (`best_iteration + 1`, or the rounds actually run).
 fn cv_with_pruning<B: Backend>(
     model: &GradientLSS<B>,
     features: &Array2<f64>,
     labels: &Array1<f64>,
     n_folds: usize,
     cv_scheme: CvScheme,
+    fold_perm: Option<&[usize]>,
+    fold_start_values: &mut [Option<Array1<f64>>],
     params: B::Params,
     config: TrainConfig,
     pruning_strategy: &PruningStrategy,
     pruner_state: &PrunerState,
     n_completed_trials: usize,
-) -> (f64, bool, Vec<f64>) {
+) -> (f64, bool, Vec<f64>, Vec<usize>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
 
@@ -557,6 +603,7 @@ fn cv_with_pruning<B: Backend>(
     let time_series =
         matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
     let mut intermediate_scores = Vec::with_capacity(n_iters);
+    let mut fold_best_rounds: Vec<usize> = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
     for i in 0..n_iters {
@@ -573,8 +620,8 @@ fn cv_with_pruning<B: Backend>(
             (
                 features.slice(s![..train_end, ..]).to_owned(),
                 labels.slice(s![..train_end]).to_owned(),
-                features.slice(s![train_end..test_end, ..]),
-                labels.slice(s![train_end..test_end]),
+                features.slice(s![train_end..test_end, ..]).to_owned(),
+                labels.slice(s![train_end..test_end]).to_owned(),
             )
         } else {
             let (test_start, test_end) = if single_holdout {
@@ -586,31 +633,48 @@ fn cv_with_pruning<B: Backend>(
                 (i * fold_size, (i + 1) * fold_size)
             };
 
-            let test_features = features.slice(s![test_start..test_end, ..]);
-            let test_labels = labels.slice(s![test_start..test_end]);
+            if let Some(p) = fold_perm {
+                // Shuffled k-fold: gather rows through the seeded permutation.
+                let test_idx = &p[test_start..test_end];
+                let train_idx: Vec<usize> = p[..test_start]
+                    .iter()
+                    .chain(p[test_end..].iter())
+                    .copied()
+                    .collect();
+                (
+                    features.select(Axis(0), &train_idx),
+                    labels.select(Axis(0), &train_idx),
+                    features.select(Axis(0), test_idx),
+                    labels.select(Axis(0), test_idx),
+                )
+            } else {
+                // Contiguous split (single holdout, or no permutation supplied).
+                let test_features = features.slice(s![test_start..test_end, ..]).to_owned();
+                let test_labels = labels.slice(s![test_start..test_end]).to_owned();
 
-            let train_features_1 = features.slice(s![..test_start, ..]);
-            let train_labels_1 = labels.slice(s![..test_start]);
-            let train_features_2 = features.slice(s![test_end.., ..]);
-            let train_labels_2 = labels.slice(s![test_end..]);
+                let train_features_1 = features.slice(s![..test_start, ..]);
+                let train_labels_1 = labels.slice(s![..test_start]);
+                let train_features_2 = features.slice(s![test_end.., ..]);
+                let train_labels_2 = labels.slice(s![test_end..]);
 
-            let train_features =
-                match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        intermediate_scores.push(f64::INFINITY);
-                        continue;
-                    }
-                };
-            let train_labels =
-                match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        intermediate_scores.push(f64::INFINITY);
-                        continue;
-                    }
-                };
-            (train_features, train_labels, test_features, test_labels)
+                let train_features =
+                    match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            intermediate_scores.push(f64::INFINITY);
+                            continue;
+                        }
+                    };
+                let train_labels =
+                    match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            intermediate_scores.push(f64::INFINITY);
+                            continue;
+                        }
+                    };
+                (train_features, train_labels, test_features, test_labels)
+            }
         };
 
         let mut train_data = match B::Dataset::from_data(train_features.view(), train_labels.view())
@@ -629,7 +693,7 @@ fn cv_with_pruning<B: Backend>(
         // Reusing the scoring fold as the early-stopping monitor makes each
         // trial's score mildly optimistic, but uniformly so across trials — the
         // TPE ranking (all that matters for HPO) is unaffected.
-        let mut val_data = match B::Dataset::from_data(test_features, test_labels) {
+        let mut val_data = match B::Dataset::from_data(test_features.view(), test_labels.view()) {
             Ok(d) => d,
             Err(_) => {
                 intermediate_scores.push(f64::INFINITY);
@@ -638,29 +702,51 @@ fn cv_with_pruning<B: Backend>(
         };
 
         let mut fold_model = GradientLSS::<B>::new(model.distribution().clone_arc());
-        if fold_model
-            .train(
-                &mut train_data,
-                Some(&mut val_data),
-                params.clone(),
-                config.clone(),
-            )
-            .is_err()
-        {
-            intermediate_scores.push(f64::INFINITY);
-            continue;
+        // Reuse this fold's start values from an earlier trial when available —
+        // they depend only on the fold's train labels, which are fixed for the
+        // whole search.
+        if let Some(sv) = fold_start_values.get(i).and_then(|s| s.as_ref()) {
+            fold_model.preset_start_values(sv.clone());
         }
+        let train_result = match fold_model.train_with_callbacks(
+            &mut train_data,
+            Some(&mut val_data),
+            params.clone(),
+            config.clone(),
+            None::<&mut crate::backend::HistoryCallback>,
+        ) {
+            Ok(((), result)) => result,
+            Err(_) => {
+                intermediate_scores.push(f64::INFINITY);
+                continue;
+            }
+        };
+        if let Some(slot) = fold_start_values.get_mut(i) {
+            if slot.is_none() {
+                *slot = fold_model.start_values().cloned();
+            }
+        }
+
+        // Rounds this fold's early stopping actually selected (argmin of its
+        // validation curve); falls back to the number of rounds run.
+        fold_best_rounds.push(
+            train_result
+                .best_iteration
+                .map(|b| b + 1)
+                .unwrap_or(train_result.n_iterations),
+        );
 
         // Get prediction using public API and compute score
         let score = match fold_model.predict(
-            &test_features,
+            &test_features.view(),
             crate::model::PredType::Parameters,
             0,
             &[],
             0,
         ) {
             Ok(crate::backend::PredictionOutput::Parameters(preds)) => {
-                let target = crate::types::ResponseData::Univariate(&test_labels);
+                let test_labels_view = test_labels.view();
+                let target = crate::types::ResponseData::Univariate(&test_labels_view);
                 fold_model.distribution().nll(&preds.view(), &target)
             }
             _ => f64::INFINITY,
@@ -686,7 +772,7 @@ fn cv_with_pruning<B: Backend>(
         intermediate_scores.iter().sum::<f64>() / intermediate_scores.len() as f64
     };
 
-    (final_score, pruned, intermediate_scores)
+    (final_score, pruned, intermediate_scores, fold_best_rounds)
 }
 
 /// Parse hyperparameter specifications from JSON values.
@@ -747,6 +833,11 @@ fn parse_hp_specs(hp_dict: &HashMap<String, Value>) -> Result<Vec<HyperParamSpec
         };
         specs.push(spec);
     }
+
+    // HashMap iteration order is randomized per process, and the specs order
+    // sets the order in which parameters consume the shared RNG stream — sort
+    // by name so seeded runs are reproducible.
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(specs)
 }
@@ -865,5 +956,216 @@ mod tests {
             json_to_param_value(&serde_json::json!(true)),
             ParamValue::Bool(true)
         ));
+    }
+
+    #[test]
+    fn test_parse_hp_specs_sorted_by_name() {
+        // HashMap iteration order is randomized per process; specs must come
+        // back name-sorted so seeded searches consume the RNG in a stable order.
+        let mut hp_dict = HashMap::new();
+        hp_dict.insert("eta".to_string(), serde_json::json!([0.01, 0.3]));
+        hp_dict.insert("max_depth".to_string(), serde_json::json!([2.0, 8.0]));
+        hp_dict.insert("alpha".to_string(), serde_json::json!([0.0, 1.0]));
+        hp_dict.insert("lambda".to_string(), serde_json::json!([0.0, 1.0]));
+
+        let specs = parse_hp_specs(&hp_dict).unwrap();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "eta", "lambda", "max_depth"]);
+    }
+}
+
+#[cfg(all(test, feature = "xgboost"))]
+mod xgboost_hyper_opt_tests {
+    use super::*;
+    use crate::backend::XGBoostBackend;
+    use crate::distributions::Gaussian;
+    use ndarray::{Array1, Array2};
+    use std::sync::Arc;
+
+    /// Deterministic noisy regression data (same LCG scheme as the backend
+    /// best_iteration tests) — noisy enough that CV early stopping fires well
+    /// before `num_boost_round`.
+    fn noisy_dataset() -> (Array2<f64>, Array1<f64>) {
+        let n = 200usize;
+        let f = 4usize;
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (u32::MAX as f64)
+        };
+
+        let mut feats = Array2::<f64>::zeros((n, f));
+        let mut labels = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut signal = 0.0;
+            for j in 0..f {
+                let x = next();
+                feats[[i, j]] = x;
+                if j < 2 {
+                    signal += x;
+                }
+            }
+            labels[i] = signal + (next() - 0.5) * 4.0;
+        }
+        (feats, labels)
+    }
+
+    fn run_search(seed: u64) -> HyperOptResult {
+        let (features, labels) = noisy_dataset();
+        let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+
+        let mut hp_dict = HashMap::new();
+        hp_dict.insert("eta".to_string(), serde_json::json!([0.05, 0.5]));
+        hp_dict.insert(
+            "max_depth".to_string(),
+            serde_json::json!({"low": 2.0, "high": 6.0, "type": "int"}),
+        );
+
+        let config = HyperOptConfig {
+            n_trials: 4,
+            n_folds: 2,
+            seed,
+            num_boost_round: 60,
+            early_stopping_rounds: Some(5),
+            verbose: false,
+            ..Default::default()
+        };
+
+        hyper_opt_with_config(&mut model, &features, &labels, &hp_dict, config).unwrap()
+    }
+
+    #[test]
+    fn test_seeded_search_is_reproducible() {
+        let a = run_search(11);
+        let b = run_search(11);
+
+        assert_eq!(a.trials.len(), b.trials.len());
+        for (ta, tb) in a.trials.iter().zip(&b.trials) {
+            assert_eq!(
+                ta.params, tb.params,
+                "same seed must sample identical hyperparameters"
+            );
+            assert_eq!(ta.score.to_bits(), tb.score.to_bits());
+        }
+        assert_eq!(a.best_score.to_bits(), b.best_score.to_bits());
+        assert_eq!(a.opt_rounds, b.opt_rounds);
+    }
+
+    /// Manual benchmark proving the per-fold start-value cache is a real
+    /// speedup. Uses NegativeBinomial with `initialize: true` (the L-BFGS
+    /// start-value path; distributions with `initialize: false` skip the fit
+    /// entirely and the cache is a no-op for them). True A/B: `&mut []` as the
+    /// cache slice disables caching (no slots to read or write).
+    /// `cargo test --release --features xgboost --lib start_value_cache_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn start_value_cache_timing() {
+        use crate::backend::Backend;
+        use crate::distributions::{LossFn, NegativeBinomial, Stabilization};
+        use crate::utils::ResponseFn;
+        use std::time::Instant;
+
+        // ~50k-row count dataset (LCG, deterministic).
+        let n = 50_000usize;
+        let f = 4usize;
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (u32::MAX as f64)
+        };
+        let mut features = Array2::<f64>::zeros((n, f));
+        let mut labels = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut rate = 1.0;
+            for j in 0..f {
+                let x = next();
+                features[[i, j]] = x;
+                rate += x;
+            }
+            labels[i] = (rate * next() * 4.0).floor(); // counts in [0, ~20)
+        }
+
+        let nb = NegativeBinomial::new(
+            Stabilization::Mad,
+            ResponseFn::Relu,
+            ResponseFn::Sigmoid,
+            LossFn::Nll,
+            true, // initialize: engage the L-BFGS start-value fit
+        );
+        let model = GradientLSS::<XGBoostBackend>::new(Arc::new(nb));
+
+        let n_trials = 6usize;
+        let n_folds = 3usize;
+        let config = TrainConfig {
+            num_boost_round: 10,
+            early_stopping_rounds: None,
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: false,
+        };
+        let pruner_state = PrunerState::new();
+
+        let run = |cache: &mut [Option<Array1<f64>>]| -> std::time::Duration {
+            let t = Instant::now();
+            for _ in 0..n_trials {
+                let params = XGBoostBackend::create_params(model.n_params());
+                let (score, ..) = cv_with_pruning(
+                    &model,
+                    &features,
+                    &labels,
+                    n_folds,
+                    CvScheme::KFold,
+                    None,
+                    cache,
+                    params,
+                    config.clone(),
+                    &PruningStrategy::None,
+                    &pruner_state,
+                    0,
+                );
+                assert!(score.is_finite());
+            }
+            t.elapsed()
+        };
+
+        // Warm-up (allocator, xgboost init).
+        run(&mut []);
+
+        let uncached = run(&mut []);
+        let mut cache: Vec<Option<Array1<f64>>> = vec![None; n_folds];
+        let cached = run(&mut cache);
+
+        println!(
+            "start-value cache A/B over {n_trials} trials x {n_folds} folds @ {n} rows:\n\
+             uncached: {uncached:?}\n\
+             cached:   {cached:?}\n\
+             saved:    {:?} ({:.1}%)",
+            uncached.saturating_sub(cached),
+            100.0 * (1.0 - cached.as_secs_f64() / uncached.as_secs_f64()),
+        );
+        assert!(
+            cached < uncached,
+            "cached ({cached:?}) should beat uncached ({uncached:?})"
+        );
+    }
+
+    #[test]
+    fn test_opt_rounds_reflects_early_stopping() {
+        let result = run_search(11);
+
+        assert!(result.best_score.is_finite());
+        assert!(result.opt_rounds >= 1);
+        // On heavily noisy labels the CV folds early-stop far below the
+        // budget; opt_rounds must come from that optimum, not num_boost_round.
+        assert!(
+            result.opt_rounds < 60,
+            "opt_rounds ({}) should reflect the folds' early-stopped optimum, \
+             not the num_boost_round budget",
+            result.opt_rounds
+        );
     }
 }
