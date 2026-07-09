@@ -54,7 +54,8 @@ Both XGBoost and LightGBM backends require native libraries to be compiled:
 
 ## Breaking Changes
 
-If you're updating from an earlier build, two changes require action:
+If you're updating from an earlier build, the following changes require action
+or change numerical results:
 
 ### `TrainConfig` has a new required field: `collect_train_metrics`
 
@@ -96,6 +97,56 @@ LightGBM models now persist `best_iteration` (an 8-byte header before the model
 text) so that predictions after early stopping use the best round, matching
 LightGBM's Python behavior. **Models saved with an older build will fail to
 load** — retrain and re-save them.
+
+### Predictions may shift: `best_iteration` now tracks the true optimum
+
+When early stopping is active, prediction truncates the ensemble to the best
+boosting iteration. Previously that iteration only advanced when the validation
+metric improved by the early-stopping *min-delta* (1e-4 relative), so it could
+lag the real optimum and predict a slightly under-fit model. It now records the
+true argmin of the validation curve (any improvement counts), matching
+XGBoost/LightGBM in Python.
+
+- **Effect:** predictions from a model trained *with a validation set + early
+  stopping* can change slightly — generally a touch more accurate. Models
+  trained without early stopping are **unchanged** (all trees are used).
+- **Action:** none required. If you pinned expected prediction values in tests,
+  regenerate the baselines.
+
+The early-stopping *decision* is unchanged: the patience counter still uses the
+min-delta, so training stops after the same number of rounds as before — only
+which iteration is selected for prediction moved.
+
+### Hyperparameter search now shuffles CV folds (results change)
+
+`hyper_opt` with the default `CvScheme::KFold` now draws one seeded row
+permutation (from `HyperOptConfig::seed`) and reuses it for every trial, instead
+of using contiguous row-order folds. This makes `seed` actually control fold
+composition (as documented) and matches `xgboost.cv`'s random partitioning.
+
+- **Effect:** CV scores — and therefore which hyperparameters are selected —
+  will differ from previous runs. This is a one-time shift toward more reliable
+  estimates (contiguous folds were biased whenever rows were ordered by target).
+- **Reproducibility:** a fixed `seed` (and `hp_seed`) now gives identical
+  results run-to-run; a previous bug tied fold/RNG order to `HashMap` iteration
+  order, so even seeded runs varied.
+
+**Time-series data is unaffected — and this is the mechanism to use.** Shuffling
+is applied *only* to `CvScheme::KFold`. Set `cv_scheme: CvScheme::TimeSeries` and
+folds stay in row order with forward-chaining (expanding window): fold *i* trains
+only on rows strictly before its test segment, so no future row ever informs a
+past prediction. If your rows encode time, use `TimeSeries` and none of the
+shuffling above applies:
+
+```rust
+let config = HyperOptConfig {
+    cv_scheme: CvScheme::TimeSeries, // preserves order; no shuffle
+    n_folds: 5,
+    ..HyperOptConfig::default()      // KFold is the default
+};
+```
+
+(The single 80/20 holdout, `n_folds <= 1`, is likewise never shuffled.)
 
 ## Usage
 
