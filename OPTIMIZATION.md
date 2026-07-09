@@ -19,16 +19,12 @@ The release profile is configured with:
 - `lto = "fat"` - Link-time optimization across all crates
 - `codegen-units = 1` - Better optimization (slower compile)
 
-### 2. SIMD Vectorization
+### 2. Auto-Vectorization
 
-The `simd_ops` module provides SIMD-accelerated versions of response functions:
-- `exp_simd` - Exponential function
-- `sigmoid_simd` - Sigmoid activation
-- `softplus_simd` - Softplus activation
-- `squareplus_simd` - Squareplus activation
-- `relu_simd` - ReLU activation
-
-These use the `wide` crate for portable SIMD on stable Rust. To maximize SIMD performance:
+The hot paths (fused response-function derivatives in `utils.rs`, the batch
+transform passes) are written as contiguous single-pass loops that LLVM
+auto-vectorizes. To let the compiler use the full instruction set of the
+build machine:
 
 ```bash
 # Enable native CPU features (AVX2/AVX-512 on modern x86)
@@ -153,6 +149,5 @@ cargo bench -- --sample-size 10
 With all optimizations enabled:
 - Gradient computation: ~50 Melem/s at 10k samples
 - Transform params: 70-150 Melem/s depending on distribution
-- SIMD provides ~2-4x speedup for response functions
 - PGO adds ~10-15% improvement
 - BOLT adds ~2-5% on top of PGO

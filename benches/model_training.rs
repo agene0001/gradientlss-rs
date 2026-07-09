@@ -485,7 +485,7 @@ mod no_backend {
 // Main
 // ============================================================================
 
-#[cfg(feature = "xgboost")]
+#[cfg(all(feature = "xgboost", not(feature = "lightgbm")))]
 criterion_main!(xgboost_benchmarks::xgboost_benches);
 
 #[cfg(all(feature = "lightgbm", not(feature = "xgboost")))]

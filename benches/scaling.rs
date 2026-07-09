@@ -625,7 +625,7 @@ criterion_group!(
     bench_transform_scaling,
 );
 
-#[cfg(feature = "xgboost")]
+#[cfg(all(feature = "xgboost", not(feature = "lightgbm")))]
 criterion_main!(
     distribution_scaling_benches,
     xgboost_scaling::xgboost_scaling_benches
