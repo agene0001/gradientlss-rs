@@ -9,6 +9,12 @@ use crate::types::ResponseData;
 use ndarray::{Array1, ArrayView1};
 use rayon::prelude::*;
 
+/// Sort key that pushes NaN NLLs to the end of an ascending ranking (ties
+/// with +inf, which also loses to every finite fit).
+fn nan_last(nll: f64) -> f64 {
+    if nll.is_nan() { f64::INFINITY } else { nll }
+}
+
 /// Selects the best distribution from a list of candidates based on NLL.
 ///
 /// This function iterates through a list of candidate distributions, fits each
@@ -57,8 +63,10 @@ pub fn dist_select<'a>(
         }
     }
 
-    // Sort by NLL, lowest to highest
-    successful_fits.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by NLL, lowest to highest. NaN losses sort LAST (like pandas
+    // sort_values' na_position='last' in Python's dist_select) so a diverged
+    // fit can never win the ranking.
+    successful_fits.sort_by(|a, b| nan_last(a.1).total_cmp(&nan_last(b.1)));
 
     Ok(successful_fits)
 }
@@ -143,12 +151,10 @@ pub fn dist_select_with_params<'a>(
         }
     }
 
-    // Sort by NLL, lowest to highest
-    successful_fits.sort_by(|a, b| {
-        a.nll
-            .partial_cmp(&b.nll)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort by NLL, lowest to highest. NaN losses sort LAST (like pandas
+    // sort_values' na_position='last' in Python's dist_select) so a diverged
+    // fit can never win the ranking.
+    successful_fits.sort_by(|a, b| nan_last(a.nll).total_cmp(&nan_last(b.nll)));
 
     Ok(successful_fits)
 }

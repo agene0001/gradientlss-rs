@@ -78,6 +78,18 @@ harness = false
 name = "ab_comparison"
 harness = false
 
+[[bench]]
+name = "model_training"
+harness = false
+
+[[bench]]
+name = "inference"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

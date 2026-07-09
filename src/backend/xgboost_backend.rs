@@ -412,6 +412,9 @@ impl BackendModel for XGBoostModel {
 
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
+        // Last loss that beat its predecessor by the relative min-delta; drives
+        // ONLY the patience counter, never best_iteration/best_loss.
+        let mut significant_best_loss = f64::INFINITY;
         let mut rounds_without_improvement = 0;
         let mut stopped_early = false;
 
@@ -521,14 +524,22 @@ impl BackendModel for XGBoostModel {
                 }
             }
 
-            // Count this round as progress only if it beats the best by a
-            // relative margin (see `is_significant_improvement`). Without the
-            // min-delta, a noisy sub-1e-4 NLL tick reset the patience counter
-            // every round, so NegBinom fits rode `num_boost_round` to the end
-            // instead of early-stopping.
-            if is_significant_improvement(eval_loss, best_loss, EARLY_STOP_REL_DELTA) {
+            // best_iteration/best_loss track the TRUE argmin of the eval curve
+            // (min_delta = 0, matching Python's xgboost/lightgbm early-stopping
+            // bookkeeping) — predict-time truncation must keep every tree that
+            // improved the monitored loss, however slightly.
+            if eval_loss < best_loss {
                 best_loss = eval_loss;
                 best_iteration = round;
+            }
+
+            // The patience counter, by contrast, only counts a round as progress
+            // if it beats the last significant best by a relative margin (see
+            // `is_significant_improvement`). Without the min-delta, a noisy
+            // sub-1e-4 NLL tick reset the counter every round, so NegBinom fits
+            // rode `num_boost_round` to the end instead of early-stopping.
+            if is_significant_improvement(eval_loss, significant_best_loss, EARLY_STOP_REL_DELTA) {
+                significant_best_loss = eval_loss;
                 rounds_without_improvement = 0;
             } else {
                 rounds_without_improvement += 1;

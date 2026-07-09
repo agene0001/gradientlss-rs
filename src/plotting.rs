@@ -147,12 +147,18 @@ pub fn plot_feature_importance(
             .collect()
     };
 
-    // Get feature names
-    let feature_names: Vec<String> = importance.feature_names.clone().unwrap_or_else(|| {
-        (0..scores.len())
-            .map(|i| format!("Feature {}", i))
-            .collect()
-    });
+    // Map each score row to its true feature index: `scores` rows are in the
+    // backend's row order (XGBoost dumps a lexicographically sorted subset of
+    // the features that appear in splits — "f10" < "f2" — and omits unused
+    // ones), and `feature_indices` carries the real feature number per row.
+    // Naming rows positionally would mislabel the bars.
+    let row_name = |row: usize| -> String {
+        let feat_idx = importance.feature_indices.get(row).copied().unwrap_or(row);
+        match &importance.feature_names {
+            Some(names) if feat_idx < names.len() => names[feat_idx].clone(),
+            _ => format!("Feature {}", feat_idx),
+        }
+    };
 
     // Sort by importance and take top N
     let mut indexed_scores: Vec<(usize, f64)> = scores.iter().copied().enumerate().collect();
@@ -160,10 +166,7 @@ pub fn plot_feature_importance(
     indexed_scores.truncate(max_features);
 
     // Prepare data for plotting
-    let sorted_names: Vec<&str> = indexed_scores
-        .iter()
-        .map(|(i, _)| feature_names[*i].as_str())
-        .collect();
+    let sorted_names: Vec<String> = indexed_scores.iter().map(|(i, _)| row_name(*i)).collect();
     let sorted_scores: Vec<f64> = indexed_scores.iter().map(|(_, s)| *s).collect();
 
     // Create the plot
@@ -193,7 +196,7 @@ pub fn plot_feature_importance(
         .y_desc(config.y_label.as_deref().unwrap_or("Feature"))
         .y_label_formatter(&|y| {
             if let SegmentValue::CenterOf(idx) = y {
-                sorted_names.get(*idx).copied().unwrap_or("").to_string()
+                sorted_names.get(*idx).cloned().unwrap_or_default()
             } else {
                 String::new()
             }
@@ -352,14 +355,21 @@ pub fn plot_dist_select(results: &[(String, f64)], path: &str, config: &PlotConf
 
     let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
     let scores: Vec<f64> = results.iter().map(|(_, s)| *s).collect();
-    let max_score = scores.iter().cloned().fold(0.0, f64::max) * 1.1;
+    // NLL can be negative (densities > 1 on small-scale data), so anchor the
+    // axis at 0 and extend in both directions — otherwise negative bars (the
+    // BEST fits) fall outside a 0..max range and render invisible.
+    let max_score = scores.iter().cloned().fold(0.0_f64, f64::max) * 1.1;
+    let mut min_score = scores.iter().cloned().fold(0.0_f64, f64::min) * 1.1;
+    if min_score == max_score {
+        min_score = max_score - 1.0;
+    }
 
     let mut chart = ChartBuilder::on(&root)
         .caption(&title, ("sans-serif", config.font_size).into_font())
         .margin(10)
         .x_label_area_size(40)
         .y_label_area_size(120)
-        .build_cartesian_2d(0.0..max_score, (0..names.len()).into_segmented())
+        .build_cartesian_2d(min_score..max_score, (0..names.len()).into_segmented())
         .map_err(|e| GradientLSSError::PlottingError(e.to_string()))?;
 
     chart
@@ -1084,14 +1094,17 @@ impl<B: Backend> GradientLSS<B> {
             })
             .collect();
 
-        // If we couldn't parse tau levels, use evenly spaced defaults
-        let tau_levels = if tau_levels.len() == n_params {
-            tau_levels
-        } else {
-            (0..n_params)
-                .map(|i| (i as f64 + 1.0) / (n_params as f64 + 1.0))
-                .collect()
-        };
+        // If the names don't parse as expectile levels, this isn't an Expectile
+        // model (PredType::Expectiles silently returns plain parameters) —
+        // refuse rather than fabricate evenly spaced taus and plot e.g. a
+        // Gaussian's (loc, scale) as "expectiles".
+        if tau_levels.len() != n_params {
+            return Err(GradientLSSError::InvalidParameter(format!(
+                "expectile_plot requires an Expectile distribution; parameter names {:?} \
+                 do not parse as expectile levels",
+                self.param_names()
+            )));
+        }
 
         let feature_str = feature_name.unwrap_or_else(|| format!("Feature {}", feature_idx));
 
