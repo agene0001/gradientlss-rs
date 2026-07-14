@@ -399,7 +399,11 @@ pub fn hyper_opt_with_config<B: Backend>(
     // reuse them afterwards. Saves one L-BFGS start-value fit per trial × fold
     // (significant for distributions with numerical-gradient fits like
     // NegativeBinomial on large data).
-    let n_fold_slots = if config.n_folds <= 1 { 1 } else { config.n_folds };
+    let n_fold_slots = if config.n_folds <= 1 {
+        1
+    } else {
+        config.n_folds
+    };
     let mut fold_start_values: Vec<Option<Array1<f64>>> = vec![None; n_fold_slots];
 
     let mut best_score = f64::INFINITY;
@@ -513,8 +517,8 @@ pub fn hyper_opt_with_config<B: Backend>(
             best_rounds = if fold_best_rounds.is_empty() {
                 config.num_boost_round
             } else {
-                let mean = fold_best_rounds.iter().sum::<usize>() as f64
-                    / fold_best_rounds.len() as f64;
+                let mean =
+                    fold_best_rounds.iter().sum::<usize>() as f64 / fold_best_rounds.len() as f64;
                 (mean.round() as usize).max(1)
             };
         }
@@ -600,8 +604,7 @@ fn cv_with_pruning<B: Backend>(
     // Forward-chaining splits into `n_folds + 1` time segments; disabled when there
     // are too few rows to segment (falls back to k-fold/holdout behavior).
     let ts_seg = n_samples / (n_folds + 1);
-    let time_series =
-        matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
+    let time_series = matches!(cv_scheme, CvScheme::TimeSeries) && !single_holdout && ts_seg > 0;
     let mut intermediate_scores = Vec::with_capacity(n_iters);
     let mut fold_best_rounds: Vec<usize> = Vec::with_capacity(n_iters);
     let mut pruned = false;
@@ -736,20 +739,15 @@ fn cv_with_pruning<B: Backend>(
                 .unwrap_or(train_result.n_iterations),
         );
 
-        // Get prediction using public API and compute score
-        let score = match fold_model.predict(
-            &test_features.view(),
-            crate::model::PredType::Parameters,
-            0,
-            &[],
-            0,
-        ) {
-            Ok(crate::backend::PredictionOutput::Parameters(preds)) => {
+        // Score on the INTERNAL transformed parameters (start values added, no
+        // user-facing finalize — Mixture's `nll` expects raw mixing logits).
+        let score = match fold_model.predict_transformed(&test_features.view()) {
+            Ok(preds) => {
                 let test_labels_view = test_labels.view();
                 let target = crate::types::ResponseData::Univariate(&test_labels_view);
                 fold_model.distribution().nll(&preds.view(), &target)
             }
-            _ => f64::INFINITY,
+            Err(_) => f64::INFINITY,
         };
 
         intermediate_scores.push(score);
@@ -781,15 +779,30 @@ fn parse_hp_specs(hp_dict: &HashMap<String, Value>) -> Result<Vec<HyperParamSpec
 
     for (name, value) in hp_dict {
         let spec = match value {
-            // Array format: [low, high] - treated as float range
+            // Array format: [low, high]. Integer bounds (JSON `2`, not `2.0`)
+            // mean an INT range — optuna-suggest_int semantics for params like
+            // num_leaves/max_depth, which LightGBM rejects as floats ("Parameter
+            // num_leaves should be of type int, got 5.07..."). Any float bound
+            // makes it a float range.
             Value::Array(arr) if arr.len() == 2 => {
-                let low = arr[0]
-                    .as_f64()
-                    .ok_or_else(|| format!("Invalid low value for {}", name))?;
-                let high = arr[1]
-                    .as_f64()
-                    .ok_or_else(|| format!("Invalid high value for {}", name))?;
-                HyperParamSpec::float(name.clone(), low, high)
+                if let (Some(low), Some(high)) = (arr[0].as_i64(), arr[1].as_i64()) {
+                    HyperParamSpec {
+                        name: name.clone(),
+                        param_type: HyperParamType::Int {
+                            low,
+                            high,
+                            log: false,
+                        },
+                    }
+                } else {
+                    let low = arr[0]
+                        .as_f64()
+                        .ok_or_else(|| format!("Invalid low value for {}", name))?;
+                    let high = arr[1]
+                        .as_f64()
+                        .ok_or_else(|| format!("Invalid high value for {}", name))?;
+                    HyperParamSpec::float(name.clone(), low, high)
+                }
             }
             // Object format with more options
             Value::Object(obj) => {
