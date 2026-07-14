@@ -69,45 +69,55 @@ fn main() {
     // Skipped when PROFILE_MICRO=0 so a sampling profiler sees training only.
     let run_micro = std::env::var("PROFILE_MICRO").as_deref() != Ok("0");
     let preds = Array2::<f64>::from_shape_fn((n, 2), |(i, j)| {
-        if j == 0 { 1.5 + (i % 7) as f64 * 0.1 } else { 0.3 }
+        if j == 0 {
+            1.5 + (i % 7) as f64 * 0.1
+        } else {
+            0.3
+        }
     });
     let target = ResponseData::Univariate(&labels.view());
 
     let mut grad_per_call = std::time::Duration::ZERO;
     let mut nll_per_call = std::time::Duration::ZERO;
     if run_micro {
-    let t = Instant::now();
-    let mut iters = 0u32;
-    while t.elapsed().as_millis() < 1500 {
-        let gh = dist
-            .compute_gradients_and_hessians(&preds.view(), &target, None)
-            .unwrap();
-        std::hint::black_box(&gh);
-        iters += 1;
-    }
-    grad_per_call = t.elapsed() / iters;
-    println!("gradients+hessians: {:>10.3?} per call ({iters} calls)", grad_per_call);
+        let t = Instant::now();
+        let mut iters = 0u32;
+        while t.elapsed().as_millis() < 1500 {
+            let gh = dist
+                .compute_gradients_and_hessians(&preds.view(), &target, None)
+                .unwrap();
+            std::hint::black_box(&gh);
+            iters += 1;
+        }
+        grad_per_call = t.elapsed() / iters;
+        println!(
+            "gradients+hessians: {:>10.3?} per call ({iters} calls)",
+            grad_per_call
+        );
 
-    let transformed = dist.transform_params(&preds.view());
-    let t = Instant::now();
-    let mut iters = 0u32;
-    while t.elapsed().as_millis() < 1500 {
-        std::hint::black_box(dist.nll(&transformed.view(), &target));
-        iters += 1;
-    }
-    nll_per_call = t.elapsed() / iters;
-    println!("nll:                {:>10.3?} per call ({iters} calls)", nll_per_call);
+        let transformed = dist.transform_params(&preds.view());
+        let t = Instant::now();
+        let mut iters = 0u32;
+        while t.elapsed().as_millis() < 1500 {
+            std::hint::black_box(dist.nll(&transformed.view(), &target));
+            iters += 1;
+        }
+        nll_per_call = t.elapsed() / iters;
+        println!(
+            "nll:                {:>10.3?} per call ({iters} calls)",
+            nll_per_call
+        );
 
-    let t = Instant::now();
-    let mut iters = 0u32;
-    while t.elapsed().as_millis() < 1500 {
-        std::hint::black_box(dist.transform_params(&preds.view()));
-        iters += 1;
-    }
-    println!(
-        "transform_params:   {:>10.3?} per call ({iters} calls)",
-        t.elapsed() / iters
-    );
+        let t = Instant::now();
+        let mut iters = 0u32;
+        while t.elapsed().as_millis() < 1500 {
+            std::hint::black_box(dist.transform_params(&preds.view()));
+            iters += 1;
+        }
+        println!(
+            "transform_params:   {:>10.3?} per call ({iters} calls)",
+            t.elapsed() / iters
+        );
     } // run_micro
 
     // --- End-to-end training --------------------------------------------
@@ -143,10 +153,15 @@ fn main() {
         // metric does one transform+nll on train predictions.
         let dist_side = (grad_per_call + nll_per_call) * rounds as u32;
         println!("\n--- attribution over {rounds} rounds ---");
-        println!("distribution side (grad + nll): {:>10.3?}  ({:.1}%)",
-            dist_side, 100.0 * dist_side.as_secs_f64() / train_time.as_secs_f64());
-        println!("backend side (trees + predict): {:>10.3?}  ({:.1}%)",
+        println!(
+            "distribution side (grad + nll): {:>10.3?}  ({:.1}%)",
+            dist_side,
+            100.0 * dist_side.as_secs_f64() / train_time.as_secs_f64()
+        );
+        println!(
+            "backend side (trees + predict): {:>10.3?}  ({:.1}%)",
             train_time.saturating_sub(dist_side),
-            100.0 * (train_time.saturating_sub(dist_side)).as_secs_f64() / train_time.as_secs_f64());
+            100.0 * (train_time.saturating_sub(dist_side)).as_secs_f64() / train_time.as_secs_f64()
+        );
     }
 }

@@ -26,7 +26,9 @@ fn make_data(n: usize, n_features: usize, seed_shift: usize) -> (Array2<f64>, Ar
         }
         // NB-ish integer counts with a spread of magnitudes.
         let mu = 1.0 + 10.0 * features[[i, 0]] + 5.0 * features[[i, 1]];
-        labels[i] = (mu + ((i * 31 + seed_shift) % 13) as f64 - 6.0).max(0.0).round();
+        labels[i] = (mu + ((i * 31 + seed_shift) % 13) as f64 - 6.0)
+            .max(0.0)
+            .round();
     }
     (features, labels)
 }
@@ -81,8 +83,14 @@ fn main() {
     };
     let t_true = med(&mut with_metric);
     let t_false = med(&mut without_metric);
-    println!("collect_train_metrics=true:  median {:.3}s  {:?}", t_true, with_metric);
-    println!("collect_train_metrics=false: median {:.3}s  {:?}", t_false, without_metric);
+    println!(
+        "collect_train_metrics=true:  median {:.3}s  {:?}",
+        t_true, with_metric
+    );
+    println!(
+        "collect_train_metrics=false: median {:.3}s  {:?}",
+        t_false, without_metric
+    );
     println!(
         "delta: {:.3}s ({:.1}% faster without the train metric)",
         t_true - t_false,

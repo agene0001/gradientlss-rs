@@ -8,7 +8,7 @@
 //!
 //! Note: These benchmarks require backend features to be enabled.
 
-use criterion::{ Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ndarray::{Array1, Array2};
 use std::hint::black_box;
 /// Generate synthetic regression data.
@@ -51,12 +51,12 @@ fn generate_positive_training_data(
 #[cfg(feature = "xgboost")]
 mod xgboost_inference {
     use super::*;
+    use criterion::{BenchmarkId, Throughput};
     use gradientlss::backend::{Backend, BackendDataset, TrainConfig};
     use gradientlss::distributions::{Gamma, Gaussian, StudentT};
     use gradientlss::model::{GradientLSS, PredType};
     use gradientlss::prelude::XGBoostBackend;
     use std::sync::Arc;
-    use criterion::{BenchmarkId, Throughput};
 
     fn bench_prediction_parameters(c: &mut Criterion) {
         let mut group = c.benchmark_group("inference/xgboost/parameters");
@@ -419,12 +419,12 @@ mod xgboost_inference {
 #[cfg(feature = "lightgbm")]
 mod lightgbm_inference {
     use super::*;
+    use criterion::{BenchmarkId, Throughput};
     use gradientlss::backend::{Backend, BackendDataset, TrainConfig};
     use gradientlss::distributions::Gaussian;
     use gradientlss::model::{GradientLSS, PredType};
     use gradientlss::prelude::LightGBMBackend;
     use std::sync::Arc;
-    use criterion::{BenchmarkId, Throughput};
 
     fn bench_lightgbm_prediction_parameters(c: &mut Criterion) {
         let mut group = c.benchmark_group("inference/lightgbm/parameters");
