@@ -110,7 +110,11 @@ impl NegativeBinomial {
         // They are complementary: statrs_p = 1 - probs
         let p = 1.0 - probs;
         // ln_pmf = ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
-        ln_gamma(r + k) - ln_gamma(r) - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0)) + r * p.ln() + k * (-p).ln_1p()
+        ln_gamma(r + k)
+            - ln_gamma(r)
+            - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
+            + r * p.ln()
+            + k * (-p).ln_1p()
     }
 }
 
@@ -148,6 +152,13 @@ impl Distribution for NegativeBinomial {
         self.initialize
     }
 
+    /// Sampling uses a discrete Gamma–Poisson draw, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -157,7 +168,7 @@ impl Distribution for NegativeBinomial {
             ResponseData::Univariate(y) => {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[col0[i], col1[i]], y[i])
                 })
             }
@@ -208,7 +219,8 @@ impl Distribution for NegativeBinomial {
         // sequential and parallel paths so we no longer branch on the per-sample
         // scalar derivative calls.
         let (rd_r, rsd_r) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
-        let (rd_p, rsd_p) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
+        let (rd_p, rsd_p) =
+            probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
 
         // Per-sample (grad_r, hess_r, grad_probs, hess_probs) in prediction space.
         let compute = |i: usize| -> (f64, f64, f64, f64) {

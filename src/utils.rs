@@ -108,24 +108,11 @@ impl ResponseFn {
             ResponseFn::ExpDf => nan_to_num_scalar(x, nan_replacement).exp() + EPSILON + 2.0,
             ResponseFn::Softplus => {
                 let v = nan_to_num_scalar(x, nan_replacement);
-                if v > 20.0 {
-                    v + EPSILON
-                } else if v < -20.0 {
-                    EPSILON
-                } else {
-                    (1.0 + v.exp()).ln() + EPSILON
-                }
+                softplus_scalar(v)
             }
             ResponseFn::SoftplusDf => {
                 let v = nan_to_num_scalar(x, nan_replacement);
-                let sp = if v > 20.0 {
-                    v + EPSILON
-                } else if v < -20.0 {
-                    EPSILON
-                } else {
-                    (1.0 + v.exp()).ln() + EPSILON
-                };
-                sp + 2.0
+                softplus_scalar(v) + 2.0
             }
             ResponseFn::Squareplus => {
                 let v = nan_to_num_scalar(x, nan_replacement);
@@ -309,19 +296,41 @@ pub fn gumbel_softmax_fn_2d(
 // ============================================================================
 
 fn softplus_scalar(x: f64) -> f64 {
-    // Numerically stable softplus (assumes input already nan-cleaned)
+    // Numerically stable softplus (assumes input already nan-cleaned).
+    // torch's softplus only has an UPPER threshold (linear for x > 20) and
+    // computes log1p(exp(x)) below it; log1p(exp(x)) = exp(x) to f64 precision
+    // for x < -20, so the lower branch keeps the tail instead of flooring it.
     if x > 20.0 {
         x + EPSILON
     } else if x < -20.0 {
-        EPSILON
+        x.exp() + EPSILON
     } else {
-        (1.0 + x.exp()).ln() + EPSILON
+        x.exp().ln_1p() + EPSILON
     }
 }
 
 fn squareplus_scalar(x: f64) -> f64 {
     // Assumes input already nan-cleaned
     0.5 * (x + (x * x + 4.0).sqrt()) + EPSILON
+}
+
+/// First and second derivatives of the Sigmoid *response function* — i.e. of
+/// `clamp(σ(x) + ε, 1e-3, 1 - 1e-3)`, not of the bare σ(x). Where the clamp is
+/// active (|x| ≳ 6.9) the transform is constant, so both derivatives are 0 —
+/// exactly what torch autograd yields through `torch.clamp`, and what this
+/// crate's own numerical differentiation (which perturbs through the clamped
+/// forward) measures. The bare σ'(x) there is ≤ ~1e-3, so this is a small but
+/// real consistency fix between the analytical and numerical paths.
+#[inline]
+fn sigmoid_response_derivs(x: f64) -> (f64, f64) {
+    let s = 1.0 / (1.0 + (-x).exp());
+    let clamped = s + EPSILON;
+    if clamped < SIGMOID_CLAMP_MIN || clamped > SIGMOID_CLAMP_MAX {
+        (0.0, 0.0)
+    } else {
+        let d = s * (1.0 - s);
+        (d, d * (1.0 - 2.0 * s))
+    }
 }
 
 // ============================================================================
@@ -342,11 +351,7 @@ impl ResponseFn {
                 // d/dx squareplus(x) = 0.5 * (1 + x / sqrt(x^2 + 4))
                 0.5 * (1.0 + x / (x * x + 4.0).sqrt())
             }
-            ResponseFn::Sigmoid => {
-                // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
-                let s = 1.0 / (1.0 + (-x).exp());
-                s * (1.0 - s)
-            }
+            ResponseFn::Sigmoid => sigmoid_response_derivs(x).0,
             ResponseFn::Relu | ResponseFn::ReluDf => {
                 if x > 0.0 {
                     1.0
@@ -374,11 +379,7 @@ impl ResponseFn {
                 let denom = (x * x + 4.0).powf(1.5);
                 2.0 / denom
             }
-            ResponseFn::Sigmoid => {
-                // d²/dx² sigmoid(x) = sigmoid(x)*(1-sigmoid(x))*(1-2*sigmoid(x))
-                let s = 1.0 / (1.0 + (-x).exp());
-                s * (1.0 - s) * (1.0 - 2.0 * s)
-            }
+            ResponseFn::Sigmoid => sigmoid_response_derivs(x).1,
             ResponseFn::Relu | ResponseFn::ReluDf => 0.0,
         }
     }
@@ -393,10 +394,7 @@ impl ResponseFn {
             ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
                 x.mapv(|v| 0.5 * (1.0 + v / (v * v + 4.0).sqrt()))
             }
-            ResponseFn::Sigmoid => x.mapv(|v| {
-                let s = 1.0 / (1.0 + (-v).exp());
-                s * (1.0 - s)
-            }),
+            ResponseFn::Sigmoid => x.mapv(|v| sigmoid_response_derivs(v).0),
             ResponseFn::Relu | ResponseFn::ReluDf => x.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 }),
         }
     }
@@ -413,10 +411,7 @@ impl ResponseFn {
             ResponseFn::Squareplus | ResponseFn::SquareplusDf => {
                 x.mapv(|v| 2.0 / (v * v + 4.0).powf(1.5))
             }
-            ResponseFn::Sigmoid => x.mapv(|v| {
-                let s = 1.0 / (1.0 + (-v).exp());
-                s * (1.0 - s) * (1.0 - 2.0 * s)
-            }),
+            ResponseFn::Sigmoid => x.mapv(|v| sigmoid_response_derivs(v).1),
             ResponseFn::Relu | ResponseFn::ReluDf => Array1::zeros(x.len()),
         }
     }
@@ -469,10 +464,9 @@ impl ResponseFn {
                 let mut d1 = Array1::zeros(n);
                 let mut d2 = Array1::zeros(n);
                 for ((o1, o2), &v) in d1.iter_mut().zip(d2.iter_mut()).zip(x.iter()) {
-                    let s = 1.0 / (1.0 + (-v).exp());
-                    let d = s * (1.0 - s);
-                    *o1 = d;
-                    *o2 = d * (1.0 - 2.0 * s);
+                    let (first, second) = sigmoid_response_derivs(v);
+                    *o1 = first;
+                    *o2 = second;
                 }
                 (d1, d2)
             }

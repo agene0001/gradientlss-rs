@@ -136,6 +136,13 @@ impl Distribution for ZABeta {
         self.initialize
     }
 
+    /// Sampling uses a discrete zero-gate and Beta rejection sampling, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         if target.len() != 1 {
             return f64::NEG_INFINITY;
@@ -152,7 +159,7 @@ impl Distribution for ZABeta {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(arr) => {
-                crate::distributions::util::par_sum(params.nrows(), |i| {
+                crate::distributions::util::par_nansum(params.nrows(), |i| {
                     let row_vec: Vec<f64> = params.row(i).to_vec();
                     -self.log_prob(&row_vec, &[arr[i]])
                 })

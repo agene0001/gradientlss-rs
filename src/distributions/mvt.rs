@@ -229,6 +229,13 @@ impl Distribution for MVT {
         self.initialize
     }
 
+    /// Sampling uses a chi-square/Gamma rejection draw for the df, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         if target.len() != self.n_targets {
             return f64::NEG_INFINITY;
@@ -260,7 +267,10 @@ impl Distribution for MVT {
                             self.log_prob(&rp, &tr)
                         }
                     };
-                    total_nll -= log_prob;
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !log_prob.is_nan() {
+                        total_nll -= log_prob;
+                    }
                 }
 
                 total_nll

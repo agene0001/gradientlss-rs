@@ -22,13 +22,13 @@ mod negative_binomial;
 mod poisson;
 pub mod spline_flow;
 mod student_t;
+pub(crate) mod util;
 mod weibull;
 mod zabeta;
 mod zagamma;
 mod zaln;
 mod zinb;
 mod zipoisson;
-pub(crate) mod util;
 
 pub use base::{Distribution, DistributionParam, GradientsAndHessians, LossFn, Stabilization};
 pub use beta::Beta;

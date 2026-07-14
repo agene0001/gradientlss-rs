@@ -98,6 +98,13 @@ impl Distribution for Gamma {
         self.initialize
     }
 
+    /// Sampling uses rejection sampling (Marsaglia–Tsang), which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -109,7 +116,7 @@ impl Distribution for Gamma {
                 // NLL_i = -shape*ln(rate) - (shape-1)*ln(y) + rate*y + ln_gamma(shape)
                 let conc_col = params.column(0);
                 let rate_col = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     let y_val = y[i];
                     if y_val < 0.0 {
                         f64::INFINITY
@@ -165,8 +172,10 @@ impl Distribution for Gamma {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_conc, rsd_conc) = conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
-            let (rd_rate, rsd_rate) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
+            let (rd_conc, rsd_conc) =
+                conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
+            let (rd_rate, rsd_rate) =
+                rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let alpha = t_conc[i].max(1e-6);

@@ -111,7 +111,7 @@ impl Distribution for Weibull {
             ResponseData::Univariate(y) => {
                 let scale_col = params.column(0);
                 let conc_col = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     let y_val = y[i];
                     if y_val < 0.0 {
                         f64::INFINITY
@@ -165,8 +165,10 @@ impl Distribution for Weibull {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_s, rsd_s) = scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
-            let (rd_k, rsd_k) = conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
+            let (rd_s, rsd_s) =
+                scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
+            let (rd_k, rsd_k) =
+                conc_response_fn.derivative_batches_from_transformed(&p_conc, &t_conc);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let lambda = t_scale[i].max(1e-6);

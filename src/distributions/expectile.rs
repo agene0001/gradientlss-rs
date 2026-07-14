@@ -183,7 +183,7 @@ impl Distribution for Expectile {
                     0.0
                 };
 
-                crate::distributions::util::par_sum(n_samples, |i| {
+                crate::distributions::util::par_nansum(n_samples, |i| {
                     let row_params: Vec<f64> = params.row(i).to_vec();
                     let transformed = self.transform_dist_params(&row_params);
                     self.expectile_loss(&transformed, arr[i], penalty)

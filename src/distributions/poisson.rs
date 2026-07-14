@@ -54,7 +54,8 @@ impl Poisson {
             return f64::NEG_INFINITY;
         }
         // ln_pmf = -λ + k*ln(λ) - ln(k!) = -λ + k*ln(λ) - ln_gamma(k+1)
-        -rate + k * rate.ln() - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
+        -rate + k * rate.ln()
+            - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
     }
 }
 
@@ -87,6 +88,13 @@ impl Distribution for Poisson {
         self.initialize
     }
 
+    /// Sampling uses a discrete draw, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -95,7 +103,7 @@ impl Distribution for Poisson {
         match target {
             ResponseData::Univariate(y) => {
                 let rate_col = params.column(0);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[rate_col[i]], y[i])
                 })
             }

@@ -150,6 +150,13 @@ impl Distribution for Dirichlet {
         self.initialize
     }
 
+    /// Sampling uses rejection sampling (built on Gamma draws), which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         if target.len() != self.n_targets {
             return f64::NEG_INFINITY;
@@ -173,7 +180,10 @@ impl Distribution for Dirichlet {
                     let target_row: Vec<f64> = arr.row(i).to_vec();
 
                     let log_prob = self.log_prob(&row_params, &target_row);
-                    total_nll -= log_prob;
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !log_prob.is_nan() {
+                        total_nll -= log_prob;
+                    }
                 }
 
                 total_nll

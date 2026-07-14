@@ -51,7 +51,8 @@ impl ZIPoisson {
 
     /// Poisson ln_pmf inlined: -λ + k*ln(λ) - ln_gamma(k+1)
     fn poisson_ln_pmf(rate: f64, k: f64) -> f64 {
-        -rate + k * rate.ln() - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
+        -rate + k * rate.ln()
+            - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
     }
 
     /// Helper method for scalar log probability (inlined formula)
@@ -113,6 +114,13 @@ impl Distribution for ZIPoisson {
         self.initialize
     }
 
+    /// Sampling uses a discrete zero-inflation gate and Poisson draw, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -122,7 +130,7 @@ impl Distribution for ZIPoisson {
             ResponseData::Univariate(y) => {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[col0[i], col1[i]], y[i])
                 })
             }
@@ -341,11 +349,7 @@ mod tests {
 
         for i in 0..targets.len() {
             for j in 0..2 {
-                assert_relative_eq!(
-                    analytical.0[[i, j]],
-                    numerical.0[[i, j]],
-                    epsilon = 1e-3
-                );
+                assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-3);
                 // True (unfloored) Hessians: both paths must agree on value AND sign.
                 assert_relative_eq!(
                     analytical.1[[i, j]],

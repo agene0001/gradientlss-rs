@@ -747,8 +747,8 @@ impl LrsBin {
         let wb = (d_k / d_k1).sqrt() * wa;
         let wc = (lambda * wa * d_k + (1.0 - lambda) * wb * d_k1) / s;
         let y_k1 = y_k + h;
-        let yc = ((1.0 - lambda) * wa * y_k + lambda * wb * y_k1)
-            / ((1.0 - lambda) * wa + lambda * wb);
+        let yc =
+            ((1.0 - lambda) * wa * y_k + lambda * wb * y_k1) / ((1.0 - lambda) * wa + lambda * wb);
         Self {
             w,
             y_k,
@@ -768,8 +768,8 @@ impl LrsBin {
             let den = self.wa * (self.lambda - theta) + self.wc * theta;
             num / den
         } else {
-            let num = self.wc * self.yc * (1.0 - theta)
-                + self.wb * self.y_k1 * (theta - self.lambda);
+            let num =
+                self.wc * self.yc * (1.0 - theta) + self.wb * self.y_k1 * (theta - self.lambda);
             let den = self.wc * (1.0 - theta) + self.wb * (theta - self.lambda);
             num / den
         }
@@ -867,7 +867,7 @@ impl Distribution for SplineFlow {
                             &params_buf[..n_params]
                         }
                     };
-                    total -= self.log_prob_flow_with_buffers(
+                    let lp = self.log_prob_flow_with_buffers(
                         p,
                         y_val,
                         &mut widths_buf,
@@ -875,6 +875,10 @@ impl Distribution for SplineFlow {
                         &mut derivatives_buf,
                         &mut lambdas_buf,
                     );
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !lp.is_nan() {
+                        total -= lp;
+                    }
                 }
                 total
             }
@@ -1391,9 +1395,9 @@ mod tests {
 
             // log_det must equal -ln(dy/dx) of the actual forward map
             let h = 1e-6;
-            let dy_dx_fd =
-                (dist.forward_transform(x + h, &params) - dist.forward_transform(x - h, &params))
-                    / (2.0 * h);
+            let dy_dx_fd = (dist.forward_transform(x + h, &params)
+                - dist.forward_transform(x - h, &params))
+                / (2.0 * h);
             assert!(
                 ((-dy_dx_fd.ln()) - log_det).abs() < 1e-4,
                 "log_det mismatch at y={}: analytic={}, fd={}",
@@ -1432,9 +1436,9 @@ mod tests {
             );
 
             let h = 1e-6;
-            let dy_dx_fd =
-                (dist.forward_transform(x + h, &params) - dist.forward_transform(x - h, &params))
-                    / (2.0 * h);
+            let dy_dx_fd = (dist.forward_transform(x + h, &params)
+                - dist.forward_transform(x - h, &params))
+                / (2.0 * h);
             assert!(
                 ((-dy_dx_fd.ln()) - log_det).abs() < 1e-4,
                 "log_det mismatch at y={}: analytic={}, fd={}",
