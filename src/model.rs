@@ -168,26 +168,6 @@ impl<B: Backend> GradientLSS<B> {
         Ok(())
     }
 
-    fn set_init_score(&self, dataset: &mut B::Dataset) -> Result<()> {
-        if let Some(ref start_vals) = self.start_values {
-            let n_samples = dataset.num_rows();
-            let n_params = self.n_params();
-            // Row-major (sample-major) layout: [s0_p0, s0_p1, ..., s1_p0, ...],
-            // matching what the backends' `set_init_score` / `set_base_margin`
-            // expect for multi-output. (The XGBoost training path overwrites this
-            // and LightGBM's setter is a no-op, so this is currently inert — but
-            // the column-major layout it previously built would be a latent bug.)
-            let mut init_score = Array1::zeros(n_samples * n_params);
-            for i in 0..n_samples {
-                for j in 0..n_params {
-                    init_score[i * n_params + j] = start_vals[j];
-                }
-            }
-            dataset.set_init_score(&init_score)?;
-        }
-        Ok(())
-    }
-
     /// Compute the NLL of already-transformed parameters against `labels`,
     /// handling the univariate/multivariate reshape. Shared by the metric closure
     /// (both the cache-hit and recompute paths).
@@ -412,11 +392,26 @@ impl<B: Backend> GradientLSS<B> {
         config: TrainConfig,
         callbacks: Option<&mut C>,
     ) -> Result<((), TrainingResult)> {
+        // CRPS gradients are finite differences through `sample` with a fixed
+        // seed — only meaningful when the sampler is smooth in its parameters
+        // (torch rsample analogue). Rejection/discrete samplers would turn each
+        // accept/reject flip into a 1/(2ε)-amplified garbage gradient, so fail
+        // fast instead (Python fails the same way: no rsample → error).
+        if self.dist.loss_fn() == LossFn::Crps && !self.dist.has_reparameterizable_sampler() {
+            return Err(GradientLSSError::InvalidParameter(format!(
+                "LossFn::Crps is not supported for {}: its sampler uses rejection sampling or \
+                 discrete draws, which are not differentiable (torch has no rsample for it \
+                 either). Use LossFn::Nll instead.",
+                self.dist.name()
+            )));
+        }
+
         let labels = train_data.get_labels()?;
         // A preset (see `preset_start_values`) is consumed by exactly this one
         // train call; the caller vouches that the preset values were computed
         // on these labels.
-        let use_preset = std::mem::take(&mut self.start_values_preset) && self.start_values.is_some();
+        let use_preset =
+            std::mem::take(&mut self.start_values_preset) && self.start_values.is_some();
         if !use_preset {
             if self.dist.is_univariate() {
                 let target = ResponseData::Univariate(&labels.view());
@@ -433,7 +428,9 @@ impl<B: Backend> GradientLSS<B> {
             }
         }
 
-        self.set_init_score(train_data)?;
+        // Start values are handed to the backend below, which sets them as the
+        // base margin (XGBoost) or seeds the accumulated margins (LightGBM) on
+        // both the train and validation sets — no separate init-score pass.
 
         // Shared per-run transform cache — see `TransformCache`.
         let transform_cache: TransformCache = Arc::new(Mutex::new(Vec::with_capacity(2)));
@@ -490,13 +487,13 @@ impl<B: Backend> GradientLSS<B> {
             let mut model = GradientLSS::<B>::new(self.dist.clone());
             model.train(&mut train_data, None, params.clone(), config.clone())?;
 
-            // Score on the predicted *parameters*, which add the model's start
-            // values (base margin) before transforming — `predict_raw` omits them,
-            // so scoring its output transforms the wrong point. Mirrors hyper_opt.
-            let preds = match model.predict(&test_features, PredType::Parameters, 0, &[], 0)? {
-                PredictionOutput::Parameters(p) => p,
-                _ => unreachable!("PredType::Parameters yields Parameters"),
-            };
+            // Score on the INTERNAL transformed parameters, which add the
+            // model's start values (base margin) before transforming —
+            // `predict_raw` omits them, so scoring its output transforms the
+            // wrong point; and the user-facing `predict(Parameters)` output is
+            // finalized (Mixture: softmaxed), which `nll` must not receive.
+            // Mirrors hyper_opt.
+            let preds = model.predict_transformed(&test_features)?;
             let target = ResponseData::Univariate(&test_labels);
             let score = self.dist.nll(&preds.view(), &target);
             scores.push(score);
@@ -610,11 +607,9 @@ impl<B: Backend> GradientLSS<B> {
             let mut model = GradientLSS::<B>::new(self.dist.clone());
             model.train(&mut train_data, None, params.clone(), config.clone())?;
 
-            // Score on predicted parameters (start values added) — see `cv`.
-            let preds = match model.predict(&test_features.view(), PredType::Parameters, 0, &[], 0)? {
-                PredictionOutput::Parameters(p) => p,
-                _ => unreachable!("PredType::Parameters yields Parameters"),
-            };
+            // Score on the internal transformed parameters (start values
+            // added, no user-facing finalize) — see `cv`.
+            let preds = model.predict_transformed(&test_features.view())?;
             let test_labels_view = test_labels.view();
             let target = ResponseData::Univariate(&test_labels_view);
             let score = self.dist.nll(&preds.view(), &target);
@@ -638,14 +633,14 @@ impl<B: Backend> GradientLSS<B> {
             .map_err(|e| GradientLSSError::HyperOptError(e.to_string()))
     }
 
-    pub fn predict(
-        &self,
-        features: &ArrayView2<f64>,
-        pred_type: PredType,
-        n_samples: usize,
-        quantiles: &[f64],
-        seed: u64,
-    ) -> Result<PredictionOutput> {
+    /// Predict the INTERNAL transformed parameters: raw margin + start values,
+    /// run through the per-parameter response functions — the representation
+    /// `nll`/`log_prob`/`sample` consume. For most distributions this equals
+    /// the user-facing `predict(Parameters)` output; for Mixture the user-facing
+    /// form additionally softmaxes the mixing logits (see
+    /// `Distribution::finalize_predicted_params`), which must NOT be fed back
+    /// into `nll`. CV/hyper-opt scoring therefore uses this method.
+    pub(crate) fn predict_transformed(&self, features: &ArrayView2<f64>) -> Result<Array2<f64>> {
         let model = self
             .model
             .as_ref()
@@ -662,10 +657,23 @@ impl<B: Backend> GradientLSS<B> {
             }
         }
 
-        let params = self.dist.transform_params(&predictions.view());
+        Ok(self.dist.transform_params(&predictions.view()))
+    }
+
+    pub fn predict(
+        &self,
+        features: &ArrayView2<f64>,
+        pred_type: PredType,
+        n_samples: usize,
+        quantiles: &[f64],
+        seed: u64,
+    ) -> Result<PredictionOutput> {
+        let params = self.predict_transformed(features)?;
 
         match pred_type {
-            PredType::Parameters => Ok(PredictionOutput::Parameters(params)),
+            PredType::Parameters => Ok(PredictionOutput::Parameters(
+                self.dist.finalize_predicted_params(params),
+            )),
 
             PredType::Samples => {
                 let samples = self.dist.sample(&params.view(), n_samples, seed);
@@ -710,11 +718,16 @@ impl<B: Backend> GradientLSS<B> {
             PredType::Expectiles => {
                 // For Expectile distribution, the parameters ARE the expectiles.
                 // For other distributions, this returns the same as Parameters.
-                Ok(PredictionOutput::Expectiles(params))
+                Ok(PredictionOutput::Expectiles(
+                    self.dist.finalize_predicted_params(params),
+                ))
             }
 
             PredType::Distribution => {
-                // Return full distribution info for PDF/CDF evaluation
+                // Return full distribution info for PDF/CDF evaluation.
+                // NOTE: these are the INTERNAL transformed parameters (what
+                // `log_prob`/`sample` consume for PDF/CDF evaluation), so no
+                // finalize here — Mixture's block keeps raw mixing logits.
                 let dist_info = crate::backend::DistributionInfo {
                     dist_name: self.dist.name().to_string(),
                     params,
