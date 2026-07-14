@@ -148,6 +148,89 @@ let config = HyperOptConfig {
 
 (The single 80/20 holdout, `n_folds <= 1`, is likewise never shuffled.)
 
+### LightGBM: user-set parameters now actually apply (results change)
+
+`LightGBMParams::set` previously *appended* to LightGBM's parameter list, and
+LightGBM keeps the **first** occurrence of a duplicated key — so any override of
+a default (`learning_rate`, `num_leaves`, `boosting`, `objective`, `verbose`,
+plus `num_class` on repeated `set_n_dist_params`) was silently ignored, with the
+warning suppressed by `verbose=-1`. This included **every hyper_opt-tuned
+value**: LightGBM trials all trained with `learning_rate=0.1, num_leaves=31`
+regardless of what the optimizer sampled. `set` now replaces in place.
+
+- **Effect:** LightGBM models trained with non-default params (directly or via
+  `hyper_opt`) will differ — they now honor your configuration. Re-evaluate any
+  previously tuned "best" LightGBM hyperparameters: the scores they were
+  selected by did not measure them.
+- Relatedly, the binned `Dataset` is now constructed with the full training
+  params (as `lgb.train` does in Python), so dataset-level params like
+  `max_bin`, `min_data_in_leaf` (feature pre-filtering), and `zero_as_missing`
+  take effect instead of being pinned to defaults.
+- The `[low, high]` hyper_opt shorthand with **integer bounds** (e.g.
+  `num_leaves: [2, 64]`) now samples integers (optuna `suggest_int` semantics);
+  LightGBM rejects float-valued integer params, which the override fix exposed.
+
+### XGBoost: `objective` and `base_score` are now forced (matching Python)
+
+Python XGBoostLSS's `set_params_adj` unconditionally overwrites
+`objective=None`, `base_score=0`, and `disable_default_eval_metric=True`; the
+Rust backend now does the same at train time. A user-carried `objective` (e.g.
+`"count:poisson"`) used to silently corrupt training — every internal predict
+returned link-transformed values while boosting stayed on margin scale — and a
+nonzero `base_score` shifted all predictions. If you were setting either, remove
+them; the distribution's response functions are the link.
+
+`TrainConfig::seed` is now wired into both backends (previously silently
+ignored). Runs using `subsample`/`colsample_*`/`bagging_fraction` may differ; an
+explicit `seed` set via backend params still wins.
+
+### Mixture distribution fixes (predictions change)
+
+- `predict(PredType::Samples | Quantiles)` drew mixture components with the
+  wrong probabilities: a second Gumbel perturbation plus temperature softmax was
+  layered on top of the already-softmaxed mixing weights, biasing selection
+  toward uniform (weights 0.9/0.1 sampled at roughly 0.82/0.18). Components are
+  now drawn as an exact categorical, matching `MixtureSameFamily.sample()`.
+- `predict(PredType::Parameters)` now returns mixing **probabilities** (summing
+  to 1) for the `mix_prob_*` columns, matching Python's `predict_dist`.
+  Previously it returned raw unbounded logits.
+
+### NLL metric now skips NaN terms (`torch.nansum` parity)
+
+The evaluation metric aggregates per-sample log-probs with NaN treated as 0,
+matching Python's `-torch.nansum(log_prob)`. Previously one NaN log-prob (e.g. a
+0·inf at a support boundary) made the metric NaN for the rest of training, which
+froze `best_iteration` and burned out the early-stopping patience where Python
+trains on.
+
+### CRPS loss now errors for non-reparameterizable distributions
+
+`LossFn::Crps` computes gradients by finite differences through fixed-seed
+sampling, which is only meaningful when the sampler is smooth in its parameters
+(the `rsample` analogue). Training now fails fast with a clear error for
+distributions whose samplers use rejection sampling or discrete draws (Gamma,
+Beta, Dirichlet, StudentT, Poisson, NegativeBinomial, the ZI/ZA families, MVT,
+Mixture) instead of silently producing garbage gradients. Torch errors the same
+way — these have no `rsample`. Loc-scale and inverse-CDF families (Gaussian,
+LogNormal, Logistic, Gumbel, Laplace, Cauchy, Weibull, Expectile, MVN, MVNLoRa,
+SplineFlow) still support CRPS.
+
+### Smaller behavioral fixes
+
+- XGBoost `feature_importance` now honors the requested type: `Gain`/`Cover`
+  are parsed from the model dump (per-split averages, matching
+  `get_score`); previously every type silently returned split counts.
+- XGBoost saved models append `n_features` (trailing, optional — old files
+  still load, reporting 0); `GradientLSS::num_features()` now returns the real
+  count instead of a stub 0.
+- A `CallbackAction::Stop` on a new-minimum round no longer excludes that round
+  from `best_iteration`.
+- `num_boost_round: 0` now reports `n_iterations: 0` instead of 1.
+- Sigmoid response derivatives are 0 in the clamp region (|x| ≳ 6.9), matching
+  torch autograd through `torch.clamp` and this crate's own numerical path.
+- Softplus keeps its tail below x = −20 (`exp(x) + ε`) instead of flooring to ε,
+  matching torch.
+
 ## Usage
 
 ### Basic Example
