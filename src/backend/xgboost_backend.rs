@@ -40,29 +40,34 @@ fn objective_trampoline(_preds: &[f32], _dtrain: &DMatrix) -> (Vec<f32>, Vec<f32
 #[derive(Debug, Clone)]
 pub struct XGBoostBackend;
 
+/// Render a `ParamValue` the way XGBoost's string config expects it.
+fn param_value_to_string(value: &ParamValue) -> String {
+    match value {
+        ParamValue::Int(v) => v.to_string(),
+        ParamValue::Float(v) => v.to_string(),
+        ParamValue::String(v) => v.clone(),
+        ParamValue::Bool(v) => v.to_string(),
+    }
+}
+
 /// XGBoost-specific parameters.
 #[derive(Debug, Clone)]
 pub struct XGBoostParams {
-    inner: HashMap<String, String>,
+    inner: HashMap<String, ParamValue>,
     n_dist_params: usize,
 }
 
 impl Default for XGBoostParams {
     fn default() -> Self {
         let mut inner = HashMap::new();
-        inner.insert("booster".to_string(), "gbtree".to_string());
+        inner.insert("booster".to_string(), ParamValue::from("gbtree"));
         // Histogram split-finding — the same algorithm LightGBM uses. Without
         // this, XGBoost defaults to `auto` (exact/approx greedy), which is ~10x
         // slower here (esp. for the 2-parameter NegativeBinomial). This is the
         // single biggest training-speed lever for the XGBoost backend.
-        inner.insert("tree_method".to_string(), "hist".to_string());
-        inner.insert("eta".to_string(), "0.1".to_string());
-        inner.insert("max_depth".to_string(), "6".to_string());
-        inner.insert("base_score".to_string(), "0.0".to_string());
-        inner.insert(
-            "disable_default_eval_metric".to_string(),
-            "true".to_string(),
-        );
+        inner.insert("tree_method".to_string(), ParamValue::from("hist"));
+        inner.insert("eta".to_string(), ParamValue::Float(0.1));
+        inner.insert("max_depth".to_string(), ParamValue::Int(6));
         Self {
             inner,
             n_dist_params: 1,
@@ -72,31 +77,25 @@ impl Default for XGBoostParams {
 
 impl BackendParams for XGBoostParams {
     fn set(&mut self, key: &str, value: ParamValue) {
-        let str_value = match value {
-            ParamValue::Int(v) => v.to_string(),
-            ParamValue::Float(v) => v.to_string(),
-            ParamValue::String(v) => v,
-            ParamValue::Bool(v) => v.to_string(),
-        };
-        self.inner.insert(key.to_string(), str_value);
+        self.inner.insert(key.to_string(), value);
     }
 
-    fn get(&self, _key: &str) -> Option<&ParamValue> {
-        None
+    fn get(&self, key: &str) -> Option<&ParamValue> {
+        self.inner.get(key)
     }
 
     fn to_map(&self) -> HashMap<String, ParamValue> {
-        self.inner
-            .iter()
-            .map(|(k, v)| (k.clone(), ParamValue::String(v.clone())))
-            .collect()
+        self.inner.clone()
     }
 }
 
 impl XGBoostParams {
-    /// Get the inner HashMap for xgboost-rs.
+    /// Get the params as the string map xgboost-rs consumes.
     pub fn to_xgb_params(&self) -> HashMap<String, String> {
-        self.inner.clone()
+        self.inner
+            .iter()
+            .map(|(k, v)| (k.clone(), param_value_to_string(v)))
+            .collect()
     }
 
     /// Set the number of distribution parameters.
@@ -184,9 +183,9 @@ impl BackendDataset for XGBoostDataset {
             )));
         }
         let weights_f32: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
-        self.dmatrix.set_weights(&weights_f32).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
-        })?;
+        self.dmatrix
+            .set_weights(&weights_f32)
+            .map_err(|e| GradientLSSError::BackendError(format!("Failed to set weights: {}", e)))?;
         // Keep a copy: XGBoost ignores DMatrix weights for custom objectives, so
         // the training loop reads these back and weights grad/hess itself.
         self.weights = Some(weights.to_owned());
@@ -236,6 +235,9 @@ impl XGBoostDataset {
 pub struct XGBoostModel {
     booster: Booster,
     n_params: usize,
+    /// Number of features the model was trained on. 0 when unknown (models
+    /// saved before this field existed — see `load_from_reader`).
+    n_features: usize,
     /// 0-based index of the best boosting iteration selected by early stopping.
     /// `Some(b)` means predictions must use trees for iterations `[0, b]`
     /// (i.e. `b + 1` iterations), truncating the overfit tail that early
@@ -379,7 +381,25 @@ impl BackendModel for XGBoostModel {
         // (XGBoost-specific: the LightGBM backend has no such cache, which is why
         // it accumulates per-iteration margins instead.)
         let mut xgb_params = params.to_xgb_params();
+        // Forced params, matching Python's `set_params_adj` which unconditionally
+        // overwrites the user dict. These are correctness requirements, not
+        // defaults: a user-carried `objective` (e.g. "count:poisson") makes every
+        // predict return link-transformed values while boosting stays on margin
+        // scale — silently corrupting gradients and predictions — and a nonzero
+        // `base_score` is inert during training (base_margin overrides it) but
+        // added by predict, shifting all outputs under the start values.
+        xgb_params.remove("objective");
+        xgb_params.insert("base_score".to_string(), "0.0".to_string());
+        xgb_params.insert(
+            "disable_default_eval_metric".to_string(),
+            "true".to_string(),
+        );
         xgb_params.insert("num_target".to_string(), n_params.to_string());
+        // Wire TrainConfig::seed (subsample/colsample draws); an explicit
+        // user-set "seed" param still wins.
+        xgb_params
+            .entry("seed".to_string())
+            .or_insert_with(|| config.seed.to_string());
 
         let cached_dmats: Vec<&DMatrix> = match &valid_dmat {
             Some(vdm) => vec![&train_data.dmatrix, vdm],
@@ -507,20 +527,10 @@ impl BackendModel for XGBoostModel {
                 // `need_train_metric` is true when verbose, so this is Some.
                 let tl = train_loss.unwrap_or(f64::NAN);
                 match valid_loss {
-                    Some(vl) => println!(
-                        "[{}] train_loss: {:.6}, valid_loss: {:.6}",
-                        round, tl, vl
-                    ),
+                    Some(vl) => {
+                        println!("[{}] train_loss: {:.6}, valid_loss: {:.6}", round, tl, vl)
+                    }
                     None => println!("[{}] train_loss: {:.6}", round, tl),
-                }
-            }
-
-            if let Some(ref mut cb) = callbacks {
-                // `need_train_metric` is true when callbacks are present.
-                let tl = train_loss.unwrap_or(f64::NAN);
-                if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
-                    stopped_early = true;
-                    break;
                 }
             }
 
@@ -545,6 +555,18 @@ impl BackendModel for XGBoostModel {
                 rounds_without_improvement += 1;
             }
 
+            // Callbacks run AFTER the argmin/patience bookkeeping: a callback
+            // that stops on a new-minimum round must not exclude that round
+            // from best_iteration (its loss is already in the histories above).
+            if let Some(ref mut cb) = callbacks {
+                // `need_train_metric` is true when callbacks are present.
+                let tl = train_loss.unwrap_or(f64::NAN);
+                if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
+                    stopped_early = true;
+                    break;
+                }
+            }
+
             if let Some(early_stopping) = config.early_stopping_rounds {
                 if rounds_without_improvement >= early_stopping {
                     if config.verbose {
@@ -556,12 +578,20 @@ impl BackendModel for XGBoostModel {
             }
         }
 
+        // `final_round` stays 0 when the loop never ran (num_boost_round == 0),
+        // so `final_round + 1` would fabricate one completed iteration.
+        let n_iterations = if config.num_boost_round == 0 {
+            0
+        } else {
+            final_round + 1
+        };
+
         if let Some(ref mut cb) = callbacks {
-            cb.on_training_end(final_round + 1, stopped_early);
+            cb.on_training_end(n_iterations, stopped_early);
         }
 
         let result = TrainingResult {
-            n_iterations: final_round + 1,
+            n_iterations,
             best_iteration: Some(best_iteration),
             best_score: Some(best_loss),
             train_history,
@@ -574,17 +604,18 @@ impl BackendModel for XGBoostModel {
         // AND `early_stopping_rounds` configured. Otherwise the model was
         // trained to the full `num_boost_round` and predictions should use all
         // trees (None).
-        let effective_best_iteration = if valid_dmat.is_some() && config.early_stopping_rounds.is_some()
-        {
-            Some(best_iteration)
-        } else {
-            None
-        };
+        let effective_best_iteration =
+            if valid_dmat.is_some() && config.early_stopping_rounds.is_some() {
+                Some(best_iteration)
+            } else {
+                None
+            };
 
         Ok((
             Self {
                 booster,
                 n_params,
+                n_features: train_data.n_cols,
                 best_iteration: effective_best_iteration,
             },
             result,
@@ -614,8 +645,10 @@ impl BackendModel for XGBoostModel {
                     iteration_end: (best_iteration + 1) as i64,
                     strict_shape: false,
                 };
-                let (preds, _shape) =
-                    self.booster.predict_matrix(&dmatrix, &cfg.as_json()).map_err(|e| {
+                let (preds, _shape) = self
+                    .booster
+                    .predict_matrix(&dmatrix, &cfg.as_json())
+                    .map_err(|e| {
                         GradientLSSError::BackendError(format!("Prediction failed: {}", e))
                     })?;
                 preds
@@ -667,6 +700,13 @@ impl BackendModel for XGBoostModel {
             .write_all(&best_iter_sentinel.to_le_bytes())
             .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
+        // n_features, appended after best_iteration with the same trailing-
+        // optional convention (older readers stop before it; this reader falls
+        // back to 0 on EOF for models saved before the field existed).
+        writer
+            .write_all(&(self.n_features as u64).to_le_bytes())
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -711,9 +751,19 @@ impl BackendModel for XGBoostModel {
             Err(e) => return Err(GradientLSSError::IoError(e.to_string())),
         };
 
+        // Trailing n_features (same optional convention): 0 = unknown for
+        // models saved before the field existed.
+        let mut n_features_bytes = [0u8; 8];
+        let n_features = match reader.read_exact(&mut n_features_bytes) {
+            Ok(()) => u64::from_le_bytes(n_features_bytes) as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => return Err(GradientLSSError::IoError(e.to_string())),
+        };
+
         Ok(Self {
             booster,
             n_params,
+            n_features,
             best_iteration,
         })
     }
@@ -725,15 +775,26 @@ impl BackendModel for XGBoostModel {
     ) -> Result<FeatureImportance> {
         let n_params = self.n_params;
 
-        let mut importance: HashMap<String, f64> = HashMap::new();
+        // Per-feature (split count, total gain, total cover) from the
+        // with-stats model dump. Branch lines look like
+        //   0:[f2<3.5] yes=1,no=2,missing=1,gain=100.5,cover=58
+        // Python XGBoostLSS uses booster.get_score(importance_type="gain"),
+        // where "gain"/"cover" are per-split AVERAGES — matched below.
+        let mut importance: HashMap<String, (f64, f64, f64)> = HashMap::new();
 
-        // Parse feature importance from model dump
         if let Ok(model_dump) = self.booster.dump_model(true, None) {
             for line in model_dump.lines() {
                 if let Some(start) = line.find("[f") {
                     if let Some(end) = line[start..].find('<').or_else(|| line[start..].find(']')) {
                         let feature_name = &line[start + 1..start + end];
-                        *importance.entry(feature_name.to_string()).or_insert(0.0) += 1.0;
+                        let gain = parse_dump_stat(line, "gain=").unwrap_or(0.0);
+                        let cover = parse_dump_stat(line, "cover=").unwrap_or(0.0);
+                        let entry = importance
+                            .entry(feature_name.to_string())
+                            .or_insert((0.0, 0.0, 0.0));
+                        entry.0 += 1.0;
+                        entry.1 += gain;
+                        entry.2 += cover;
                     }
                 }
             }
@@ -757,7 +818,25 @@ impl BackendModel for XGBoostModel {
         // Replicate the scores for each param column to match the expected shape.
         let mut scores_vec = Vec::with_capacity(n_features * n_params);
         for feat in &all_features {
-            let score = importance.get(feat).copied().unwrap_or(0.0);
+            let (count, gain, cover) = importance.get(feat).copied().unwrap_or((0.0, 0.0, 0.0));
+            let score = match importance_type {
+                FeatureImportanceType::Split => count,
+                // Averages over splits, matching xgboost get_score semantics.
+                FeatureImportanceType::Gain => {
+                    if count > 0.0 {
+                        gain / count
+                    } else {
+                        0.0
+                    }
+                }
+                FeatureImportanceType::Cover => {
+                    if count > 0.0 {
+                        cover / count
+                    } else {
+                        0.0
+                    }
+                }
+            };
             for _ in 0..n_params {
                 scores_vec.push(score);
             }
@@ -788,12 +867,21 @@ impl BackendModel for XGBoostModel {
     }
 
     fn num_features(&self) -> usize {
-        0
+        self.n_features
     }
 
     fn num_params(&self) -> usize {
         self.n_params
     }
+}
+
+/// Parse a numeric `key=value` stat (e.g. `gain=`, `cover=`) out of a model
+/// dump branch line; the value runs to the next ',' or end of line.
+fn parse_dump_stat(line: &str, key: &str) -> Option<f64> {
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest.find(',').unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
 }
 
 impl Backend for XGBoostBackend {
@@ -965,7 +1053,9 @@ mod tests {
         // Simple deterministic LCG so the test is reproducible without rand deps.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f64) / (u32::MAX as f64)
         };
 
@@ -1032,8 +1122,8 @@ mod tests {
         params.set_n_dist_params(1);
         // Aggressive learning + deep trees + many rounds => overfits well before
         // num_boost_round, so early stopping fires with a best in the interior.
-        params.inner.insert("eta".to_string(), "0.3".to_string());
-        params.inner.insert("max_depth".to_string(), "8".to_string());
+        params.set("eta", ParamValue::Float(0.3));
+        params.set("max_depth", ParamValue::Int(8));
 
         let config = TrainConfig {
             num_boost_round: 80,
@@ -1043,7 +1133,11 @@ mod tests {
             collect_train_metrics: false,
         };
 
-        XGBoostModel::train_with_objective_and_callbacks::<_, _, super::super::traits::HistoryCallback>(
+        XGBoostModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
             &params,
             &mut train,
             Some(&mut valid),
