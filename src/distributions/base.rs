@@ -347,19 +347,18 @@ pub trait Distribution: Send + Sync {
         // Parallel threshold: for small sample counts, rayon overhead exceeds benefit.
         let use_parallel = n_samples >= 256;
 
-        // Per-sample computation closure. Each sample is independent.
-        // Returns (grad_row, hess_row) for sample i.
-        let compute_sample = |i: usize| -> (Vec<f64>, Vec<f64>) {
-            let mut grad_row = vec![0.0f64; n_params];
-            let mut hess_row = vec![0.0f64; n_params];
-
-            // Thread-local buffers (stack-allocated for small n_params)
-            let mut params_buf = vec![0.0f64; n_params];
-            let mut y_buf = vec![0.0f64; n_targets];
+        // Per-sample fill, writing straight into the output rows. Scratch is
+        // per-thread (`for_each_init`) rather than per-sample: the old shape —
+        // 4 fresh Vecs per sample plus a collected Vec of row pairs and a
+        // copy-out loop — allocated ~4·n_samples times per boosting round.
+        let fill = |scratch: &mut (Vec<f64>, Vec<f64>, Vec<f64>),
+                    i: usize,
+                    grad_row: &mut [f64],
+                    hess_row: &mut [f64]| {
+            let (params_buf, y_buf, crps_sort_buf) = scratch;
 
             // Copy transformed params for this sample
-            let row = transformed.row(i);
-            for (j, v) in row.iter().enumerate() {
+            for (j, v) in transformed.row(i).iter().enumerate() {
                 params_buf[j] = *v;
             }
 
@@ -369,18 +368,16 @@ pub trait Distribution: Send + Sync {
                     y_buf[0] = arr[i];
                 }
                 ResponseData::Multivariate(arr) => {
-                    let target_row = arr.row(i);
-                    for (j, &v) in target_row.iter().enumerate() {
+                    for (j, &v) in arr.row(i).iter().enumerate() {
                         y_buf[j] = v;
                     }
                 }
             }
-
-            let y_slice = &y_buf[..n_targets];
+            let y_buf = &y_buf[..n_targets];
 
             // For NLL path, compute base loss once per sample (shared across params)
             let loss_center = if !use_crps {
-                -self.log_prob(&params_buf, y_slice)
+                -self.log_prob(params_buf, y_buf)
             } else {
                 0.0
             };
@@ -406,18 +403,28 @@ pub trait Distribution: Send + Sync {
                     let n_crps_samples: usize = 30;
                     let seed: u64 = 123;
 
-                    let loss_plus =
-                        self.crps_single_observation(&params_buf, y_slice, n_crps_samples, seed);
+                    let loss_plus = self.crps_single_observation_buffered(
+                        params_buf,
+                        y_buf,
+                        n_crps_samples,
+                        seed,
+                        crps_sort_buf,
+                    );
                     params_buf[p] = param_minus;
-                    let loss_minus =
-                        self.crps_single_observation(&params_buf, y_slice, n_crps_samples, seed);
+                    let loss_minus = self.crps_single_observation_buffered(
+                        params_buf,
+                        y_buf,
+                        n_crps_samples,
+                        seed,
+                        crps_sort_buf,
+                    );
 
                     grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
                     hess_row[p] = 1.0;
                 } else {
-                    let loss_plus = -self.log_prob(&params_buf, y_slice);
+                    let loss_plus = -self.log_prob(params_buf, y_buf);
                     params_buf[p] = param_minus;
-                    let loss_minus = -self.log_prob(&params_buf, y_slice);
+                    let loss_minus = -self.log_prob(params_buf, y_buf);
 
                     grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
                     // True second difference, no positivity floor: PyTorch autograd
@@ -430,22 +437,39 @@ pub trait Distribution: Send + Sync {
                 // Restore original value
                 params_buf[p] = original;
             }
-
-            (grad_row, hess_row)
         };
 
-        // Compute gradients/hessians, using parallel iteration for large sample counts
-        let results: Vec<(Vec<f64>, Vec<f64>)> = if use_parallel {
-            (0..n_samples).into_par_iter().map(compute_sample).collect()
+        let make_scratch = || {
+            (
+                vec![0.0f64; n_params],
+                vec![0.0f64; n_targets],
+                Vec::<f64>::new(),
+            )
+        };
+
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+
+        if use_parallel {
+            g_slice
+                .par_chunks_mut(n_params)
+                .zip(h_slice.par_chunks_mut(n_params))
+                .enumerate()
+                .for_each_init(make_scratch, |scratch, (i, (gc, hc))| {
+                    fill(scratch, i, gc, hc)
+                });
         } else {
-            (0..n_samples).map(compute_sample).collect()
-        };
-
-        // Assemble results into output arrays
-        for (i, (grad_row, hess_row)) in results.into_iter().enumerate() {
-            for p in 0..n_params {
-                gradients[[i, p]] = grad_row[p];
-                hessians[[i, p]] = hess_row[p];
+            let mut scratch = make_scratch();
+            for (i, (gc, hc)) in g_slice
+                .chunks_mut(n_params)
+                .zip(h_slice.chunks_mut(n_params))
+                .enumerate()
+            {
+                fill(&mut scratch, i, gc, hc);
             }
         }
 
@@ -462,22 +486,41 @@ pub trait Distribution: Send + Sync {
         n_samples: usize,
         seed: u64,
     ) -> f64 {
-        // Create a 1-row params array for the sample method
-        let params_arr = Array2::from_shape_vec((1, params.len()), params.to_vec()).unwrap();
+        let mut sort_buf = Vec::new();
+        self.crps_single_observation_buffered(params, target, n_samples, seed, &mut sort_buf)
+    }
 
-        let samples = self.sample(&params_arr.view(), n_samples, seed);
+    /// Like [`Self::crps_single_observation`], but reuses a caller-owned sort
+    /// buffer. The numerical CRPS gradient calls this 2·n_params times per
+    /// observation per round — a fresh params array and sample Vec each time
+    /// were the dominant allocations on that path (the params view is now
+    /// borrowed from the slice, allocation-free).
+    fn crps_single_observation_buffered(
+        &self,
+        params: &[f64],
+        target: &[f64],
+        n_samples: usize,
+        seed: u64,
+        sort_buf: &mut Vec<f64>,
+    ) -> f64 {
+        // 1-row view straight over the params slice — no copy.
+        let params_view =
+            ArrayView2::from_shape((1, params.len()), params).expect("slice reshapes to one row");
+
+        let samples = self.sample(&params_view, n_samples, seed);
 
         // Compute empirical CRPS for the single observation
         let y = target[0];
-        let mut obs_samples: Vec<f64> = samples.column(0).to_vec();
-        obs_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sort_buf.clear();
+        sort_buf.extend(samples.column(0).iter().copied());
+        sort_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut crps = 0.0;
         let mut yhat_prev = 0.0;
         let mut yhat_cdf = 0.0;
         let mut y_cdf = 0.0;
 
-        for &yhat in &obs_samples {
+        for &yhat in sort_buf.iter() {
             let flag = y_cdf == 0.0 && y < yhat;
 
             if flag {
@@ -494,7 +537,7 @@ pub trait Distribution: Send + Sync {
 
         // Handle case where y > all samples
         if y_cdf == 0.0 {
-            crps += y - obs_samples.last().unwrap_or(&0.0);
+            crps += y - sort_buf.last().unwrap_or(&0.0);
         }
 
         crps

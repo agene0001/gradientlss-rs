@@ -8,6 +8,7 @@ use ndarray::{Array2, ArrayView2};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Mixture distribution for distributional regression.
@@ -99,14 +100,32 @@ impl Mixture {
         (mix_probs, locs, scales)
     }
 
-    /// Apply Gumbel-Softmax to logits for differentiable categorical sampling.
-    /// Matches Python's gumbel_softmax_fn which uses torch.manual_seed(123)
-    /// and torch.nn.functional.gumbel_softmax on every call, making the Gumbel
-    /// noise deterministic and reproducible.
-    fn gumbel_softmax_from_logits(logits: &[f64], temperature: f64) -> Vec<f64> {
-        // Python's gumbel_softmax_fn runs nan_to_num(predt) first (replacement
-        // = nanmean); mirror that per row so a NaN logit doesn't turn the whole
-        // probability vector — and every downstream log_prob — into NaN.
+    /// The fixed Gumbel(0,1) noise vector: g_i = -log(-log(u_i)) with u drawn
+    /// from ChaCha8(seed=123) — the deterministic analogue of Python's
+    /// `torch.manual_seed(123)` inside gumbel_softmax_fn. The noise depends
+    /// only on the component count, so hot paths draw it ONCE per pass instead
+    /// of reseeding an RNG per row (values are identical either way).
+    fn gumbel_noise(m: usize) -> Vec<f64> {
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        (0..m)
+            .map(|_| {
+                let u: f64 = rng.random();
+                -(-u.ln()).ln()
+            })
+            .collect()
+    }
+
+    /// Gumbel-softmax with precomputed noise, written into `out`
+    /// (allocation-free): softmax((sanitize(logits) + noise) / temperature).
+    /// NaN logits are replaced with the row's finite mean first — Python's
+    /// gumbel_softmax_fn runs nan_to_num(predt) (replacement = nanmean), and
+    /// without it one NaN logit poisons every downstream log_prob.
+    fn gumbel_softmax_with_noise_into(
+        logits: &[f64],
+        noise: &[f64],
+        temperature: f64,
+        out: &mut [f64],
+    ) {
         let (sum, count) = logits.iter().fold((0.0, 0usize), |(s, c), &v| {
             if v.is_finite() {
                 (s + v, c + 1)
@@ -116,20 +135,32 @@ impl Mixture {
         });
         let nan_replacement = if count == 0 { 0.0 } else { sum / count as f64 };
 
-        // Fixed seed matching Python's torch.manual_seed(123) in gumbel_softmax_fn
-        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        let mut max_val = f64::NEG_INFINITY;
+        for ((o, &x), &g) in out.iter_mut().zip(logits).zip(noise) {
+            let x = if x.is_finite() { x } else { nan_replacement };
+            let perturbed = x + g;
+            *o = perturbed;
+            max_val = max_val.max(perturbed);
+        }
+        let mut sum_exp = 0.0;
+        for o in out.iter_mut() {
+            *o = ((*o - max_val) / temperature).exp();
+            sum_exp += *o;
+        }
+        for o in out.iter_mut() {
+            *o /= sum_exp;
+        }
+    }
 
-        // Add Gumbel(0,1) noise to logits: g_i = -log(-log(u_i)) where u_i ~ Uniform(0,1)
-        let perturbed: Vec<f64> = logits
-            .iter()
-            .map(|&x| {
-                let x = if x.is_finite() { x } else { nan_replacement };
-                let u: f64 = rng.random();
-                x + (-(-u.ln()).ln())
-            })
-            .collect();
-
-        Self::softmax(&perturbed, temperature)
+    /// Apply Gumbel-Softmax to logits for differentiable categorical sampling.
+    /// Matches Python's gumbel_softmax_fn which uses torch.manual_seed(123)
+    /// and torch.nn.functional.gumbel_softmax on every call, making the Gumbel
+    /// noise deterministic and reproducible.
+    fn gumbel_softmax_from_logits(logits: &[f64], temperature: f64) -> Vec<f64> {
+        let noise = Self::gumbel_noise(logits.len());
+        let mut out = vec![0.0; logits.len()];
+        Self::gumbel_softmax_with_noise_into(logits, &noise, temperature, &mut out);
+        out
     }
 
     /// Apply softmax function with temperature.
@@ -235,6 +266,150 @@ impl Distribution for Mixture {
         self.log_prob_mixture(&mix_probs, &locs, &scales, target[0])
     }
 
+    /// Analytical gradients/Hessians of the NLL w.r.t. the RAW margins —
+    /// exactly what PyTorch autograd computes for Python's Mixture under the
+    /// default `hessian_mode="individual"` (diagonal second derivatives, no
+    /// positivity floor). Replaces the numerical central-difference fallback,
+    /// which cost 2·n_params `log_prob` evaluations (each allocating several
+    /// Vecs) per sample per boosting round.
+    ///
+    /// Derivation, per observation (fixed gumbel noise g, temperature τ):
+    ///   π = softmax((z + g)/τ),  φ_j = N(y; μ_j, σ_j),  S = Σ_j π_j φ_j,
+    ///   responsibilities w_j = π_j φ_j / S,  L = ln S,  NLL = −L, and with
+    ///   ζ_j = (y−μ_j)/σ_j,  A_j = (y−μ_j)/σ_j²,  B_j = (ζ_j²−1)/σ_j:
+    ///
+    ///   ∂L/∂μ_j  = w_j A_j          ∂²L/∂μ_j²  = w_j(1−w_j)A_j² − w_j/σ_j²
+    ///   ∂L/∂σ_j  = w_j B_j          ∂²L/∂σ_j²  = w_j(1−w_j)B_j² + w_j(1−3ζ_j²)/σ_j²
+    ///   ∂L/∂z_m  = (w_m − π_m)/τ    ∂²L/∂z_m²  = [w_m(1−w_m) − π_m(1−π_m)]/τ²
+    ///
+    /// Locs and logits use the identity response (no chain rule); scales chain
+    /// through σ = e^s + ε with σ' = σ'' = e^s:
+    ///   d(−L)/ds = −(∂L/∂σ)σ',  d²(−L)/ds² = −[(∂²L/∂σ²)σ'² + (∂L/∂σ)σ'].
+    ///
+    /// The softmax derivatives fall out of ∂π_j/∂z_m = π_j(δ_jm − π_m)/τ:
+    /// ∂S/∂z_m = S(w_m − π_m)/τ and ∂w_m/∂z_m = w_m(1−w_m)/τ.
+    fn analytical_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
+        if self.loss_fn != LossFn::Nll {
+            return None;
+        }
+        let y = match target {
+            ResponseData::Univariate(arr) => arr,
+            ResponseData::Multivariate(_) => return None,
+        };
+
+        let m = self.n_components;
+        let n_params = 3 * m;
+        let tau = self.temperature;
+        let n_samples = predictions.nrows();
+
+        // Fixed per-call gumbel noise (identical for every row — the accepted
+        // per-row-reuse deviation, same values the numerical path sees).
+        let noise = Self::gumbel_noise(m);
+
+        // dσ/ds = e^s, recovered from the transformed value without an exp
+        // (σ − ε); Mixture scales always use the Exp response.
+        let mut sigma_prime = Array2::zeros((n_samples, m));
+        for j in 0..m {
+            let (d1, _d2) = ResponseFn::Exp.derivative_batches_from_transformed(
+                &predictions.column(m + j),
+                &transformed.column(m + j),
+            );
+            sigma_prime.column_mut(j).assign(&d1);
+        }
+
+        let mut gradients = Array2::zeros((n_samples, n_params));
+        let mut hessians = Array2::zeros((n_samples, n_params));
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+
+        // Per-row fill. Scratch: (row copy, π buffer, log-weight buffer).
+        // A NaN target/margin propagates to NaN outputs, which stabilization
+        // replaces — identical to the numerical path's behavior.
+        let fill = |scratch: &mut (Vec<f64>, Vec<f64>, Vec<f64>),
+                    i: usize,
+                    gc: &mut [f64],
+                    hc: &mut [f64]| {
+            let (row_buf, pi, lw) = scratch;
+            for (k, &v) in transformed.row(i).iter().enumerate() {
+                row_buf[k] = v;
+            }
+            let yi = y[i];
+
+            Self::gumbel_softmax_with_noise_into(&row_buf[2 * m..3 * m], &noise, tau, pi);
+
+            // Responsibilities in log space: lw_j = ln π_j + ln φ_j, shifted
+            // by the max so w_j = exp(lw_j − a)/Σ never over/underflows.
+            for j in 0..m {
+                let sig = row_buf[m + j];
+                let zeta = (yi - row_buf[j]) / sig;
+                lw[j] = -0.5 * zeta * zeta - 0.5 * LOG_2PI - sig.ln() + pi[j].ln();
+            }
+            let a = lw.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v));
+            let mut sum_w = 0.0;
+            for v in lw.iter_mut() {
+                *v = (*v - a).exp();
+                sum_w += *v;
+            }
+
+            for j in 0..m {
+                let w = lw[j] / sum_w;
+                let sig = row_buf[m + j];
+                let sig_sq = sig * sig;
+                let diff = yi - row_buf[j];
+                let zeta = diff / sig;
+                let a_j = diff / sig_sq;
+                gc[j] = -w * a_j;
+                hc[j] = w / sig_sq - w * (1.0 - w) * a_j * a_j;
+
+                let b_j = (zeta * zeta - 1.0) / sig;
+                let sp = sigma_prime[[i, j]];
+                gc[m + j] = -w * b_j * sp;
+                hc[m + j] = -((w * (1.0 - w) * b_j * b_j + w * (1.0 - 3.0 * zeta * zeta) / sig_sq)
+                    * sp
+                    * sp
+                    + w * b_j * sp);
+
+                let p = pi[j];
+                gc[2 * m + j] = (p - w) / tau;
+                hc[2 * m + j] = (p * (1.0 - p) - w * (1.0 - w)) / (tau * tau);
+            }
+        };
+
+        let make_scratch = || (vec![0.0; n_params], vec![0.0; m], vec![0.0; m]);
+
+        // Threshold matches the other analytical paths (256).
+        const PAR_MIN: usize = 256;
+        if n_samples >= PAR_MIN {
+            g_slice
+                .par_chunks_mut(n_params)
+                .zip(h_slice.par_chunks_mut(n_params))
+                .enumerate()
+                .for_each_init(make_scratch, |scratch, (i, (gc, hc))| {
+                    fill(scratch, i, gc, hc)
+                });
+        } else {
+            let mut scratch = make_scratch();
+            for (i, (gc, hc)) in g_slice
+                .chunks_mut(n_params)
+                .zip(h_slice.chunks_mut(n_params))
+                .enumerate()
+            {
+                fill(&mut scratch, i, gc, hc);
+            }
+        }
+
+        Some((gradients, hessians))
+    }
+
     /// User-facing predicted parameters: apply the gumbel-softmax to the
     /// mixing-logit block, matching Python's `predict_dist` (whose `param_dict`
     /// response for `mix_prob` is `gumbel_softmax_fn`). Without this, users get
@@ -268,8 +443,18 @@ impl Distribution for Mixture {
             ResponseData::Univariate(arr) => {
                 let mut total_nll = 0.0;
                 let n_samples = params.nrows();
+                let m = self.n_components;
 
-                // Pre-allocate fallback buffer for non-contiguous rows
+                // Hoisted per-call state: the gumbel noise is fixed (seeded
+                // per call in Python; identical for every row here — the
+                // accepted per-row-reuse deviation), so draw it once instead
+                // of reseeding an RNG per row, and reuse one probability
+                // buffer instead of the 4 Vecs `transform_dist_params`
+                // allocated per row. This runs every boosting round on both
+                // the train and validation sets.
+                let noise = Self::gumbel_noise(m);
+                let mut probs_buf = vec![0.0f64; m];
+                // Fallback buffer for non-contiguous rows
                 let n_params = self.n_params();
                 let mut params_buf = vec![0.0f64; n_params];
 
@@ -284,9 +469,19 @@ impl Distribution for Mixture {
                             &params_buf[..n_params]
                         }
                     };
-                    let target_val = arr[i];
 
-                    let log_prob = self.log_prob(row_params, &[target_val]);
+                    Self::gumbel_softmax_with_noise_into(
+                        &row_params[2 * m..3 * m],
+                        &noise,
+                        self.temperature,
+                        &mut probs_buf,
+                    );
+                    let log_prob = self.log_prob_mixture(
+                        &probs_buf,
+                        &row_params[0..m],
+                        &row_params[m..2 * m],
+                        arr[i],
+                    );
                     // torch.nansum parity: a NaN log-prob contributes 0.
                     if !log_prob.is_nan() {
                         total_nll -= log_prob;
@@ -406,6 +601,63 @@ mod tests {
 
         let nll = dist.nll(&params.view(), &target_response);
         assert!(nll.is_finite());
+    }
+
+    /// The analytical gradients/Hessians must agree with the numerical
+    /// central-difference path (the autograd-equivalent reference) across
+    /// component counts and temperatures — this is the sweep that catches
+    /// Hessian-only bugs the grad-only tests miss.
+    #[test]
+    fn test_mixture_analytical_matches_numerical() {
+        for &(m, tau) in &[(2usize, 1.0f64), (3, 0.7), (4, 2.5)] {
+            let dist = Mixture::new(m, tau, Stabilization::None, LossFn::Nll, false);
+            let n_params = dist.n_params();
+            let n = 40usize;
+
+            // Deterministic raw margins in a moderate range and targets that
+            // straddle the component means.
+            let mut state: u64 = 0xfeed_beef ^ (m as u64) << 8;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f64) / (u32::MAX as f64)
+            };
+            let mut preds = Array2::zeros((n, n_params));
+            let mut y = ndarray::Array1::zeros(n);
+            for i in 0..n {
+                for j in 0..n_params {
+                    preds[[i, j]] = (next() - 0.5) * 3.0;
+                }
+                y[i] = (next() - 0.5) * 5.0;
+            }
+
+            let transformed = dist.transform_params(&preds.view());
+            let yv = y.view();
+            let target = ResponseData::Univariate(&yv);
+
+            let (ga, ha) = dist
+                .analytical_gradients(&preds.view(), &transformed.view(), &target)
+                .expect("analytical gradients available for NLL");
+            let (gn, hn) = dist
+                .numerical_gradients_hessians(&preds.view(), &transformed.view(), &target)
+                .unwrap();
+
+            for i in 0..n {
+                for j in 0..n_params {
+                    let (a, nref) = (ga[[i, j]], gn[[i, j]]);
+                    assert!(
+                        (a - nref).abs() <= 1e-6 + 1e-4 * nref.abs(),
+                        "grad mismatch m={m} tau={tau} [{i},{j}]: analytical={a}, numerical={nref}"
+                    );
+                    let (a, nref) = (ha[[i, j]], hn[[i, j]]);
+                    assert!(
+                        (a - nref).abs() <= 1e-4 + 1e-3 * nref.abs(),
+                        "hess mismatch m={m} tau={tau} [{i},{j}]: analytical={a}, numerical={nref}"
+                    );
+                }
+            }
+        }
     }
 
     /// Component selection must be an exact categorical draw from the mixing
