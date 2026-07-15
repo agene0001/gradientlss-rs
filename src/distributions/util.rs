@@ -46,3 +46,26 @@ where
         if v.is_nan() { 0.0 } else { v }
     })
 }
+
+/// Row threshold for parallelizing HEAVYWEIGHT per-row reductions — per-row
+/// matrix factorizations (multivariate log_probs) or spline evaluations.
+/// Much lower than [`PAR_THRESHOLD`]: each row does enough work to amortize
+/// rayon's fork/join far sooner than a scalar-libm NLL term does.
+pub(crate) const PAR_ROW_THRESHOLD: usize = 256;
+
+/// [`par_nansum`] with the heavyweight-row threshold ([`PAR_ROW_THRESHOLD`]).
+#[inline]
+pub(crate) fn par_nansum_rows<F>(n: usize, f: F) -> f64
+where
+    F: Fn(usize) -> f64 + Send + Sync,
+{
+    let nan_to_zero = move |i: usize| {
+        let v = f(i);
+        if v.is_nan() { 0.0 } else { v }
+    };
+    if n >= PAR_ROW_THRESHOLD {
+        (0..n).into_par_iter().map(nan_to_zero).sum()
+    } else {
+        (0..n).map(nan_to_zero).sum()
+    }
+}

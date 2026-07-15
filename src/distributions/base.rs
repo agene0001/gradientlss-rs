@@ -943,22 +943,26 @@ impl CostFunction for StartValueProblem {
             .map(|(&p, response_fn)| response_fn.apply_scalar(p))
             .collect();
 
-        // Compute total negative log-likelihood using the actual distribution's log_prob
+        // Total NLL via the actual distribution's log_prob. par_nansum both
+        // parallelizes the full-dataset pass (this cost — and, via the
+        // finite-difference `gradient` below, 2·n_params of these per L-BFGS
+        // iteration — dominated `initialize: true` fits) and matches Python's
+        // `-torch.nansum(...)` in loss_fn_start_values: a NaN per-sample
+        // log-prob is skipped, not allowed to poison the whole loss into the
+        // f64::MAX clamp. The parallel reduction reorders float adds (~1e-12),
+        // which is immaterial to the optimizer.
         let loss: f64 = if self.is_multivariate {
             let n_obs = self.target_data.len() / self.n_targets;
-            (0..n_obs)
-                .map(|i| {
-                    let start = i * self.n_targets;
-                    let end = start + self.n_targets;
-                    let target_slice = &self.target_data[start..end];
-                    -self.dist.log_prob(&transformed, target_slice)
-                })
-                .sum()
+            crate::distributions::util::par_nansum(n_obs, |i| {
+                let start = i * self.n_targets;
+                let end = start + self.n_targets;
+                let target_slice = &self.target_data[start..end];
+                -self.dist.log_prob(&transformed, target_slice)
+            })
         } else {
-            self.target_data
-                .iter()
-                .map(|&y| -self.dist.log_prob(&transformed, &[y]))
-                .sum()
+            crate::distributions::util::par_nansum(self.target_data.len(), |i| {
+                -self.dist.log_prob(&transformed, &[self.target_data[i]])
+            })
         };
 
         if loss.is_finite() {

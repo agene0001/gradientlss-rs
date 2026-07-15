@@ -172,21 +172,27 @@ impl Distribution for Dirichlet {
                 panic!("Dirichlet requires multivariate targets")
             }
             ResponseData::Multivariate(arr) => {
-                let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
-                for i in 0..n_samples {
-                    let row_params: Vec<f64> = params.row(i).to_vec();
-                    let target_row: Vec<f64> = arr.row(i).to_vec();
+                let term = |i: usize| -> f64 {
+                    let row_params = params.row(i);
+                    let target_row = arr.row(i);
 
-                    let log_prob = self.log_prob(&row_params, &target_row);
-                    // torch.nansum parity: a NaN log-prob contributes 0.
-                    if !log_prob.is_nan() {
-                        total_nll -= log_prob;
-                    }
-                }
-
-                total_nll
+                    // Avoid allocation when rows are contiguous (standard layout)
+                    let log_prob = match (row_params.as_slice(), target_row.as_slice()) {
+                        (Some(rp), Some(tr)) => self.log_prob(rp, tr),
+                        _ => {
+                            let rp = row_params.to_vec();
+                            let tr = target_row.to_vec();
+                            self.log_prob(&rp, &tr)
+                        }
+                    };
+                    // torch.nansum parity handled by par_nansum_rows (NaN -> 0).
+                    -log_prob
+                };
+                // Each row is a full multivariate log_prob (matrix work), so
+                // parallelize above the heavyweight-row threshold.
+                crate::distributions::util::par_nansum_rows(n_samples, term)
             }
         }
     }

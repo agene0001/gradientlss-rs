@@ -251,10 +251,9 @@ impl Distribution for MVT {
                 panic!("MVT requires multivariate targets")
             }
             ResponseData::Multivariate(arr) => {
-                let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
-                for i in 0..n_samples {
+                let term = |i: usize| -> f64 {
                     let row_params = params.row(i);
                     let target_row = arr.row(i);
 
@@ -267,13 +266,12 @@ impl Distribution for MVT {
                             self.log_prob(&rp, &tr)
                         }
                     };
-                    // torch.nansum parity: a NaN log-prob contributes 0.
-                    if !log_prob.is_nan() {
-                        total_nll -= log_prob;
-                    }
-                }
-
-                total_nll
+                    // torch.nansum parity handled by par_nansum_rows (NaN -> 0).
+                    -log_prob
+                };
+                // Each row is a full multivariate log_prob (matrix work), so
+                // parallelize above the heavyweight-row threshold.
+                crate::distributions::util::par_nansum_rows(n_samples, term)
             }
         }
     }

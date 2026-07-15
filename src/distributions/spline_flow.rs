@@ -18,6 +18,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution as RandDistribution, Normal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Target support options for the spline flow.
@@ -842,21 +843,20 @@ impl Distribution for SplineFlow {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(y) => {
-                // Pre-allocate reusable buffers for spline knot computation
+                // Reusable per-thread buffers for spline knot computation
                 let n_deriv = match self.order {
                     SplineOrder::Quadratic => self.count_bins + 1,
                     SplineOrder::Linear => self.count_bins + 1,
                 };
-                let mut widths_buf = vec![0.0f64; self.count_bins];
-                let mut heights_buf = vec![0.0f64; self.count_bins];
-                let mut derivatives_buf = vec![0.0f64; n_deriv];
-                let mut lambdas_buf = vec![0.0f64; self.count_bins];
-                // Fallback buffer for non-contiguous rows
                 let n_params = self.n_params();
-                let mut params_buf = vec![0.0f64; n_params];
+                let n_samples = params.nrows();
 
-                let mut total = 0.0;
-                for (i, &y_val) in y.iter().enumerate() {
+                // Scratch: (widths, heights, derivatives, lambdas, row fallback).
+                // NaN log-probs contribute 0 (torch.nansum parity).
+                type Scratch = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
+                let term = |scratch: &mut Scratch, i: usize| -> f64 {
+                    let (widths_buf, heights_buf, derivatives_buf, lambdas_buf, params_buf) =
+                        scratch;
                     let row = params.row(i);
                     let p: &[f64] = match row.as_slice() {
                         Some(s) => s,
@@ -869,18 +869,35 @@ impl Distribution for SplineFlow {
                     };
                     let lp = self.log_prob_flow_with_buffers(
                         p,
-                        y_val,
-                        &mut widths_buf,
-                        &mut heights_buf,
-                        &mut derivatives_buf,
-                        &mut lambdas_buf,
+                        y[i],
+                        widths_buf,
+                        heights_buf,
+                        derivatives_buf,
+                        lambdas_buf,
                     );
-                    // torch.nansum parity: a NaN log-prob contributes 0.
-                    if !lp.is_nan() {
-                        total -= lp;
-                    }
+                    if lp.is_nan() { 0.0 } else { -lp }
+                };
+                let make_scratch = || -> Scratch {
+                    (
+                        vec![0.0f64; self.count_bins],
+                        vec![0.0f64; self.count_bins],
+                        vec![0.0f64; n_deriv],
+                        vec![0.0f64; self.count_bins],
+                        vec![0.0f64; n_params],
+                    )
+                };
+
+                // Each row evaluates the full spline transform — heavyweight
+                // enough to parallelize at the row threshold.
+                if n_samples >= crate::distributions::util::PAR_ROW_THRESHOLD {
+                    (0..n_samples)
+                        .into_par_iter()
+                        .map_init(make_scratch, term)
+                        .sum()
+                } else {
+                    let mut scratch = make_scratch();
+                    (0..n_samples).map(|i| term(&mut scratch, i)).sum()
                 }
-                total
             }
             ResponseData::Multivariate(_) => {
                 panic!("SplineFlow is a univariate distribution.")

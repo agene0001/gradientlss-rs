@@ -217,45 +217,27 @@ impl Distribution for MVN {
                 panic!("MVN requires multivariate targets")
             }
             ResponseData::Multivariate(arr) => {
-                let mut total_nll = 0.0;
                 let n_samples = params.nrows();
 
-                // Pre-allocate fallback buffers for non-contiguous rows
-                let n_params = self.n_params();
-                let n_targets = self.n_targets;
-                let mut params_buf = vec![0.0f64; n_params];
-                let mut target_buf = vec![0.0f64; n_targets];
-
-                for i in 0..n_samples {
+                let term = |i: usize| -> f64 {
                     let row_params = params.row(i);
                     let target_row = arr.row(i);
 
-                    let rp: &[f64] = match row_params.as_slice() {
-                        Some(s) => s,
-                        None => {
-                            for (k, &v) in row_params.iter().enumerate() {
-                                params_buf[k] = v;
-                            }
-                            &params_buf[..n_params]
+                    // Avoid allocation when rows are contiguous (standard layout)
+                    let log_prob = match (row_params.as_slice(), target_row.as_slice()) {
+                        (Some(rp), Some(tr)) => self.log_prob(rp, tr),
+                        _ => {
+                            let rp = row_params.to_vec();
+                            let tr = target_row.to_vec();
+                            self.log_prob(&rp, &tr)
                         }
                     };
-                    let tr: &[f64] = match target_row.as_slice() {
-                        Some(s) => s,
-                        None => {
-                            for (k, &v) in target_row.iter().enumerate() {
-                                target_buf[k] = v;
-                            }
-                            &target_buf[..n_targets]
-                        }
-                    };
-                    let log_prob = self.log_prob(rp, tr);
-                    // torch.nansum parity: a NaN log-prob contributes 0.
-                    if !log_prob.is_nan() {
-                        total_nll -= log_prob;
-                    }
-                }
-
-                total_nll
+                    // torch.nansum parity handled by par_nansum_rows (NaN -> 0).
+                    -log_prob
+                };
+                // Each row is a full multivariate log_prob (matrix work), so
+                // parallelize above the heavyweight-row threshold.
+                crate::distributions::util::par_nansum_rows(n_samples, term)
             }
         }
     }

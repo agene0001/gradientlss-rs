@@ -441,24 +441,23 @@ impl Distribution for Mixture {
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(arr) => {
-                let mut total_nll = 0.0;
                 let n_samples = params.nrows();
                 let m = self.n_components;
+                let n_params = self.n_params();
 
                 // Hoisted per-call state: the gumbel noise is fixed (seeded
                 // per call in Python; identical for every row here — the
                 // accepted per-row-reuse deviation), so draw it once instead
-                // of reseeding an RNG per row, and reuse one probability
-                // buffer instead of the 4 Vecs `transform_dist_params`
-                // allocated per row. This runs every boosting round on both
-                // the train and validation sets.
+                // of reseeding an RNG per row. Rows reuse per-thread scratch
+                // (probability buffer + non-contiguous-row fallback) instead
+                // of the 4 Vecs `transform_dist_params` allocated per row.
+                // This runs every boosting round on train and validation sets.
                 let noise = Self::gumbel_noise(m);
-                let mut probs_buf = vec![0.0f64; m];
-                // Fallback buffer for non-contiguous rows
-                let n_params = self.n_params();
-                let mut params_buf = vec![0.0f64; n_params];
 
-                for i in 0..n_samples {
+                // Scratch: (probs_buf, params_buf). NaN log-probs contribute 0
+                // (torch.nansum parity).
+                let term = |scratch: &mut (Vec<f64>, Vec<f64>), i: usize| -> f64 {
+                    let (probs_buf, params_buf) = scratch;
                     let row = params.row(i);
                     let row_params: &[f64] = match row.as_slice() {
                         Some(s) => s,
@@ -474,21 +473,27 @@ impl Distribution for Mixture {
                         &row_params[2 * m..3 * m],
                         &noise,
                         self.temperature,
-                        &mut probs_buf,
+                        probs_buf,
                     );
                     let log_prob = self.log_prob_mixture(
-                        &probs_buf,
+                        probs_buf,
                         &row_params[0..m],
                         &row_params[m..2 * m],
                         arr[i],
                     );
-                    // torch.nansum parity: a NaN log-prob contributes 0.
-                    if !log_prob.is_nan() {
-                        total_nll -= log_prob;
-                    }
-                }
+                    if log_prob.is_nan() { 0.0 } else { -log_prob }
+                };
+                let make_scratch = || (vec![0.0f64; m], vec![0.0f64; n_params]);
 
-                total_nll
+                if n_samples >= crate::distributions::util::PAR_ROW_THRESHOLD {
+                    (0..n_samples)
+                        .into_par_iter()
+                        .map_init(make_scratch, term)
+                        .sum()
+                } else {
+                    let mut scratch = make_scratch();
+                    (0..n_samples).map(|i| term(&mut scratch, i)).sum()
+                }
             }
             ResponseData::Multivariate(_) => {
                 panic!("Mixture is a univariate distribution")
