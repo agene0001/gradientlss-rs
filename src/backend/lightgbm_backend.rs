@@ -254,10 +254,12 @@ impl LightGBMDataset {
         &self.features
     }
 
-    /// Create a Mat from stored features for prediction.
-    pub fn to_mat(&self) -> MatBuf<f32, lgbm::mat::RowMajor> {
-        MatBuf::from_vec(
-            self.features.clone(),
+    /// Borrow the stored features as a Mat for prediction — no copy: the old
+    /// `to_mat` cloned the full feature Vec every call (once for the train
+    /// matrix and once per validation set, per training run).
+    pub fn features_mat(&self) -> Mat<'_, f32, lgbm::mat::RowMajor> {
+        Mat::from_slice(
+            &self.features,
             self.n_rows,
             self.n_cols,
             lgbm::mat::RowMajor,
@@ -370,15 +372,15 @@ impl BackendModel for LightGBMModel {
             }
         }
 
-        // Prepare validation data if available
-        let (valid_mat, valid_labels, valid_n_samples) = if let Some(ref vd) = valid_data {
+        // Prepare validation data if available (Mat borrows the dataset's
+        // feature buffer — no copy).
+        let valid_ref = valid_data.as_deref();
+        let (valid_mat, valid_labels, valid_n_samples) = if let Some(vd) = valid_ref {
             let vl = vd.get_labels()?;
-            let vm = vd.to_mat();
-            Some((vm, vl, vd.num_rows()))
+            (Some(vd.features_mat()), Some(vl), vd.num_rows())
         } else {
-            None
-        }
-        .map_or((None, None, 0), |(m, l, n)| (Some(m), Some(l), n));
+            (None, None, 0)
+        };
 
         // Running validation margin, accumulated one iteration at a time (mirrors
         // `predictions`). Seeded with start_values; zero-sized when there's no
@@ -414,8 +416,8 @@ impl BackendModel for LightGBMModel {
         let mut train_history = Vec::with_capacity(config.num_boost_round);
         let mut valid_history = Vec::with_capacity(config.num_boost_round);
 
-        // Create Mat from training data for predictions
-        let train_mat = train_data.to_mat();
+        // Borrow the training features as a Mat for the per-round predicts
+        let train_mat = train_data.features_mat();
         let pred_params = Parameters::new();
 
         // Notify callbacks of training start
@@ -424,6 +426,11 @@ impl BackendModel for LightGBMModel {
         }
 
         let mut final_round = 0;
+
+        // Reused across rounds; every element is overwritten by the transpose
+        // pass below, so no per-round clearing (or allocation) is needed.
+        let mut grad_f32 = vec![0f32; n_samples * n_params];
+        let mut hess_f32 = vec![0f32; n_samples * n_params];
 
         for round in 0..config.num_boost_round {
             final_round = round;
@@ -436,8 +443,6 @@ impl BackendModel for LightGBMModel {
             // Transpose and cast to f32 in a single pass — the previous
             // `reshape_gradients` + `map` route allocated two intermediate f64
             // arrays per round.
-            let mut grad_f32 = vec![0f32; n_samples * n_params];
-            let mut hess_f32 = vec![0f32; n_samples * n_params];
             for (i, (g_row, h_row)) in gh
                 .gradients
                 .rows()
@@ -935,7 +940,7 @@ mod tests {
                 .expect("update_one_iter_custom");
         }
 
-        let mat = ds.to_mat();
+        let mat = ds.features_mat();
         let pp = Parameters::new();
 
         let full = booster
