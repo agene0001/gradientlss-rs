@@ -29,3 +29,20 @@ where
         (0..n).map(f).sum()
     }
 }
+
+/// Like [`par_sum`], but NaN terms contribute 0 — `torch.nansum` semantics
+/// (±inf still propagates). Python's `get_params_loss` aggregates the NLL with
+/// `-torch.nansum(dist.log_prob(target))`, so a single NaN log-prob (e.g. a
+/// 0·inf at a support boundary) must NOT poison the whole eval metric: a NaN
+/// metric never compares better than `best_loss`, which silently freezes
+/// best_iteration and burns the early-stopping patience where Python trains on.
+#[inline]
+pub(crate) fn par_nansum<F>(n: usize, f: F) -> f64
+where
+    F: Fn(usize) -> f64 + Send + Sync,
+{
+    par_sum(n, move |i| {
+        let v = f(i);
+        if v.is_nan() { 0.0 } else { v }
+    })
+}

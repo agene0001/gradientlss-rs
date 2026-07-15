@@ -395,7 +395,10 @@ impl Distribution for MVNLoRa {
                             self.log_prob(&rp, &tr)
                         }
                     };
-                    total_nll -= log_prob;
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !log_prob.is_nan() {
+                        total_nll -= log_prob;
+                    }
                 }
 
                 total_nll

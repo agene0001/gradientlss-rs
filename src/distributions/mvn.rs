@@ -248,7 +248,11 @@ impl Distribution for MVN {
                             &target_buf[..n_targets]
                         }
                     };
-                    total_nll -= self.log_prob(rp, tr);
+                    let log_prob = self.log_prob(rp, tr);
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !log_prob.is_nan() {
+                        total_nll -= log_prob;
+                    }
                 }
 
                 total_nll

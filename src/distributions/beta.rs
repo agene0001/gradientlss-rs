@@ -115,6 +115,13 @@ impl Distribution for Beta {
         self.initialize
     }
 
+    /// Sampling uses rejection sampling (built on Gamma draws), which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -124,7 +131,7 @@ impl Distribution for Beta {
             ResponseData::Univariate(y) => {
                 let conc1_col = params.column(0);
                 let conc0_col = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     let y_val = y[i];
                     if y_val < 0.0 || y_val > 1.0 {
                         f64::INFINITY
@@ -180,8 +187,10 @@ impl Distribution for Beta {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for both parameters
-            let (rd_a, rsd_a) = conc1_response_fn.derivative_batches_from_transformed(&p_conc1, &t_conc1);
-            let (rd_b, rsd_b) = conc0_response_fn.derivative_batches_from_transformed(&p_conc0, &t_conc0);
+            let (rd_a, rsd_a) =
+                conc1_response_fn.derivative_batches_from_transformed(&p_conc1, &t_conc1);
+            let (rd_b, rsd_b) =
+                conc0_response_fn.derivative_batches_from_transformed(&p_conc0, &t_conc0);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let a = t_conc1[i].max(1e-6);

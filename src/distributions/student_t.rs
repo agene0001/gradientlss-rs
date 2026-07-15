@@ -105,6 +105,13 @@ impl Distribution for StudentT {
         self.initialize
     }
 
+    /// Sampling uses rejection sampling (chi-square/Gamma draw for the df), which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -115,7 +122,7 @@ impl Distribution for StudentT {
                 let df_col = params.column(0);
                 let loc_col = params.column(1);
                 let scale_col = params.column(2);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[df_col[i], loc_col[i], scale_col[i]], y[i])
                 })
             }
@@ -192,7 +199,8 @@ impl Distribution for StudentT {
 
         if n_samples >= 4096 {
             let (rd_df, rsd_df) = df_response_fn.derivative_batches_from_transformed(&p_df, &t_df);
-            let (rd_scale, rsd_scale) = scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
+            let (rd_scale, rsd_scale) =
+                scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
 
             let compute_sample = |i: usize| -> ([f64; 3], [f64; 3]) {
                 let nu = t_df[i].max(1e-6);
@@ -232,8 +240,7 @@ impl Distribution for StudentT {
                 // −(ν+1)d²/(2ν²z)) combines to d²(2ν + d²(1−ν))/(2ν²(ν+d²)²).
                 let hess_nu_param = -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu)
                     - 0.5 / (nu * nu)
-                    + d2 * (2.0 * nu + d2 * (1.0 - nu))
-                        / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
+                    + d2 * (2.0 * nu + d2 * (1.0 - nu)) / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
                 let rd = rd_df[i];
                 let rsd = rsd_df[i];
                 let g0 = grad_nu * rd;
@@ -273,8 +280,7 @@ impl Distribution for StudentT {
                 let sigma_sq = sigma * sigma;
 
                 gradients[[i, 1]] = -(nu_p1) * d / (sigma * nu_plus_d2);
-                hessians[[i, 1]] =
-                    nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2);
+                hessians[[i, 1]] = nu_p1 / sigma_sq * (nu - d2) / (nu_plus_d2 * nu_plus_d2);
 
                 let grad_sigma = 1.0 / sigma - nu_p1 * d2 / (sigma * nu_plus_d2);
                 let hess_sigma_param = -1.0 / sigma_sq
@@ -295,8 +301,7 @@ impl Distribution for StudentT {
                 // differentiating 0.5·ln z − (ν+1)d²/(2ν²z) w.r.t. ν.
                 let hess_nu_param = -0.25 * trigamma(half_nu_p1) + 0.25 * trigamma(half_nu)
                     - 0.5 / (nu * nu)
-                    + d2 * (2.0 * nu + d2 * (1.0 - nu))
-                        / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
+                    + d2 * (2.0 * nu + d2 * (1.0 - nu)) / (2.0 * nu * nu * nu_plus_d2 * nu_plus_d2);
                 let pred_df = p_df[i];
                 let rd = df_response_fn.derivative(pred_df);
                 let rsd = df_response_fn.second_derivative(pred_df);

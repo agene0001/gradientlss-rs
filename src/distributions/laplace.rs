@@ -95,7 +95,7 @@ impl Distribution for Laplace {
             ResponseData::Univariate(y) => {
                 let loc_col = params.column(0);
                 let scale_col = params.column(1);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[loc_col[i], scale_col[i]], y[i])
                 })
             }
@@ -163,7 +163,8 @@ impl Distribution for Laplace {
 
         if n_samples >= 4096 {
             // Pre-compute batch derivatives for scale (loc uses Identity: deriv=1, second=0)
-            let (resp_deriv, resp_second) = scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
+            let (resp_deriv, resp_second) =
+                scale_response_fn.derivative_batches_from_transformed(&p_scale, &t_scale);
 
             let compute_sample = |i: usize| -> (f64, f64, f64, f64) {
                 let loc = t_loc[i];

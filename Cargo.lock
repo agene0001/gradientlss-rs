@@ -1716,7 +1716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -2062,7 +2062,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "xgb"
 version = "3.2.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#af49f464f769693bbdc63ebf115c6e14b98f8104"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#789d347bf9bb49ed92760051ebc32ed15cdced3a"
 dependencies = [
  "derive_builder",
  "indexmap",
@@ -2075,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "xgboost_lib-sys"
 version = "3.2.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#af49f464f769693bbdc63ebf115c6e14b98f8104"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#789d347bf9bb49ed92760051ebc32ed15cdced3a"
 dependencies = [
  "bindgen",
  "cmake",

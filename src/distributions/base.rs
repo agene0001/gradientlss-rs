@@ -169,6 +169,39 @@ pub trait Distribution: Send + Sync {
         result
     }
 
+    /// Post-process transformed parameters into their USER-FACING form for
+    /// `predict(PredType::Parameters)` output. Default: identity.
+    ///
+    /// Most distributions' internal parameter representation (what `nll`,
+    /// `log_prob`, and `sample` consume) is already what users expect. Mixture
+    /// is the exception: its per-column response functions leave the mixing
+    /// weights as raw logits (the softmax couples columns, which the scalar
+    /// response-function machinery can't express), and `log_prob`/`sample`
+    /// apply the softmax internally. Python's `predict_dist` returns softmaxed
+    /// probabilities, so Mixture overrides this to match. Internal consumers
+    /// must NOT call this — feeding finalized parameters back into
+    /// `nll`/`log_prob`/`sample` would double-apply the group transform.
+    fn finalize_predicted_params(&self, params: Array2<f64>) -> Array2<f64> {
+        params
+    }
+
+    /// Whether `sample` is a smooth (pathwise/reparameterizable) function of
+    /// the distribution parameters when the RNG seed is held fixed.
+    ///
+    /// The CRPS loss differentiates the sampled empirical CRPS by central
+    /// differences with a fixed seed. That is only meaningful when parameters
+    /// enter the sampler smoothly (loc-scale transforms, inverse-CDF draws) —
+    /// the analogue of torch's `rsample`. Rejection samplers (Gamma and
+    /// everything built on it) and discrete draws (Poisson, mixture gates)
+    /// flip accept/reject decisions between the ±ε evaluations, and the
+    /// resulting sample jump is amplified by 1/(2ε) into garbage gradients —
+    /// distributions like those override this to `false`, and training errors
+    /// out early for `LossFn::Crps` (Python errors likewise: torch
+    /// distributions without `rsample` reject `.rsample()`).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        true
+    }
+
     /// Compute analytical gradients and hessians if available.
     ///
     /// Distributions can override this to provide exact analytical gradients
@@ -252,9 +285,10 @@ pub trait Distribution: Send + Sync {
         // Apply stabilization
         self.stabilize_derivatives(&mut gradients, &mut hessians);
 
-        // Apply weights if provided — broadcast column vector across columns
+        // Apply weights if provided — broadcast column vector across columns.
+        // insert_axis on a reborrowed view: no per-round copy of the weights.
         if let Some(w) = weights {
-            let w_col = w.to_owned().insert_axis(ndarray::Axis(1));
+            let w_col = w.view().insert_axis(ndarray::Axis(1));
             gradients *= &w_col;
             hessians *= &w_col;
         }
@@ -608,14 +642,17 @@ pub trait Distribution: Send + Sync {
     /// # Returns
     /// Total negative log-likelihood
     fn compute_total_loss(&self, params: &[f64], target: &ResponseData) -> f64 {
+        // torch.nansum parity (Python's loss_fn_start_values): NaN terms → 0.
+        let nan_to_zero = |v: f64| if v.is_nan() { 0.0 } else { v };
         match target {
-            ResponseData::Univariate(arr) => {
-                arr.iter().map(|&y| -self.log_prob(params, &[y])).sum()
-            }
+            ResponseData::Univariate(arr) => arr
+                .iter()
+                .map(|&y| nan_to_zero(-self.log_prob(params, &[y])))
+                .sum(),
             ResponseData::Multivariate(arr) => (0..arr.nrows())
                 .map(|i| {
                     let y = arr.row(i).to_vec();
-                    -self.log_prob(params, &y)
+                    nan_to_zero(-self.log_prob(params, &y))
                 })
                 .sum(),
         }
@@ -668,7 +705,10 @@ pub trait Distribution: Send + Sync {
                         crps += y - obs_samples.last().unwrap_or(&0.0);
                     }
 
-                    total_crps += crps;
+                    // torch.nansum parity: a NaN per-observation CRPS → 0.
+                    if !crps.is_nan() {
+                        total_crps += crps;
+                    }
                 }
 
                 total_crps
@@ -717,7 +757,10 @@ pub trait Distribution: Send + Sync {
                             crps += y - obs_samples.last().unwrap_or(&0.0);
                         }
 
-                        total_crps += crps;
+                        // torch.nansum parity: a NaN per-observation CRPS → 0.
+                        if !crps.is_nan() {
+                            total_crps += crps;
+                        }
                     }
                 }
 
@@ -801,8 +844,9 @@ fn median_inplace(buf: &mut [f64]) -> f64 {
         return 0.0;
     }
     let mid = (buf.len() - 1) / 2;
-    let (_, m, _) = buf
-        .select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (_, m, _) = buf.select_nth_unstable_by(mid, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
     *m
 }
 

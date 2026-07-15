@@ -7,7 +7,7 @@
 //!
 //! Note: These benchmarks require the respective backend features to be enabled.
 
-use criterion::{Criterion,criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ndarray::{Array1, Array2};
 use std::hint::black_box;
 /// Generate synthetic regression data for training benchmarks.
@@ -52,12 +52,12 @@ fn generate_positive_training_data(
 #[cfg(feature = "xgboost")]
 mod xgboost_benchmarks {
     use super::*;
+    use criterion::BenchmarkId;
     use gradientlss::backend::{Backend, BackendDataset, TrainConfig};
     use gradientlss::distributions::Gaussian;
     use gradientlss::model::GradientLSS;
     use gradientlss::prelude::XGBoostBackend;
     use std::sync::Arc;
-    use criterion::BenchmarkId;
 
     fn bench_xgboost_training_gaussian(c: &mut Criterion) {
         let mut group = c.benchmark_group("training/xgboost/gaussian");
@@ -238,12 +238,12 @@ mod xgboost_benchmarks {
 #[cfg(feature = "lightgbm")]
 mod lightgbm_benchmarks {
     use super::*;
+    use criterion::BenchmarkId;
     use gradientlss::backend::{Backend, BackendDataset, TrainConfig};
     use gradientlss::distributions::Gaussian;
     use gradientlss::model::GradientLSS;
     use gradientlss::prelude::LightGBMBackend;
     use std::sync::Arc;
-    use criterion::BenchmarkId;
 
     fn bench_lightgbm_training_gaussian(c: &mut Criterion) {
         let mut group = c.benchmark_group("training/lightgbm/gaussian");

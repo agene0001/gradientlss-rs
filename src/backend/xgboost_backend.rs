@@ -11,7 +11,6 @@ use super::traits::{
 use crate::distributions::GradientsAndHessians;
 use crate::error::{GradientLSSError, Result};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use tempfile::NamedTempFile;
@@ -19,50 +18,38 @@ use tempfile::NamedTempFile;
 use xgb::parameters::BoosterParameters;
 use xgb::{Booster, DMatrix};
 
-// Thread-local storage to pass gradients/hessians to the strict function pointer callback
-thread_local! {
-    static OBJECTIVE_DATA: RefCell<Option<(Vec<f32>, Vec<f32>)>> = RefCell::new(None);
-}
-
-/// Trampoline function that matches the signature required by xgboost::update_custom
-fn objective_trampoline(_preds: &[f32], _dtrain: &DMatrix) -> (Vec<f32>, Vec<f32>) {
-    OBJECTIVE_DATA.with(|data| {
-        // Move the buffers out rather than cloning — they're rebuilt each round
-        // before `update_custom`, so there's no need to keep a copy here. Avoids
-        // a per-round memcpy of both (n_samples * n_params) f32 vectors.
-        data.borrow_mut()
-            .take()
-            .expect("Objective data was not set before update_custom call")
-    })
-}
-
 /// XGBoost backend for GradientLSS.
 #[derive(Debug, Clone)]
 pub struct XGBoostBackend;
 
+/// Render a `ParamValue` the way XGBoost's string config expects it.
+fn param_value_to_string(value: &ParamValue) -> String {
+    match value {
+        ParamValue::Int(v) => v.to_string(),
+        ParamValue::Float(v) => v.to_string(),
+        ParamValue::String(v) => v.clone(),
+        ParamValue::Bool(v) => v.to_string(),
+    }
+}
+
 /// XGBoost-specific parameters.
 #[derive(Debug, Clone)]
 pub struct XGBoostParams {
-    inner: HashMap<String, String>,
+    inner: HashMap<String, ParamValue>,
     n_dist_params: usize,
 }
 
 impl Default for XGBoostParams {
     fn default() -> Self {
         let mut inner = HashMap::new();
-        inner.insert("booster".to_string(), "gbtree".to_string());
+        inner.insert("booster".to_string(), ParamValue::from("gbtree"));
         // Histogram split-finding — the same algorithm LightGBM uses. Without
         // this, XGBoost defaults to `auto` (exact/approx greedy), which is ~10x
         // slower here (esp. for the 2-parameter NegativeBinomial). This is the
         // single biggest training-speed lever for the XGBoost backend.
-        inner.insert("tree_method".to_string(), "hist".to_string());
-        inner.insert("eta".to_string(), "0.1".to_string());
-        inner.insert("max_depth".to_string(), "6".to_string());
-        inner.insert("base_score".to_string(), "0.0".to_string());
-        inner.insert(
-            "disable_default_eval_metric".to_string(),
-            "true".to_string(),
-        );
+        inner.insert("tree_method".to_string(), ParamValue::from("hist"));
+        inner.insert("eta".to_string(), ParamValue::Float(0.1));
+        inner.insert("max_depth".to_string(), ParamValue::Int(6));
         Self {
             inner,
             n_dist_params: 1,
@@ -72,31 +59,25 @@ impl Default for XGBoostParams {
 
 impl BackendParams for XGBoostParams {
     fn set(&mut self, key: &str, value: ParamValue) {
-        let str_value = match value {
-            ParamValue::Int(v) => v.to_string(),
-            ParamValue::Float(v) => v.to_string(),
-            ParamValue::String(v) => v,
-            ParamValue::Bool(v) => v.to_string(),
-        };
-        self.inner.insert(key.to_string(), str_value);
+        self.inner.insert(key.to_string(), value);
     }
 
-    fn get(&self, _key: &str) -> Option<&ParamValue> {
-        None
+    fn get(&self, key: &str) -> Option<&ParamValue> {
+        self.inner.get(key)
     }
 
     fn to_map(&self) -> HashMap<String, ParamValue> {
-        self.inner
-            .iter()
-            .map(|(k, v)| (k.clone(), ParamValue::String(v.clone())))
-            .collect()
+        self.inner.clone()
     }
 }
 
 impl XGBoostParams {
-    /// Get the inner HashMap for xgboost-rs.
+    /// Get the params as the string map xgboost-rs consumes.
     pub fn to_xgb_params(&self) -> HashMap<String, String> {
-        self.inner.clone()
+        self.inner
+            .iter()
+            .map(|(k, v)| (k.clone(), param_value_to_string(v)))
+            .collect()
     }
 
     /// Set the number of distribution parameters.
@@ -110,9 +91,16 @@ impl XGBoostParams {
     }
 }
 
-/// XGBoost dataset wrapper around DMatrix.
+/// XGBoost dataset wrapper.
+///
+/// Holds the raw features/labels; the training `DMatrix` is built lazily at
+/// TRAIN time (see [`Self::build_train_dmatrix`]) so it can be a
+/// `QuantileDMatrix` under the `hist` tree method — pre-binned values use ~1
+/// byte per feature value instead of 4 and skip the sketching pass at the
+/// start of training. Validation data never needs a stored DMatrix either
+/// (the training loop builds one plain prediction matrix from `features()`),
+/// so nothing is constructed eagerly.
 pub struct XGBoostDataset {
-    dmatrix: DMatrix,
     n_rows: usize,
     n_cols: usize,
     features: Vec<f32>,
@@ -139,21 +127,7 @@ impl BackendDataset for XGBoostDataset {
         // Convert to f32 for xgboost
         let features_f32: Vec<f32> = features.iter().map(|&x| x as f32).collect();
 
-        // Use first n_rows labels for XGBoost DMatrix.
-        // For multivariate targets the full label array is stored separately.
-        let labels_f32: Vec<f32> = labels.iter().take(n_rows).map(|&x| x as f32).collect();
-
-        // Create DMatrix from dense array (row-major)
-        let mut dmatrix = DMatrix::from_dense(&features_f32, n_rows).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
-        })?;
-
-        dmatrix
-            .set_labels(&labels_f32)
-            .map_err(|e| GradientLSSError::BackendError(format!("Failed to set labels: {}", e)))?;
-
         Ok(Self {
-            dmatrix,
             n_rows,
             n_cols,
             features: features_f32,
@@ -162,19 +136,19 @@ impl BackendDataset for XGBoostDataset {
         })
     }
 
-    fn set_init_score(&mut self, init_score: &Array1<f64>) -> Result<()> {
-        // Set base_margin on the DMatrix, matching Python's set_base_margin.
-        // For multi-output, base_margin is flattened row-major: n_samples * n_params.
-        let margin_f32: Vec<f32> = init_score.iter().map(|&x| x as f32).collect();
-        self.dmatrix.set_base_margin(&margin_f32).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
-        })?;
+    fn set_init_score(&mut self, _init_score: &Array1<f64>) -> Result<()> {
+        // Intentional no-op: the training path sets the start values as the
+        // base margin on the train/valid DMatrices it builds (see
+        // `build_train_dmatrix`), and `predict` adds them back after
+        // `predict_raw` — there is no stored DMatrix to set anything on.
         Ok(())
     }
 
-    /// Plumb per-sample weights into the underlying DMatrix. Mirrors XGBoost's
-    /// `DMatrix::set_weights` — the booster picks weights up automatically during
-    /// training and rescales gradients/hessians per-sample.
+    /// Store per-sample weights. They are set on the training `DMatrix` when
+    /// `build_train_dmatrix` runs, and the training loop additionally hands
+    /// them to the objective, which scales grad/hess per-sample — XGBoost does
+    /// not apply DMatrix weights to custom-objective gradients (matching
+    /// XGBoostLSS's `grad *= weights; hess *= weights`).
     fn set_weights(&mut self, weights: ArrayView1<f64>) -> Result<()> {
         if weights.len() != self.n_rows {
             return Err(GradientLSSError::BackendError(format!(
@@ -183,12 +157,6 @@ impl BackendDataset for XGBoostDataset {
                 weights.len()
             )));
         }
-        let weights_f32: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
-        self.dmatrix.set_weights(&weights_f32).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
-        })?;
-        // Keep a copy: XGBoost ignores DMatrix weights for custom objectives, so
-        // the training loop reads these back and weights grad/hess itself.
         self.weights = Some(weights.to_owned());
         Ok(())
     }
@@ -211,14 +179,76 @@ impl BackendDataset for XGBoostDataset {
 }
 
 impl XGBoostDataset {
-    /// Get a reference to the underlying DMatrix.
-    pub fn dmatrix(&self) -> &DMatrix {
-        &self.dmatrix
-    }
+    /// Build the training `DMatrix` with base margin, labels, and weights.
+    ///
+    /// Under the `hist` tree method this is a `QuantileDMatrix`
+    /// (`from_dense_quantile`): pre-binned storage, ~4x less memory, no
+    /// separate sketching pass — with `max_bin` taken from the training params
+    /// so the binning always matches the booster (a mismatch is a hard XGBoost
+    /// error). Any other tree method gets a plain `DMatrix`, since quantile
+    /// matrices are `hist`-only. Prediction on a quantile matrix is exact for
+    /// its own trees (hist split thresholds are bin boundaries), so the
+    /// training loop's cached per-round predicts are unaffected.
+    fn build_train_dmatrix(
+        &self,
+        xgb_params: &HashMap<String, String>,
+        n_params: usize,
+        start_values: Option<&Array1<f64>>,
+    ) -> Result<DMatrix> {
+        // First n_rows labels; for multivariate targets these are dummies (the
+        // objective reads the real labels from `full_labels`).
+        let labels_f32: Vec<f32> = self
+            .full_labels
+            .iter()
+            .take(self.n_rows)
+            .map(|&x| x as f32)
+            .collect();
 
-    /// Get a mutable reference to the underlying DMatrix.
-    pub fn dmatrix_mut(&mut self) -> &mut DMatrix {
-        &mut self.dmatrix
+        let use_quantile = xgb_params.get("tree_method").map(String::as_str) == Some("hist");
+        let mut dmatrix = if use_quantile {
+            let max_bin: u32 = xgb_params
+                .get("max_bin")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256);
+            DMatrix::from_dense_quantile(&self.features, self.n_rows, Some(&labels_f32), max_bin)
+                .map_err(|e| {
+                    GradientLSSError::BackendError(format!(
+                        "Failed to create QuantileDMatrix: {}",
+                        e
+                    ))
+                })?
+        } else {
+            let mut dm = DMatrix::from_dense(&self.features, self.n_rows).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
+            })?;
+            dm.set_labels(&labels_f32).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to set labels: {}", e))
+            })?;
+            dm
+        };
+
+        // Start values as base margin, matching Python:
+        // base_margin = np.ones((n_rows, 1)) * start_values, flattened row-major.
+        if let Some(sv) = start_values {
+            let mut margin = Vec::with_capacity(self.n_rows * n_params);
+            for _i in 0..self.n_rows {
+                for j in 0..n_params {
+                    margin.push(sv[j] as f32);
+                }
+            }
+            dmatrix.set_base_margin(&margin).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
+            })?;
+        }
+
+        if let Some(ref w) = self.weights {
+            let weights_f32: Vec<f32> = w.iter().map(|&x| x as f32).collect();
+            dmatrix.set_weights(&weights_f32).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to set weights: {}", e))
+            })?;
+        }
+
+        Ok(dmatrix)
     }
 
     /// Get the stored features for creating new DMatrix instances.
@@ -236,6 +266,9 @@ impl XGBoostDataset {
 pub struct XGBoostModel {
     booster: Booster,
     n_params: usize,
+    /// Number of features the model was trained on. 0 when unknown (models
+    /// saved before this field existed — see `load_from_reader`).
+    n_features: usize,
     /// 0-based index of the best boosting iteration selected by early stopping.
     /// `Some(b)` means predictions must use trees for iterations `[0, b]`
     /// (i.e. `b + 1` iterations), truncating the overfit tail that early
@@ -251,6 +284,23 @@ impl std::fmt::Debug for XGBoostModel {
             .field("best_iteration", &self.best_iteration)
             .finish()
     }
+}
+
+/// Copy a flat row-major f32 prediction buffer into an existing (n_samples,
+/// n_params) f64 array — the reused-buffer counterpart of
+/// `prediction_to_array2` for the training loop's persistent margin arrays.
+fn copy_preds_into(preds: &[f32], out: &mut Array2<f64>) -> Result<()> {
+    if preds.len() != out.len() {
+        return Err(GradientLSSError::ShapeMismatch {
+            expected_shape: format!("{}", out.len()),
+            actual_shape: format!("{}", preds.len()),
+        });
+    }
+    // Both are C-order row-major, so element order matches.
+    for (o, &p) in out.iter_mut().zip(preds) {
+        *o = p as f64;
+    }
+    Ok(())
 }
 
 /// Helper to reshape flat predictions from XGBoost into (n_samples, n_params).
@@ -314,20 +364,6 @@ impl BackendModel for XGBoostModel {
         let n_params = params.n_dist_params();
         let n_samples = train_data.num_rows();
 
-        // Set base_margin on DMatrix if start values are provided.
-        // This matches Python: base_margin = np.ones((n_rows, 1)) * start_values, flattened.
-        if let Some(sv) = start_values {
-            let mut margin = Vec::with_capacity(n_samples * n_params);
-            for _i in 0..n_samples {
-                for j in 0..n_params {
-                    margin.push(sv[j] as f32);
-                }
-            }
-            train_data.dmatrix.set_base_margin(&margin).map_err(|e| {
-                GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
-            })?;
-        }
-
         let labels = train_data.get_labels()?;
 
         // Per-sample weights (if any). XGBoost does not apply DMatrix weights to
@@ -335,21 +371,49 @@ impl BackendModel for XGBoostModel {
         // objective, which scales grad/hess per-sample — matching XGBoostLSS.
         let train_weights = train_data.get_weights().cloned();
 
+        let mut xgb_params = params.to_xgb_params();
+        // Forced params, matching Python's `set_params_adj` which unconditionally
+        // overwrites the user dict. These are correctness requirements, not
+        // defaults: a user-carried `objective` (e.g. "count:poisson") makes every
+        // predict return link-transformed values while boosting stays on margin
+        // scale — silently corrupting gradients and predictions — and a nonzero
+        // `base_score` is inert during training (base_margin overrides it) but
+        // added by predict, shifting all outputs under the start values.
+        xgb_params.remove("objective");
+        xgb_params.insert("base_score".to_string(), "0.0".to_string());
+        xgb_params.insert(
+            "disable_default_eval_metric".to_string(),
+            "true".to_string(),
+        );
+        xgb_params.insert("num_target".to_string(), n_params.to_string());
+        // Wire TrainConfig::seed (subsample/colsample draws); an explicit
+        // user-set "seed" param still wins.
+        xgb_params
+            .entry("seed".to_string())
+            .or_insert_with(|| config.seed.to_string());
+
+        // Training DMatrix, built with the forced params in hand so the
+        // quantile binning (hist) sees the same max_bin as the booster;
+        // carries base margin (start values) and weights.
+        let train_dmat = train_data.build_train_dmatrix(&xgb_params, n_params, start_values)?;
+
         // For validation-based early stopping.
         let (valid_features, valid_labels) = if let Some(ref vd) = valid_data {
             let vl = vd.get_labels()?;
-            Some((vd.features().to_vec(), vd.n_rows, vd.n_cols, vl))
+            Some((vd.n_rows, vd.n_cols, vl))
         } else {
             None
         }
-        .map_or((None, None), |(f, r, c, l)| (Some((f, r, c)), Some(l)));
+        .map_or((None, None), |(r, c, l)| (Some((r, c)), Some(l)));
 
         // Build the validation DMatrix ONCE — its contents and base_margin are
         // constant across boosting rounds, so rebuilding it every round (as the
-        // old loop did) was pure waste.
-        let valid_dmat: Option<DMatrix> = match &valid_features {
-            Some((vf, vr, _vc)) => {
-                let mut dm = DMatrix::from_dense(vf, *vr).map_err(|e| {
+        // old loop did) was pure waste. Plain (non-quantile) DMatrix: it is
+        // prediction-only, and prediction on raw values is exact for
+        // hist-trained trees.
+        let valid_dmat: Option<DMatrix> = match (&valid_data, &valid_features) {
+            (Some(vd), Some((vr, _vc))) => {
+                let mut dm = DMatrix::from_dense(vd.features(), *vr).map_err(|e| {
                     GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
                 })?;
                 if let Some(sv) = start_values {
@@ -368,7 +432,7 @@ impl BackendModel for XGBoostModel {
                 }
                 Some(dm)
             }
-            None => None,
+            _ => None,
         };
 
         // Create the booster, caching BOTH the train and (when present) validation
@@ -378,12 +442,9 @@ impl BackendModel for XGBoostModel {
         // re-prediction — this is what keeps the loop O(rounds), not O(rounds²).
         // (XGBoost-specific: the LightGBM backend has no such cache, which is why
         // it accumulates per-iteration margins instead.)
-        let mut xgb_params = params.to_xgb_params();
-        xgb_params.insert("num_target".to_string(), n_params.to_string());
-
         let cached_dmats: Vec<&DMatrix> = match &valid_dmat {
-            Some(vdm) => vec![&train_data.dmatrix, vdm],
-            None => vec![&train_data.dmatrix],
+            Some(vdm) => vec![&train_dmat, vdm],
+            None => vec![&train_dmat],
         };
         let mut booster =
             Booster::new_with_cached_dmats(&BoosterParameters::default(), &cached_dmats).map_err(
@@ -427,18 +488,27 @@ impl BackendModel for XGBoostModel {
 
         let mut final_round = 0;
 
+        // Reused per-round buffers: grad/hess f32 staging for `boost`, one f32
+        // prediction buffer for `predict_into`, and persistent train/valid
+        // margin arrays refreshed in place. Steady-state, the loop allocates
+        // nothing in the wrapper.
+        let mut grad_f32: Vec<f32> = Vec::with_capacity(n_samples * n_params);
+        let mut hess_f32: Vec<f32> = Vec::with_capacity(n_samples * n_params);
+        let mut pred_buf: Vec<f32> = Vec::new();
+        let valid_rows = valid_features.map_or(0, |(r, _c)| r);
+        let mut valid_preds = Array2::<f64>::zeros((valid_rows, n_params));
+
         // Initial train margin = trees [0, 0) (just the base_margin). We carry the
         // margin across rounds: each round's post-update prediction is reused as
         // the next round's pre-update (gradient) input, so the train matrix is
         // predicted once per round (＋1 here) rather than twice. The train DMatrix
         // is cached at booster creation, so each predict is an O(new-trees) cache
         // read.
-        let mut predictions = {
-            let raw_preds = booster
-                .predict(&train_data.dmatrix)
-                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-            prediction_to_array2(&raw_preds, n_samples, n_params)
-        };
+        let mut predictions = Array2::<f64>::zeros((n_samples, n_params));
+        booster
+            .predict_into(&train_dmat, &mut pred_buf)
+            .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
+        copy_preds_into(&pred_buf, &mut predictions)?;
 
         for round in 0..config.num_boost_round {
             final_round = round;
@@ -451,17 +521,17 @@ impl BackendModel for XGBoostModel {
             // The arrays are C-order, so ndarray's iter IS row-major order — a single
             // contiguous cast pass that LLVM can vectorize, instead of per-element
             // `[[i, j]]` index arithmetic.
-            let grad_f32: Vec<f32> = gh.gradients.iter().map(|&v| v as f32).collect();
-            let hess_f32: Vec<f32> = gh.hessians.iter().map(|&v| v as f32).collect();
+            grad_f32.clear();
+            grad_f32.extend(gh.gradients.iter().map(|&v| v as f32));
+            hess_f32.clear();
+            hess_f32.extend(gh.hessians.iter().map(|&v| v as f32));
 
-            // Set gradient data for the trampoline
-            OBJECTIVE_DATA.with(|data| {
-                *data.borrow_mut() = Some((grad_f32, hess_f32));
-            });
-
-            // Update the single booster with all parameters' gradients
+            // Update the single booster with all parameters' gradients. `boost`
+            // takes them directly — `update_custom` would first re-predict on
+            // the train matrix for its callback, a wasted cache read since the
+            // carried `predictions` margin already holds that result.
             booster
-                .update_custom(&train_data.dmatrix, round as i32, objective_trampoline)
+                .boost(&train_dmat, round as i32, &grad_f32, &hess_f32)
                 .map_err(|e| GradientLSSError::BackendError(format!("Update failed: {}", e)))?;
 
             // Refresh the train margin to the post-update model (trees [0, round]).
@@ -470,10 +540,10 @@ impl BackendModel for XGBoostModel {
             // so train-only early stopping no longer lags the model by one tree.
             // This same array is carried into the next round as its pre-update
             // (gradient) margin, keeping it at one predict per round.
-            let raw_preds = booster
-                .predict(&train_data.dmatrix)
+            booster
+                .predict_into(&train_dmat, &mut pred_buf)
                 .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-            predictions = prediction_to_array2(&raw_preds, n_samples, n_params);
+            copy_preds_into(&pred_buf, &mut predictions)?;
 
             let train_loss = if need_train_metric {
                 let loss = metric_fn(&predictions, &labels);
@@ -485,13 +555,11 @@ impl BackendModel for XGBoostModel {
 
             // Validation loss (post-update → trees [0, round]). The validation
             // DMatrix is also cached, so this is likewise a cache read.
-            let valid_loss = if let (Some(vdm), Some((_vf, vr, _vc)), Some(vl)) =
-                (&valid_dmat, &valid_features, &valid_labels)
-            {
-                let valid_raw = booster.predict(vdm).map_err(|e| {
+            let valid_loss = if let (Some(vdm), Some(vl)) = (&valid_dmat, &valid_labels) {
+                booster.predict_into(vdm, &mut pred_buf).map_err(|e| {
                     GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
                 })?;
-                let valid_preds = prediction_to_array2(&valid_raw, *vr, n_params);
+                copy_preds_into(&pred_buf, &mut valid_preds)?;
                 let vl_loss = metric_fn(&valid_preds, vl);
                 valid_history.push(vl_loss);
                 Some(vl_loss)
@@ -507,20 +575,10 @@ impl BackendModel for XGBoostModel {
                 // `need_train_metric` is true when verbose, so this is Some.
                 let tl = train_loss.unwrap_or(f64::NAN);
                 match valid_loss {
-                    Some(vl) => println!(
-                        "[{}] train_loss: {:.6}, valid_loss: {:.6}",
-                        round, tl, vl
-                    ),
+                    Some(vl) => {
+                        println!("[{}] train_loss: {:.6}, valid_loss: {:.6}", round, tl, vl)
+                    }
                     None => println!("[{}] train_loss: {:.6}", round, tl),
-                }
-            }
-
-            if let Some(ref mut cb) = callbacks {
-                // `need_train_metric` is true when callbacks are present.
-                let tl = train_loss.unwrap_or(f64::NAN);
-                if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
-                    stopped_early = true;
-                    break;
                 }
             }
 
@@ -545,6 +603,18 @@ impl BackendModel for XGBoostModel {
                 rounds_without_improvement += 1;
             }
 
+            // Callbacks run AFTER the argmin/patience bookkeeping: a callback
+            // that stops on a new-minimum round must not exclude that round
+            // from best_iteration (its loss is already in the histories above).
+            if let Some(ref mut cb) = callbacks {
+                // `need_train_metric` is true when callbacks are present.
+                let tl = train_loss.unwrap_or(f64::NAN);
+                if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
+                    stopped_early = true;
+                    break;
+                }
+            }
+
             if let Some(early_stopping) = config.early_stopping_rounds {
                 if rounds_without_improvement >= early_stopping {
                     if config.verbose {
@@ -556,12 +626,20 @@ impl BackendModel for XGBoostModel {
             }
         }
 
+        // `final_round` stays 0 when the loop never ran (num_boost_round == 0),
+        // so `final_round + 1` would fabricate one completed iteration.
+        let n_iterations = if config.num_boost_round == 0 {
+            0
+        } else {
+            final_round + 1
+        };
+
         if let Some(ref mut cb) = callbacks {
-            cb.on_training_end(final_round + 1, stopped_early);
+            cb.on_training_end(n_iterations, stopped_early);
         }
 
         let result = TrainingResult {
-            n_iterations: final_round + 1,
+            n_iterations,
             best_iteration: Some(best_iteration),
             best_score: Some(best_loss),
             train_history,
@@ -574,17 +652,25 @@ impl BackendModel for XGBoostModel {
         // AND `early_stopping_rounds` configured. Otherwise the model was
         // trained to the full `num_boost_round` and predictions should use all
         // trees (None).
-        let effective_best_iteration = if valid_dmat.is_some() && config.early_stopping_rounds.is_some()
-        {
-            Some(best_iteration)
-        } else {
-            None
-        };
+        let effective_best_iteration =
+            if valid_dmat.is_some() && config.early_stopping_rounds.is_some() {
+                Some(best_iteration)
+            } else {
+                None
+            };
+
+        // Release XGBoost's internal training caches (gradient buffers, the
+        // prediction caches for the cached DMatrices). The model is unaffected;
+        // this just hands back memory the inference-only booster never needs.
+        booster
+            .reset()
+            .map_err(|e| GradientLSSError::BackendError(format!("Booster reset failed: {}", e)))?;
 
         Ok((
             Self {
                 booster,
                 n_params,
+                n_features: train_data.n_cols,
                 best_iteration: effective_best_iteration,
             },
             result,
@@ -595,18 +681,20 @@ impl BackendModel for XGBoostModel {
         let n_samples = data.nrows();
 
         let features_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
-        let dmatrix = DMatrix::from_dense(&features_f32, n_samples).map_err(|e| {
-            GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
-        })?;
 
         let raw_preds = match self.best_iteration {
             // Early stopping selected a best iteration: predict over trees for
             // iterations [0, best_iteration] only. XGBoost's iteration_range is
             // [begin, end) (half-open), so end = best_iteration + 1. This drops
             // the overfit tail (up to early_stopping_rounds extra iterations)
-            // that training added past the best. `PredictType::Normal` matches
-            // the semantics of the plain `predict()` used below.
+            // that training added past the best. This is the one path that
+            // still needs a DMatrix: inplace prediction has no iteration-range
+            // knob. `PredictType::Normal` matches the semantics of the inplace
+            // predict used below.
             Some(best_iteration) => {
+                let dmatrix = DMatrix::from_dense(&features_f32, n_samples).map_err(|e| {
+                    GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
+                })?;
                 let cfg = xgb::PredictConfig {
                     _type: xgb::PredictType::Normal,
                     training: false,
@@ -614,17 +702,28 @@ impl BackendModel for XGBoostModel {
                     iteration_end: (best_iteration + 1) as i64,
                     strict_shape: false,
                 };
-                let (preds, _shape) =
-                    self.booster.predict_matrix(&dmatrix, &cfg.as_json()).map_err(|e| {
+                let (preds, _shape) = self
+                    .booster
+                    .predict_matrix(&dmatrix, &cfg.as_json())
+                    .map_err(|e| {
                         GradientLSSError::BackendError(format!("Prediction failed: {}", e))
                     })?;
                 preds
             }
-            // No early stopping in effect: use all trees.
-            None => self
-                .booster
-                .predict(&dmatrix)
-                .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?,
+            // No early stopping in effect: all trees, predicted inplace
+            // straight off the feature slice — constructing a DMatrix per
+            // predict call copies and re-indexes the data for nothing and
+            // dominates small-batch latency. NaN-as-missing matches the
+            // DMatrix path.
+            None => {
+                let (preds, _shape) = self
+                    .booster
+                    .predict_from_dense(&features_f32, n_samples)
+                    .map_err(|e| {
+                        GradientLSSError::BackendError(format!("Prediction failed: {}", e))
+                    })?;
+                preds
+            }
         };
 
         Ok(prediction_to_array2(&raw_preds, n_samples, self.n_params))
@@ -665,6 +764,13 @@ impl BackendModel for XGBoostModel {
         };
         writer
             .write_all(&best_iter_sentinel.to_le_bytes())
+            .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
+
+        // n_features, appended after best_iteration with the same trailing-
+        // optional convention (older readers stop before it; this reader falls
+        // back to 0 on EOF for models saved before the field existed).
+        writer
+            .write_all(&(self.n_features as u64).to_le_bytes())
             .map_err(|e| GradientLSSError::IoError(e.to_string()))?;
 
         Ok(())
@@ -711,9 +817,19 @@ impl BackendModel for XGBoostModel {
             Err(e) => return Err(GradientLSSError::IoError(e.to_string())),
         };
 
+        // Trailing n_features (same optional convention): 0 = unknown for
+        // models saved before the field existed.
+        let mut n_features_bytes = [0u8; 8];
+        let n_features = match reader.read_exact(&mut n_features_bytes) {
+            Ok(()) => u64::from_le_bytes(n_features_bytes) as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => return Err(GradientLSSError::IoError(e.to_string())),
+        };
+
         Ok(Self {
             booster,
             n_params,
+            n_features,
             best_iteration,
         })
     }
@@ -725,15 +841,26 @@ impl BackendModel for XGBoostModel {
     ) -> Result<FeatureImportance> {
         let n_params = self.n_params;
 
-        let mut importance: HashMap<String, f64> = HashMap::new();
+        // Per-feature (split count, total gain, total cover) from the
+        // with-stats model dump. Branch lines look like
+        //   0:[f2<3.5] yes=1,no=2,missing=1,gain=100.5,cover=58
+        // Python XGBoostLSS uses booster.get_score(importance_type="gain"),
+        // where "gain"/"cover" are per-split AVERAGES — matched below.
+        let mut importance: HashMap<String, (f64, f64, f64)> = HashMap::new();
 
-        // Parse feature importance from model dump
         if let Ok(model_dump) = self.booster.dump_model(true, None) {
             for line in model_dump.lines() {
                 if let Some(start) = line.find("[f") {
                     if let Some(end) = line[start..].find('<').or_else(|| line[start..].find(']')) {
                         let feature_name = &line[start + 1..start + end];
-                        *importance.entry(feature_name.to_string()).or_insert(0.0) += 1.0;
+                        let gain = parse_dump_stat(line, "gain=").unwrap_or(0.0);
+                        let cover = parse_dump_stat(line, "cover=").unwrap_or(0.0);
+                        let entry = importance
+                            .entry(feature_name.to_string())
+                            .or_insert((0.0, 0.0, 0.0));
+                        entry.0 += 1.0;
+                        entry.1 += gain;
+                        entry.2 += cover;
                     }
                 }
             }
@@ -757,7 +884,25 @@ impl BackendModel for XGBoostModel {
         // Replicate the scores for each param column to match the expected shape.
         let mut scores_vec = Vec::with_capacity(n_features * n_params);
         for feat in &all_features {
-            let score = importance.get(feat).copied().unwrap_or(0.0);
+            let (count, gain, cover) = importance.get(feat).copied().unwrap_or((0.0, 0.0, 0.0));
+            let score = match importance_type {
+                FeatureImportanceType::Split => count,
+                // Averages over splits, matching xgboost get_score semantics.
+                FeatureImportanceType::Gain => {
+                    if count > 0.0 {
+                        gain / count
+                    } else {
+                        0.0
+                    }
+                }
+                FeatureImportanceType::Cover => {
+                    if count > 0.0 {
+                        cover / count
+                    } else {
+                        0.0
+                    }
+                }
+            };
             for _ in 0..n_params {
                 scores_vec.push(score);
             }
@@ -788,12 +933,21 @@ impl BackendModel for XGBoostModel {
     }
 
     fn num_features(&self) -> usize {
-        0
+        self.n_features
     }
 
     fn num_params(&self) -> usize {
         self.n_params
     }
+}
+
+/// Parse a numeric `key=value` stat (e.g. `gain=`, `cover=`) out of a model
+/// dump branch line; the value runs to the next ',' or end of line.
+fn parse_dump_stat(line: &str, key: &str) -> Option<f64> {
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest.find(',').unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
 }
 
 impl Backend for XGBoostBackend {
@@ -965,7 +1119,9 @@ mod tests {
         // Simple deterministic LCG so the test is reproducible without rand deps.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f64) / (u32::MAX as f64)
         };
 
@@ -1032,8 +1188,8 @@ mod tests {
         params.set_n_dist_params(1);
         // Aggressive learning + deep trees + many rounds => overfits well before
         // num_boost_round, so early stopping fires with a best in the interior.
-        params.inner.insert("eta".to_string(), "0.3".to_string());
-        params.inner.insert("max_depth".to_string(), "8".to_string());
+        params.set("eta", ParamValue::Float(0.3));
+        params.set("max_depth", ParamValue::Int(8));
 
         let config = TrainConfig {
             num_boost_round: 80,
@@ -1043,7 +1199,11 @@ mod tests {
             collect_train_metrics: false,
         };
 
-        XGBoostModel::train_with_objective_and_callbacks::<_, _, super::super::traits::HistoryCallback>(
+        XGBoostModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
             &params,
             &mut train,
             Some(&mut valid),

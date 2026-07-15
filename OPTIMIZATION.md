@@ -71,6 +71,58 @@ It is computed regardless whenever something still needs it: no validation set
 
 Mathematical constants like `ln(2*pi)` are pre-computed in the `constants` module to avoid repeated computation.
 
+### 7. XGBoost Backend: What's Built In vs. What You Tune
+
+The XGBoost backend already applies the wrapper-level optimizations from
+rust-xgboost's `docs/SERVING.md` — you get these for free:
+
+- **QuantileDMatrix training** (tree_method=hist, the default): the training
+  matrix stores pre-binned values (~1 byte per feature value instead of 4 —
+  roughly 4x less training-matrix memory) and skips the sketching pass at the
+  start of training. `max_bin` is read from your params so binning always
+  matches the booster. Any non-hist tree_method falls back to a plain DMatrix.
+- **Allocation-free training loop**: gradients feed straight into
+  `Booster::boost` (no callback trampoline, no redundant internal predict per
+  round), and per-round predictions reuse one buffer.
+- **Inplace prediction**: `predict` skips DMatrix construction entirely when no
+  early-stopping truncation applies — this dominates small-batch latency.
+- **Post-training cache release** (`booster.reset()`): XGBoost's gradient
+  buffers and training prediction caches are freed once training completes.
+
+Two knobs are deliberately left to you because they are workload/machine
+decisions:
+
+**a. Native codegen for the bundled libxgboost C++.** All tree building and
+prediction time is inside libxgboost, which the `xgb` crate compiles from
+source. Two env vars tune that build:
+
+```toml
+# .cargo/config.toml (machine-local, NOT committed — a -march=native build
+# crashes with an illegal-instruction fault on older CPUs)
+[env]
+XGB_BUILD_NATIVE = "1"   # -march=native / -mcpu=native for libxgboost
+XGB_BUILD_IPO = "1"      # link-time optimization for libxgboost
+```
+
+Pin them in `.cargo/config.toml` rather than exporting ad hoc: the build script
+watches these vars, so setting them on one cargo command and not the next
+silently rebuilds the whole C++ library back to the default configuration.
+
+**b. `nthread` for small-batch serving.** Small-batch prediction latency is
+dominated by OpenMP thread dispatch, not tree traversal — rust-xgboost measured
+`nthread=1` ~11x faster for 1 row, ~5x for 16 rows, ~2x for 100 rows, with
+multithreading winning again above roughly 1000 rows per call. gradientlss does
+not set this (training wants all cores, and it can't know your serving batch
+size); for latency-sensitive small-batch serving in the same process, set it as
+a training param — it stays on the live booster for subsequent predicts:
+
+```rust
+params.set("nthread", ParamValue::Int(1)); // serving-oriented models only
+```
+
+Note XGBoost does not persist `nthread` through save/load, so a loaded model
+predicts with all cores again; there is currently no post-load knob for it.
+
 ## Profile-Guided Optimization (PGO)
 
 PGO can provide an additional 10-20% performance improvement by optimizing based on actual usage patterns.

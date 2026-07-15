@@ -57,7 +57,11 @@ impl ZINB {
 
     /// NB ln_pmf inlined: ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
     fn nb_ln_pmf(r: f64, p: f64, k: f64) -> f64 {
-        ln_gamma(r + k) - ln_gamma(r) - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0)) + r * p.ln() + k * (-p).ln_1p()
+        ln_gamma(r + k)
+            - ln_gamma(r)
+            - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
+            + r * p.ln()
+            + k * (-p).ln_1p()
     }
 
     /// Helper method for scalar log probability (inlined formula)
@@ -124,6 +128,13 @@ impl Distribution for ZINB {
         self.initialize
     }
 
+    /// Sampling uses a discrete zero-inflation gate and Gamma–Poisson draw, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -134,7 +145,7 @@ impl Distribution for ZINB {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
                 let col2 = params.column(2);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     -self.log_prob_scalar(&[col0[i], col1[i], col2[i]], y[i])
                 })
             }
@@ -193,7 +204,8 @@ impl Distribution for ZINB {
 
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
         let (rd_r, rsd_r) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
-        let (rd_p, rsd_p) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
+        let (rd_p, rsd_p) =
+            probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
         let (rd_g, rsd_g) = gate_response_fn.derivative_batches_from_transformed(&p_gate, &t_gate);
 
         let compute = |i: usize| -> (f64, f64, f64, f64, f64, f64) {
@@ -226,10 +238,9 @@ impl Distribution for ZINB {
                 (gr, hr, gp, hp, gg, hg)
             } else {
                 // Positive counts: plain NB in (r, probs), plus the ln(1-gate) term.
-                let (grad_r_psi, hess_r) = nb_psi_diff(r, k)
-                    .unwrap_or_else(|| {
-                        (-digamma(r + k) + digamma(r), -trigamma(r + k) + trigamma(r))
-                    });
+                let (grad_r_psi, hess_r) = nb_psi_diff(r, k).unwrap_or_else(|| {
+                    (-digamma(r + k) + digamma(r), -trigamma(r + k) + trigamma(r))
+                });
                 let gr = grad_r_psi - p.ln();
                 let gp = r / p - k / probs;
                 let hp = r / (p * p) + k / (probs * probs);
@@ -397,11 +408,7 @@ mod tests {
 
         for i in 0..targets.len() {
             for j in 0..3 {
-                assert_relative_eq!(
-                    analytical.0[[i, j]],
-                    numerical.0[[i, j]],
-                    epsilon = 1e-2
-                );
+                assert_relative_eq!(analytical.0[[i, j]], numerical.0[[i, j]], epsilon = 1e-2);
                 // True (unfloored) Hessians: both paths must agree on value AND sign.
                 assert_relative_eq!(
                     analytical.1[[i, j]],

@@ -104,6 +104,18 @@ impl Mixture {
     /// and torch.nn.functional.gumbel_softmax on every call, making the Gumbel
     /// noise deterministic and reproducible.
     fn gumbel_softmax_from_logits(logits: &[f64], temperature: f64) -> Vec<f64> {
+        // Python's gumbel_softmax_fn runs nan_to_num(predt) first (replacement
+        // = nanmean); mirror that per row so a NaN logit doesn't turn the whole
+        // probability vector — and every downstream log_prob — into NaN.
+        let (sum, count) = logits.iter().fold((0.0, 0usize), |(s, c), &v| {
+            if v.is_finite() {
+                (s + v, c + 1)
+            } else {
+                (s, c)
+            }
+        });
+        let nan_replacement = if count == 0 { 0.0 } else { sum / count as f64 };
+
         // Fixed seed matching Python's torch.manual_seed(123) in gumbel_softmax_fn
         let mut rng = ChaCha8Rng::seed_from_u64(123);
 
@@ -111,6 +123,7 @@ impl Mixture {
         let perturbed: Vec<f64> = logits
             .iter()
             .map(|&x| {
+                let x = if x.is_finite() { x } else { nan_replacement };
                 let u: f64 = rng.random();
                 x + (-(-u.ln()).ln())
             })
@@ -177,12 +190,6 @@ impl Mixture {
             b + (a - b).exp().ln_1p()
         }
     }
-
-    /// Sample from Gumbel(0, 1) distribution.
-    fn sample_gumbel(rng: &mut ChaCha8Rng) -> f64 {
-        let uniform: f64 = rng.random();
-        -(-uniform.ln()).ln()
-    }
 }
 
 #[typetag::serde]
@@ -228,6 +235,34 @@ impl Distribution for Mixture {
         self.log_prob_mixture(&mix_probs, &locs, &scales, target[0])
     }
 
+    /// User-facing predicted parameters: apply the gumbel-softmax to the
+    /// mixing-logit block, matching Python's `predict_dist` (whose `param_dict`
+    /// response for `mix_prob` is `gumbel_softmax_fn`). Without this, users get
+    /// unbounded raw logits that neither sum to 1 nor look like the Python
+    /// output. Internal consumers (`nll`/`log_prob`/`sample`) keep receiving
+    /// logits and softmax them in `transform_dist_params` — do not feed the
+    /// finalized parameters back into those.
+    fn finalize_predicted_params(&self, mut params: Array2<f64>) -> Array2<f64> {
+        let m = self.n_components;
+        let mut logits = vec![0.0f64; m];
+        for mut row in params.rows_mut() {
+            for k in 0..m {
+                logits[k] = row[2 * m + k];
+            }
+            let probs = Self::gumbel_softmax_from_logits(&logits, self.temperature);
+            for (k, &p) in probs.iter().enumerate() {
+                row[2 * m + k] = p;
+            }
+        }
+        params
+    }
+
+    /// Component selection is a discrete draw — CRPS finite differences through
+    /// `sample` are not meaningful (torch's MixtureSameFamily has no rsample).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn nll(&self, params: &ArrayView2<f64>, target: &ResponseData) -> f64 {
         match target {
             ResponseData::Univariate(arr) => {
@@ -252,7 +287,10 @@ impl Distribution for Mixture {
                     let target_val = arr[i];
 
                     let log_prob = self.log_prob(row_params, &[target_val]);
-                    total_nll -= log_prob;
+                    // torch.nansum parity: a NaN log-prob contributes 0.
+                    if !log_prob.is_nan() {
+                        total_nll -= log_prob;
+                    }
                 }
 
                 total_nll
@@ -277,25 +315,19 @@ impl Distribution for Mixture {
 
             // Sample from the mixture distribution
             for s in 0..n_samples {
-                // Sample component index using Gumbel-Softmax trick
-                let gumbel_samples: Vec<f64> = (0..n_components)
-                    .map(|_| Self::sample_gumbel(&mut rng))
-                    .collect();
-
-                let logits_with_gumbel: Vec<f64> = mix_probs
-                    .iter()
-                    .zip(gumbel_samples.iter())
-                    .map(|(&prob, &gumbel)| prob.ln() + gumbel)
-                    .collect();
-
-                let component_probs = Self::softmax(&logits_with_gumbel, self.temperature);
-
-                // Sample component index
-                let mut cum_prob = 0.0;
-                let mut component_idx = 0;
+                // Exact categorical draw from the mixing probabilities,
+                // matching Python's MixtureSameFamily.sample() (a plain
+                // Categorical(probs) draw). Re-perturbing the already-softmaxed
+                // probabilities with a second Gumbel + temperature softmax (as
+                // this used to do) biases component selection toward uniform —
+                // e.g. weights (0.9, 0.1) at tau=1 selected component 1 with
+                // probability ~0.82 instead of 0.9.
                 let rand_val: f64 = rng.random();
-
-                for (i, &prob) in component_probs.iter().enumerate() {
+                let mut cum_prob = 0.0;
+                // Fall back to the last component if floating-point rounding
+                // leaves the cumulative sum a hair below rand_val.
+                let mut component_idx = n_components - 1;
+                for (i, &prob) in mix_probs.iter().enumerate() {
                     cum_prob += prob;
                     if rand_val <= cum_prob {
                         component_idx = i;
@@ -374,6 +406,55 @@ mod tests {
 
         let nll = dist.nll(&params.view(), &target_response);
         assert!(nll.is_finite());
+    }
+
+    /// Component selection must be an exact categorical draw from the mixing
+    /// probabilities. The old sampler layered a second Gumbel perturbation and
+    /// temperature softmax on top of the already-softmaxed probabilities, which
+    /// biased selection toward uniform (0.9/0.1 sampled at ~0.82/0.18).
+    #[test]
+    fn test_mixture_sample_component_frequencies() {
+        let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
+        // Well-separated components so every sample is attributable:
+        // loc_1=0, loc_2=100, scales=1 (pre-transformed), strong logit gap.
+        let params = array![[0.0, 100.0, 1.0, 1.0, 3.0, 0.0]];
+        let (mix_probs, _, _) = dist.transform_dist_params(&params.row(0).to_vec());
+
+        let n = 20_000usize;
+        let samples = dist.sample(&params.view(), n, 42);
+        let frac_comp0 = samples.column(0).iter().filter(|&&v| v < 50.0).count() as f64 / n as f64;
+
+        assert!(
+            (frac_comp0 - mix_probs[0]).abs() < 0.02,
+            "component 0 frequency {frac_comp0} should match mixing probability {}",
+            mix_probs[0]
+        );
+    }
+
+    /// `finalize_predicted_params` must softmax ONLY the mixing-logit block
+    /// (rows sum to 1) and leave locs/scales untouched — matching Python's
+    /// predict output where mix_prob columns are probabilities.
+    #[test]
+    fn test_mixture_finalize_predicted_params() {
+        let dist = Mixture::new(2, 1.0, Stabilization::None, LossFn::Nll, false);
+        let params = array![
+            [0.0, 1.0, 1.0, 2.0, 2.0, -1.0],
+            [3.0, -1.0, 0.5, 0.5, 0.0, 0.0]
+        ];
+        let out = dist.finalize_predicted_params(params.clone());
+
+        for i in 0..2 {
+            // locs/scales unchanged
+            for j in 0..4 {
+                assert_relative_eq!(out[[i, j]], params[[i, j]]);
+            }
+            // mixing block: valid probabilities summing to 1
+            let p1 = out[[i, 4]];
+            let p2 = out[[i, 5]];
+            assert!(p1 > 0.0 && p1 < 1.0);
+            assert!(p2 > 0.0 && p2 < 1.0);
+            assert_relative_eq!(p1 + p2, 1.0, epsilon = 1e-10);
+        }
     }
 
     #[test]

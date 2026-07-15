@@ -119,6 +119,13 @@ impl Distribution for ZAGamma {
         self.initialize
     }
 
+    /// Sampling uses a discrete zero-gate and Gamma rejection sampling, which is not a
+    /// smooth function of the parameters under a fixed seed — CRPS finite
+    /// differences through it are meaningless (torch has no rsample here either).
+    fn has_reparameterizable_sampler(&self) -> bool {
+        false
+    }
+
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
         self.log_prob_scalar(params, target[0])
     }
@@ -129,7 +136,7 @@ impl Distribution for ZAGamma {
                 let col0 = params.column(0);
                 let col1 = params.column(1);
                 let col2 = params.column(2);
-                crate::distributions::util::par_sum(y.len(), |i| {
+                crate::distributions::util::par_nansum(y.len(), |i| {
                     let y_val = y[i];
                     if y_val < 0.0 {
                         f64::INFINITY

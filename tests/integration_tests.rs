@@ -415,11 +415,10 @@ mod xgboost_tests {
                     w.view(),
                 )
                 .unwrap(),
-                None => <XGBoostBackend as Backend>::Dataset::from_data(
-                    features.view(),
-                    labels.view(),
-                )
-                .unwrap(),
+                None => {
+                    <XGBoostBackend as Backend>::Dataset::from_data(features.view(), labels.view())
+                        .unwrap()
+                }
             };
             let params = XGBoostBackend::create_params(model.n_params());
             model
