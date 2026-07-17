@@ -123,6 +123,35 @@ params.set("nthread", ParamValue::Int(1)); // serving-oriented models only
 Note XGBoost does not persist `nthread` through save/load, so a loaded model
 predicts with all cores again; there is currently no post-load knob for it.
 
+**c. lib_lightgbm build (measured: not worth it on Apple Silicon).** Unlike the
+`xgb` crate, `lgbm-sys` links a prebuilt `lib_lightgbm` (Homebrew on macOS) and
+honors a `LIGHTGBM_LIB_DIR` override, so a source-built library can be swapped
+in without touching any crate. We A/B'd this on an M-series Mac: LightGBM
+v4.6.0 built with `-mcpu=native` + CMake IPO vs the stock Homebrew 4.6.0 dylib,
+using `examples/bench_lgbm_lib.rs` (50k×20 Gaussian, 100 rounds, medians of 5,
+three interleaved rounds). Result: **no measurable difference** (~1.36–1.42s
+medians both sides, well inside run-to-run spread) — Homebrew already builds
+`-O3`, and arm64's NEON baseline leaves `-mcpu=native` nothing to unlock.
+
+On **x86-64 servers** this same swap is worth re-testing (AVX2/AVX-512 are not
+baseline there, so a `-march=native` build can help materially):
+
+```bash
+git clone --depth 1 --branch v4.6.0 --recursive https://github.com/microsoft/LightGBM
+cd LightGBM
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="-march=native" -DCMAKE_CXX_FLAGS="-march=native" \
+  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=TRUE
+cmake --build build -j --target _lightgbm
+```
+
+then set `LIGHTGBM_LIB_DIR = "/path/to/LightGBM"` in the machine-local
+`.cargo/config.toml` `[env]` block (same non-portability caveat as
+`XGB_BUILD_NATIVE`) and re-run `bench_lgbm_lib` against the system library.
+On macOS also repoint the dylib's install names first (`install_name_tool -id
+<abs path>` and `-change '@rpath/libomp.dylib' <abs libomp path>`), or the
+binary won't resolve it at runtime.
+
 ## Profile-Guided Optimization (PGO)
 
 PGO can provide an additional 10-20% performance improvement by optimizing based on actual usage patterns.
