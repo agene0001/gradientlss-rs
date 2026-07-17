@@ -108,6 +108,13 @@ Pin them in `.cargo/config.toml` rather than exporting ad hoc: the build script
 watches these vars, so setting them on one cargo command and not the next
 silently rebuilds the whole C++ library back to the default configuration.
 
+Measured on an M-series Mac (`profile_nb_xgb`, 50k×20 NegBinom, 100 rounds,
+9 interleaved pairs): native+IPO median 801ms vs default 822ms — a small
+single-digit-percent gain near the noise floor, consistent with arm64's NEON
+baseline leaving little for native codegen (see the lib_lightgbm result in
+§c). Kept enabled since the rebuild is one-time and it never regresses; on
+x86-64 (AVX2/AVX-512) expect materially more.
+
 **b. `nthread` for small-batch serving.** Small-batch prediction latency is
 dominated by OpenMP thread dispatch, not tree traversal — rust-xgboost measured
 `nthread=1` ~11x faster for 1 row, ~5x for 16 rows, ~2x for 100 rows, with
