@@ -2060,7 +2060,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "xgb"
 version = "3.3.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#3afb6ef4b6fa2a4c39aaa3405c1f7968b0b3da25"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#d940f51feb3e34627cba71fa472946be898dfddf"
 dependencies = [
  "derive_builder",
  "indexmap",
@@ -2073,7 +2073,7 @@ dependencies = [
 [[package]]
 name = "xgboost_lib-sys"
 version = "3.3.0"
-source = "git+https://github.com/agene0001/rust-xgboost?branch=master#3afb6ef4b6fa2a4c39aaa3405c1f7968b0b3da25"
+source = "git+https://github.com/agene0001/rust-xgboost?branch=master#d940f51feb3e34627cba71fa472946be898dfddf"
 dependencies = [
  "bindgen",
  "cmake",
