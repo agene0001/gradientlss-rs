@@ -633,14 +633,14 @@ pub trait Distribution: Send + Sync {
         let inner_iters = (max_iter / 4).min(20);
         let total_iters = max_iter * inner_iters;
 
-        // Run the optimizer
+        // Run the optimizer. No target_cost: argmin treats it as "stop once
+        // best cost <= target", and a total NLL is legitimately negative
+        // whenever the ML density exceeds 1 (e.g. small-scale continuous
+        // targets) — a 0.0 target froze those fits at their first
+        // zero-crossing iterate, corrupting dist_select rankings and
+        // `initialize: true` start values. Python runs the full epoch budget.
         let result = Executor::new(problem, solver)
-            .configure(|state| {
-                state
-                    .param(init_params)
-                    .max_iters(total_iters as u64)
-                    .target_cost(0.0)
-            })
+            .configure(|state| state.param(init_params).max_iters(total_iters as u64))
             .run();
 
         match result {
