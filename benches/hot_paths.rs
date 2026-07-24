@@ -152,6 +152,42 @@ fn bench_start_values(c: &mut Criterion) {
     group.finish();
 }
 
+/// The per-round NegBinom passes: gradients+hessians on raw margins and NLL on
+/// transformed params. Counts are drawn NB-ish with mean ~14 (mostly inside
+/// `nb_psi_diff`/`nb_lgamma_ratio`'s integer fast path, tail into the
+/// special-function fallback), matching `examples/profile_poisson_vs_nb.rs`.
+fn bench_negbinom_passes(c: &mut Criterion) {
+    let n = 100_000;
+    let dist = NegativeBinomial::default();
+    let mut state = 0x5eed_cafeu64;
+    let mut preds = Array2::zeros((n, 2));
+    let mut y = Array1::zeros(n);
+    for i in 0..n {
+        preds[[i, 0]] = 1.5 + lcg(&mut state);
+        preds[[i, 1]] = (lcg(&mut state) - 0.5) * 2.0;
+        y[i] = ((-(1.0 - lcg(&mut state)).ln()) * 14.0).floor();
+    }
+    let transformed = dist.transform_params(&preds.view());
+
+    c.bench_function("hot_paths/negbinom_gradients_100k", |b| {
+        b.iter(|| {
+            let yv = y.view();
+            let target = ResponseData::Univariate(&yv);
+            black_box(
+                dist.compute_gradients_and_hessians(black_box(&preds.view()), &target, None)
+                    .unwrap(),
+            )
+        });
+    });
+    c.bench_function("hot_paths/negbinom_nll_100k", |b| {
+        b.iter(|| {
+            let yv = y.view();
+            let target = ResponseData::Univariate(&yv);
+            black_box(dist.nll(black_box(&transformed.view()), &target))
+        });
+    });
+}
+
 fn bench_mvn_nll(c: &mut Criterion) {
     let n = 10_000;
     let dist = MVN::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
@@ -222,6 +258,7 @@ criterion_group!(
     bench_spline_flow_gradients,
     bench_crps_gradients,
     bench_start_values,
+    bench_negbinom_passes,
     bench_mvn_nll,
     bench_spline_flow_nll,
     bench_gaussian_control

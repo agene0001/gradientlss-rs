@@ -124,6 +124,15 @@ impl<B: Backend> GradientLSS<B> {
     /// This creates a data structure that can be serialized and used with
     /// Python's shap library for model interpretation.
     ///
+    /// Note: `feature_importance` is keyed by distribution parameter, but the
+    /// values are currently the WHOLE-booster aggregate importance repeated
+    /// under each key — both backends train one booster for all parameters and
+    /// report a single importance vector (see `feature_importance`). Python's
+    /// `shap.plots.bar(shap_values[:, :, param])` genuinely attributes per
+    /// parameter; splitting importance per output (grouping trees by output
+    /// index) is not implemented yet, so don't read these keys as "drivers of
+    /// loc vs scale".
+    ///
     /// # Arguments
     /// * `features` - Feature matrix to explain
     /// * `feature_names` - Optional feature names
