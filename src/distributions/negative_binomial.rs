@@ -49,6 +49,28 @@ pub(crate) fn nb_psi_diff(r: f64, k: f64) -> Option<(f64, f64)> {
     }
 }
 
+/// `ln_gamma(r+k) - ln_gamma(r)` for the same integer-k band as `nb_psi_diff`:
+/// Γ(r+k)/Γ(r) = Π_{j=0}^{k-1} (r+j), so the lgamma difference collapses to k
+/// multiplies and a single `ln` instead of two lgamma evaluations. The `r`
+/// bound keeps the running product below f64 overflow: it is at most
+/// (r+40)^40, which stays finite for r < 1e7 — response functions never push
+/// `total_count` near that in practice, and the fallback is exact anyway.
+///
+/// Shared with `ZINB` (same NB positive-count log-pmf).
+#[inline]
+pub(crate) fn nb_lgamma_ratio(r: f64, k: f64) -> Option<f64> {
+    if k >= 0.0 && k <= 40.0 && k == k.trunc() && r < 1e7 {
+        let kk = k as u32;
+        let mut prod = 1.0;
+        for j in 0..kk {
+            prod *= r + j as f64;
+        }
+        Some(prod.ln())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegativeBinomial {
     params: Vec<DistributionParam>,
@@ -110,8 +132,7 @@ impl NegativeBinomial {
         // They are complementary: statrs_p = 1 - probs
         let p = 1.0 - probs;
         // ln_pmf = ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
-        ln_gamma(r + k)
-            - ln_gamma(r)
+        nb_lgamma_ratio(r, k).unwrap_or_else(|| ln_gamma(r + k) - ln_gamma(r))
             - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
             + r * p.ln()
             + k * (-p).ln_1p()
@@ -239,8 +260,12 @@ impl Distribution for NegativeBinomial {
             let (grad_r_psi, hess_r) = nb_psi_diff(r, k)
                 .unwrap_or_else(|| (-digamma(r + k) + digamma(r), -trigamma(r + k) + trigamma(r)));
             let grad_r = grad_r_psi - one_minus_probs.ln();
-            let grad_probs = r / one_minus_probs - k / probs;
-            let hess_probs = r / (one_minus_probs * one_minus_probs) + k / (probs * probs);
+            // Two reciprocals instead of four independent divisions — f64
+            // division is the throughput bottleneck of this loop.
+            let inv_1mp = 1.0 / one_minus_probs;
+            let inv_p = 1.0 / probs;
+            let grad_probs = r * inv_1mp - k * inv_p;
+            let hess_probs = r * (inv_1mp * inv_1mp) + k * (inv_p * inv_p);
 
             let r0 = rd_r[i];
             let rs0 = rsd_r[i];
@@ -400,6 +425,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_nb_lgamma_ratio_matches_ln_gamma() {
+        // The product form is exact math; the two forms differ only by float
+        // rounding, and at small r the two-lgamma difference itself carries
+        // ~1e-9 relative cancellation error (the product side is the more
+        // accurate one there). Cover small/large r across the k band, plus the
+        // fallback conditions.
+        for &r in &[1e-6, 0.37, 1.0, 5.5, 123.4, 9.9e6] {
+            for &k in &[0.0, 1.0, 2.0, 17.0, 40.0] {
+                let got = nb_lgamma_ratio(r, k).unwrap();
+                let want = ln_gamma(r + k) - ln_gamma(r);
+                assert_relative_eq!(got, want, epsilon = 1e-8, max_relative = 1e-8);
+            }
+        }
+        assert_eq!(nb_lgamma_ratio(5.0, 41.0), None);
+        assert_eq!(nb_lgamma_ratio(5.0, 2.5), None);
+        assert_eq!(nb_lgamma_ratio(5.0, -1.0), None);
+        assert_eq!(nb_lgamma_ratio(1e7, 3.0), None);
     }
 
     #[test]

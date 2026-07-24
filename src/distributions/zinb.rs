@@ -57,8 +57,8 @@ impl ZINB {
 
     /// NB ln_pmf inlined: ln_gamma(r+k) - ln_gamma(r) - ln_gamma(k+1) + r*ln(p) + k*ln(1-p)
     fn nb_ln_pmf(r: f64, p: f64, k: f64) -> f64 {
-        ln_gamma(r + k)
-            - ln_gamma(r)
+        crate::distributions::negative_binomial::nb_lgamma_ratio(r, k)
+            .unwrap_or_else(|| ln_gamma(r + k) - ln_gamma(r))
             - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
             + r * p.ln()
             + k * (-p).ln_1p()
