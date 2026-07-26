@@ -285,7 +285,7 @@ mod tests {
     fn test_dirichlet_nll() {
         let dist = Dirichlet::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
         // Params are in already-transformed space (concentrations already exp'd)
-        let params = array![[1.0, 1.0], [2.718281828, 1.0]];
+        let params = array![[1.0, 1.0], [std::f64::consts::E, 1.0]];
         let target = array![[0.5, 0.5], [0.7, 0.3]];
         let target_response = ResponseData::Multivariate(&target.view());
 
@@ -297,7 +297,7 @@ mod tests {
     fn test_dirichlet_sample() {
         let dist = Dirichlet::new(2, Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
         // Params are in already-transformed space (concentrations already exp'd)
-        let params = array![[1.0, 1.0], [2.718281828, 1.0]];
+        let params = array![[1.0, 1.0], [std::f64::consts::E, 1.0]];
         let samples = dist.sample(&params.view(), 1000, 123);
 
         // Should have shape (n_samples, n_obs * n_targets) = (1000, 2*2) = (1000, 4)

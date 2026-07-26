@@ -21,8 +21,8 @@ pub const SQRT_2PI: f64 = 2.5066282746310002;
 /// ln(√(2π)) = 0.5 * ln(2π) ≈ 0.9189385332046727
 pub const LOG_SQRT_2PI: f64 = 0.9189385332046727;
 
-/// 1 / π ≈ 0.3183098861837907
-pub const INV_PI: f64 = 0.3183098861837907;
+/// 1 / π ≈ 0.3183098861837907 (aliases the std constant for full precision)
+pub const INV_PI: f64 = std::f64::consts::FRAC_1_PI;
 
 /// Epsilon used by the zero-adjusted (ZA*) distributions to clamp zero targets
 /// before evaluating the continuous base density.
