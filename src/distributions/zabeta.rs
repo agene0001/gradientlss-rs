@@ -222,7 +222,7 @@ mod tests {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
         // Test with zero target - params are already transformed
-        let params = vec![2.718281828, 2.718281828, 0.5]; // concentration1=e, concentration0=e, gate=0.5
+        let params = vec![std::f64::consts::E, std::f64::consts::E, 0.5]; // concentration1=e, concentration0=e, gate=0.5
         let target = vec![0.0];
 
         let log_p = dist.log_prob(&params, &target);
@@ -234,7 +234,7 @@ mod tests {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
         // Test with continuous target - params are already transformed
-        let params = vec![2.718281828, 2.718281828, 0.5]; // concentration1=e, concentration0=e, gate=0.5
+        let params = vec![std::f64::consts::E, std::f64::consts::E, 0.5]; // concentration1=e, concentration0=e, gate=0.5
         let target = vec![0.5];
 
         let log_p = dist.log_prob(&params, &target);
@@ -246,7 +246,7 @@ mod tests {
         let dist = ZABeta::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
 
         // Test with invalid target (> 1) - params are already transformed
-        let params = vec![2.718281828, 2.718281828, 0.5];
+        let params = vec![std::f64::consts::E, std::f64::consts::E, 0.5];
         let target = vec![1.5];
 
         let log_p = dist.log_prob(&params, &target);

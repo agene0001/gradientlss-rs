@@ -958,7 +958,7 @@ mod tests {
             ParamValue::Int(42)
         ));
         assert!(matches!(
-            json_to_param_value(&serde_json::json!(3.14)),
+            json_to_param_value(&serde_json::json!(3.5)),
             ParamValue::Float(_)
         ));
         assert!(matches!(
