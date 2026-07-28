@@ -219,6 +219,35 @@ pub enum CvScheme {
     TimeSeries,
 }
 
+/// A data-dependent transform fitted INSIDE each CV fold.
+///
+/// Preprocessing that learns from the data — imputation being the motivating
+/// case — must be fitted on the fold's TRAIN rows only. Fitting it once on the
+/// whole matrix before folding lets the fitted state encode the very rows each
+/// fold then scores against, which quietly flatters every CV number and so
+/// biases model selection.
+///
+/// Implementors receive the fold's train/valid feature blocks and the trial's
+/// sampled parameters, so the transform's own hyperparameters (matrix-imputer
+/// `rank`, KNN `k`, …) can be tuned in the same search as the model's. Called
+/// once per (trial, fold); keep it cheap.
+///
+/// Labels are deliberately not passed: a transform that reads y is a target
+/// leak waiting to happen.
+pub trait FoldTransform: Sync {
+    /// Fit on `train_x` and apply to both blocks, in place.
+    ///
+    /// `trial_params` holds every value the study sampled for this trial,
+    /// including any the transform declared. Returning `Err` marks the fold
+    /// unscorable (recorded as infinite loss) rather than aborting the study.
+    fn fit_transform(
+        &self,
+        train_x: &mut Array2<f64>,
+        valid_x: &mut Array2<f64>,
+        trial_params: &HashMap<String, Value>,
+    ) -> Result<(), String>;
+}
+
 /// Configuration for hyperparameter optimization.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
@@ -330,6 +359,27 @@ pub fn hyper_opt_with_config<B: Backend>(
     labels: &Array1<f64>,
     hp_dict: &HashMap<String, Value>,
     config: HyperOptConfig,
+) -> Result<HyperOptResult, Box<dyn std::error::Error>> {
+    hyper_opt_with_transform(model, features, labels, hp_dict, config, None)
+}
+
+/// [`hyper_opt_with_config`] plus a [`FoldTransform`] fitted inside each CV
+/// fold.
+///
+/// Use this when preprocessing learns from the data — imputation above all.
+/// The plain entry point above passes `None` and is exactly equivalent to the
+/// previous behaviour, so existing callers are unaffected.
+///
+/// Because the transform sees each trial's sampled parameters, its own
+/// hyperparameters can be declared in `hp_dict` and tuned jointly with the
+/// model's, scored on folds the transform never fitted on.
+pub fn hyper_opt_with_transform<B: Backend>(
+    model: &mut GradientLSS<B>,
+    features: &Array2<f64>,
+    labels: &Array1<f64>,
+    hp_dict: &HashMap<String, Value>,
+    config: HyperOptConfig,
+    fold_transform: Option<&dyn FoldTransform>,
 ) -> Result<HyperOptResult, Box<dyn std::error::Error>> {
     use std::time::Instant;
 
@@ -489,6 +539,8 @@ pub fn hyper_opt_with_config<B: Backend>(
             &config.pruning,
             &pruner_state,
             n_completed_trials,
+            fold_transform,
+            &trial_params,
         );
 
         // Report result to optimizers (even for pruned trials). `cv_score` is
@@ -592,6 +644,8 @@ fn cv_with_pruning<B: Backend>(
     pruning_strategy: &PruningStrategy,
     pruner_state: &PrunerState,
     n_completed_trials: usize,
+    fold_transform: Option<&dyn FoldTransform>,
+    trial_params: &HashMap<String, Value>,
 ) -> (f64, bool, Vec<f64>, Vec<usize>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
@@ -679,6 +733,22 @@ fn cv_with_pruning<B: Backend>(
                 (train_features, train_labels, test_features, test_labels)
             }
         };
+
+        // Fit-inside-the-fold preprocessing. Runs AFTER the split so the
+        // transform only ever sees this fold's training rows — the whole point
+        // of the hook. A failure here makes the fold unscorable rather than
+        // killing the study, matching how the dataset-construction failures
+        // below are handled.
+        let (mut train_features, mut test_features) = (train_features, test_features);
+        if let Some(t) = fold_transform
+            && let Err(e) = t.fit_transform(&mut train_features, &mut test_features, trial_params)
+        {
+            if std::env::var("GRADIENTLSS_VERBOSE").is_ok() {
+                eprintln!("fold {i}: fold transform failed ({e}); scoring as infinite");
+            }
+            intermediate_scores.push(f64::INFINITY);
+            continue;
+        }
 
         let mut train_data = match B::Dataset::from_data(train_features.view(), train_labels.view())
         {
@@ -1139,6 +1209,8 @@ mod xgboost_hyper_opt_tests {
                     &PruningStrategy::None,
                     &pruner_state,
                     0,
+                    None,
+                    &HashMap::new(),
                 );
                 assert!(score.is_finite());
             }
