@@ -240,10 +240,17 @@ pub trait FoldTransform: Sync {
     /// `trial_params` holds every value the study sampled for this trial,
     /// including any the transform declared. Returning `Err` marks the fold
     /// unscorable (recorded as infinite loss) rather than aborting the study.
+    /// `train_idx` / `valid_idx` are the rows' positions in the ORIGINAL
+    /// feature matrix, in the same order as the blocks handed over. Transforms
+    /// that key off per-row identity — a per-player median, a forward fill
+    /// within a player's chronological games — need them to recover which
+    /// entity each row belongs to; purely numeric transforms can ignore them.
     fn fit_transform(
         &self,
         train_x: &mut Array2<f64>,
         valid_x: &mut Array2<f64>,
+        train_idx: &[usize],
+        valid_idx: &[usize],
         trial_params: &HashMap<String, Value>,
     ) -> Result<(), String>;
 }
@@ -667,7 +674,8 @@ fn cv_with_pruning<B: Backend>(
         // Partition fold `i` into (train, test). `TimeSeries` trains only on rows
         // strictly before the test segment (no future leakage); `KFold`/holdout
         // trains on all other rows.
-        let (train_features, train_labels, test_features, test_labels) = if time_series {
+        let (train_features, train_labels, test_features, test_labels, train_idx, valid_idx) =
+            if time_series {
             let train_end = (i + 1) * ts_seg;
             let test_end = if i == n_iters - 1 {
                 n_samples
@@ -679,6 +687,8 @@ fn cv_with_pruning<B: Backend>(
                 labels.slice(s![..train_end]).to_owned(),
                 features.slice(s![train_end..test_end, ..]).to_owned(),
                 labels.slice(s![train_end..test_end]).to_owned(),
+                (0..train_end).collect::<Vec<usize>>(),
+                (train_end..test_end).collect::<Vec<usize>>(),
             )
         } else {
             let (test_start, test_end) = if single_holdout {
@@ -703,6 +713,8 @@ fn cv_with_pruning<B: Backend>(
                     labels.select(Axis(0), &train_idx),
                     features.select(Axis(0), test_idx),
                     labels.select(Axis(0), test_idx),
+                    train_idx.clone(),
+                    test_idx.to_vec(),
                 )
             } else {
                 // Contiguous split (single holdout, or no permutation supplied).
@@ -730,7 +742,19 @@ fn cv_with_pruning<B: Backend>(
                             continue;
                         }
                     };
-                (train_features, train_labels, test_features, test_labels)
+                // Contiguous arms: indices are the ranges themselves, in the
+                // same order the blocks were concatenated.
+                let train_idx: Vec<usize> =
+                    (0..test_start).chain(test_end..n_samples).collect();
+                let valid_idx: Vec<usize> = (test_start..test_end).collect();
+                (
+                    train_features,
+                    train_labels,
+                    test_features,
+                    test_labels,
+                    train_idx,
+                    valid_idx,
+                )
             }
         };
 
@@ -741,7 +765,13 @@ fn cv_with_pruning<B: Backend>(
         // below are handled.
         let (mut train_features, mut test_features) = (train_features, test_features);
         if let Some(t) = fold_transform
-            && let Err(e) = t.fit_transform(&mut train_features, &mut test_features, trial_params)
+            && let Err(e) = t.fit_transform(
+                &mut train_features,
+                &mut test_features,
+                &train_idx,
+                &valid_idx,
+                trial_params,
+            )
         {
             if std::env::var("GRADIENTLSS_VERBOSE").is_ok() {
                 eprintln!("fold {i}: fold transform failed ({e}); scoring as infinite");
