@@ -255,6 +255,12 @@ pub trait FoldTransform: Sync {
     ) -> Result<(), String>;
 }
 
+/// Search-space keys with this prefix are handed to the [`FoldTransform`] only
+/// and are NOT forwarded to the boosting backend. Use it for anything that
+/// parameterizes preprocessing (imputer rank, neighbour count, …) so a single
+/// TPE study can tune the pipeline and the model together.
+pub const TRANSFORM_PARAM_PREFIX: &str = "__";
+
 /// Configuration for hyperparameter optimization.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
@@ -520,6 +526,13 @@ pub fn hyper_opt_with_transform<B: Backend>(
         let mut backend_params = B::create_params(model.n_params());
 
         for (key, value) in &trial_params {
+            // Transform-only axes (reserved `__` prefix) configure the
+            // `FoldTransform`, not the booster. Forwarding them would make
+            // XGBoost / LightGBM log an "unrecognized parameter" warning on
+            // every trial, and a strict backend could reject the fit outright.
+            if key.starts_with(TRANSFORM_PARAM_PREFIX) {
+                continue;
+            }
             let param_value = json_to_param_value(value);
             backend_params.set(key, param_value);
         }
