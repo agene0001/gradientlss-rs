@@ -302,6 +302,27 @@ pub struct HyperOptConfig {
     /// because it was bad, and letting those advance the counter would end a
     /// search that is still exploring productively.
     pub plateau_patience: Option<u32>,
+    /// A previous search's winning params + score, replayed into the TPE
+    /// optimizers as an observation BEFORE trial 1.
+    ///
+    /// A sweep that runs many searches over the same data with only a
+    /// preprocessing or scoring change between them re-derives the same
+    /// hyperparameters from scratch every time. Seeding the optimizers with a
+    /// sibling search's answer biases the early trials toward a region already
+    /// known to work, without constraining the search: TPE still explores, so
+    /// a run that genuinely wants different params still finds them.
+    ///
+    /// This is deliberately NOT a way to skip searching. The prior is told to
+    /// the optimizers only; it never seeds `best_params`, so it cannot be
+    /// returned as a result without being re-drawn and re-scored on this run's
+    /// own folds. Combined with [`HyperOptConfig::plateau_patience`], a search
+    /// whose prior still wins exits in a handful of trials instead of all of
+    /// them.
+    ///
+    /// Keys name params in the same `hp_dict` namespace; unknown keys are
+    /// ignored, and values outside a spec's range are clamped into it. `None`
+    /// (the default) searches cold.
+    pub warm_start: Option<(HashMap<String, Value>, f64)>,
     /// Whether to print progress
     pub verbose: bool,
 }
@@ -319,6 +340,7 @@ impl Default for HyperOptConfig {
             early_stopping_rounds: Some(10),
             max_minutes: None,
             plateau_patience: None,
+            warm_start: None,
             verbose: true,
         }
     }
@@ -406,6 +428,38 @@ pub fn hyper_opt_with_config<B: Backend>(
 /// Because the transform sees each trial's sampled parameters, its own
 /// hyperparameters can be declared in `hp_dict` and tuned jointly with the
 /// model's, scored on folds the transform never fitted on.
+/// Encode a caller-facing JSON value into the TPE optimizer's raw space — the
+/// inverse of the raw -> param conversion in the trial loop (ln for log
+/// scales, choice index for categoricals). Used to replay a prior observation
+/// via [`HyperOptConfig::warm_start`].
+///
+/// Returns `None` when the value cannot be placed in this param's space — a
+/// wrong JSON type, or a categorical the choice list no longer contains.
+/// Out-of-range numerics are CLAMPED rather than rejected: a stale prior near
+/// a moved range boundary is still a useful hint, and an out-of-range `tell`
+/// would error, letting a stale cache entry break an otherwise fine search.
+fn value_to_raw(param_type: &HyperParamType, value: &Value) -> Option<f64> {
+    match param_type {
+        HyperParamType::Float { low, high, log } => {
+            let v = value.as_f64()?.clamp(*low, *high);
+            Some(if *log { v.ln() } else { v })
+        }
+        HyperParamType::Int { low, high, log } => {
+            // Accept a float too: JSON round-trips can turn 8 into 8.0.
+            let v = value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|f| f.round() as i64))?
+                .clamp(*low, *high) as f64;
+            Some(if *log { v.ln() } else { v })
+        }
+        // Match by VALUE, not index: a reordered choice list must not silently
+        // seed a different option.
+        HyperParamType::Categorical { choices } => {
+            choices.iter().position(|c| c == value).map(|i| i as f64)
+        }
+    }
+}
+
 pub fn hyper_opt_with_transform<B: Backend>(
     model: &mut GradientLSS<B>,
     features: &Array2<f64>,
@@ -459,6 +513,37 @@ pub fn hyper_opt_with_transform<B: Backend>(
                     optimizers.insert(spec.name.clone(), optimizer);
                 }
             }
+        }
+    }
+
+    // WARM START: replay a prior search's winner as an observation on every
+    // optimizer, before any trial runs. The encoding below is the exact
+    // INVERSE of the raw -> param conversion in the trial loop (ln for log
+    // scales, choice index for categoricals), so the prior lands in the same
+    // space the optimizer samples from.
+    if let Some((prior_params, prior_score)) = &config.warm_start {
+        let mut seeded = 0usize;
+        for spec in &specs {
+            let Some(value) = prior_params.get(&spec.name) else {
+                continue;
+            };
+            let Some(optimizer) = optimizers.get_mut(&spec.name) else {
+                continue;
+            };
+            let Some(raw) = value_to_raw(&spec.param_type, value) else {
+                continue;
+            };
+            if optimizer.tell(raw, *prior_score).is_ok() {
+                seeded += 1;
+            }
+        }
+        if config.verbose {
+            eprintln!(
+                "Warm start: seeded {}/{} params from a prior search (score {:.6})",
+                seeded,
+                specs.len(),
+                prior_score
+            );
         }
     }
 
@@ -1338,5 +1423,69 @@ mod xgboost_hyper_opt_tests {
              not the num_boost_round budget",
             result.opt_rounds
         );
+    }
+}
+
+#[cfg(test)]
+mod warm_start_tests {
+    use super::*;
+
+    /// The correctness claim for warm start: a prior must land where the
+    /// optimizer would itself have sampled that value from, so encoding and
+    /// materializing back must be the identity.
+    #[test]
+    fn value_to_raw_round_trips_for_every_param_type() {
+        // Float, linear and log.
+        let pt = HyperParamType::Float { low: 0.01, high: 0.5, log: false };
+        assert_eq!(value_to_raw(&pt, &Value::from(0.25)), Some(0.25));
+        let pt = HyperParamType::Float { low: 1e-6, high: 1e-1, log: true };
+        let raw = value_to_raw(&pt, &Value::from(1e-3)).unwrap();
+        assert!((raw.exp() - 1e-3).abs() < 1e-12, "log float round-trip: {}", raw.exp());
+
+        // Int, linear and log.
+        let pt = HyperParamType::Int { low: 2, high: 12, log: false };
+        assert_eq!(value_to_raw(&pt, &Value::from(7)), Some(7.0));
+        let pt = HyperParamType::Int { low: 10, high: 1000, log: true };
+        let raw = value_to_raw(&pt, &Value::from(100)).unwrap();
+        assert_eq!(raw.exp().round() as i64, 100);
+
+        // Categorical -> index.
+        let pt = HyperParamType::Categorical {
+            choices: vec![Value::from("a"), Value::from("b"), Value::from("c")],
+        };
+        assert_eq!(value_to_raw(&pt, &Value::from("b")), Some(1.0));
+    }
+
+    /// A stale prior outside a since-moved range must be pulled INTO range,
+    /// not told out-of-range (which `tell` errors on).
+    #[test]
+    fn out_of_range_values_are_clamped_not_rejected() {
+        let pt = HyperParamType::Float { low: 0.1, high: 0.5, log: false };
+        assert_eq!(value_to_raw(&pt, &Value::from(9.9)), Some(0.5));
+        assert_eq!(value_to_raw(&pt, &Value::from(-9.9)), Some(0.1));
+    }
+
+    /// A choice list that changed between searches must not silently seed a
+    /// DIFFERENT option.
+    #[test]
+    fn categorical_misses_when_the_choice_is_gone() {
+        let pt = HyperParamType::Categorical {
+            choices: vec![Value::from("gbtree"), Value::from("dart")],
+        };
+        assert_eq!(value_to_raw(&pt, &Value::from("gblinear")), None);
+    }
+
+    /// Cache entries are untrusted input: a wrong type is a miss, not a panic.
+    #[test]
+    fn wrong_type_is_a_miss() {
+        let pt = HyperParamType::Float { low: 0.0, high: 1.0, log: false };
+        assert_eq!(value_to_raw(&pt, &Value::from("not a number")), None);
+    }
+
+    /// An int spec must accept a float that round-tripped through JSON.
+    #[test]
+    fn int_accepts_a_json_float() {
+        let pt = HyperParamType::Int { low: 1, high: 10, log: false };
+        assert_eq!(value_to_raw(&pt, &Value::from(8.0)), Some(8.0));
     }
 }
