@@ -283,6 +283,25 @@ pub struct HyperOptConfig {
     pub early_stopping_rounds: Option<usize>,
     /// Maximum time budget in minutes (None = no limit)
     pub max_minutes: Option<f64>,
+    /// Stop the study after this many CONSECUTIVE COMPLETED trials without a
+    /// new best. `None` (the default) runs every trial, as before.
+    ///
+    /// This is study-level early stopping, and it is distinct from
+    /// [`PruningStrategy`]: pruning kills an individual BAD trial partway
+    /// through its folds, but never ends the search — so a study that found
+    /// its optimum at trial 10 still pays for the remaining 90.
+    ///
+    /// Measured on the consumer's 2026-08-26 sweep: searches routinely hit
+    /// their best score in the first 10-20 trials and then spent the rest of
+    /// the budget improving by <0.11%. Whether those late gains survive to
+    /// held-out data is a separate (open) question, so the recommended
+    /// setting is generous — large enough to keep real late improvements,
+    /// small enough to cut a search that has plainly converged.
+    ///
+    /// Only COMPLETED trials count: a pruned trial was killed precisely
+    /// because it was bad, and letting those advance the counter would end a
+    /// search that is still exploring productively.
+    pub plateau_patience: Option<u32>,
     /// Whether to print progress
     pub verbose: bool,
 }
@@ -299,6 +318,7 @@ impl Default for HyperOptConfig {
             num_boost_round: 100,
             early_stopping_rounds: Some(10),
             max_minutes: None,
+            plateau_patience: None,
             verbose: true,
         }
     }
@@ -470,6 +490,7 @@ pub fn hyper_opt_with_transform<B: Backend>(
     let mut fold_start_values: Vec<Option<Array1<f64>>> = vec![None; n_fold_slots];
 
     let mut best_score = f64::INFINITY;
+    let mut trials_since_best: u32 = 0;
     let mut best_params: HashMap<String, Value> = HashMap::new();
     let mut best_rounds: usize = config.num_boost_round;
     let mut trials: Vec<TrialResult> = Vec::with_capacity(config.n_trials as usize);
@@ -580,8 +601,12 @@ pub fn hyper_opt_with_transform<B: Backend>(
         }
 
         // Track best (only from completed trials)
+        if !pruned {
+            trials_since_best = trials_since_best.saturating_add(1);
+        }
         if !pruned && cv_score < best_score {
             best_score = cv_score;
+            trials_since_best = 0;
             best_params = trial_params.clone();
             // Like Python's hyper_opt (test-mean idxmin + 1), take opt_rounds
             // from the best trial's early-stopped optimum: the mean of the
@@ -626,6 +651,24 @@ pub fn hyper_opt_with_transform<B: Backend>(
                 pruned_count,
                 trial + 1
             );
+        }
+
+        // Study-level early stop. Placed after the progress print so the last
+        // line before stopping still reports the state that triggered it.
+        if let Some(patience) = config.plateau_patience
+            && patience > 0
+            && trials_since_best >= patience
+        {
+            if config.verbose {
+                eprintln!(
+                    "Stopping at trial {}/{}: {} completed trials with no new best                      (best = {:.6})",
+                    trial + 1,
+                    config.n_trials,
+                    trials_since_best,
+                    best_score
+                );
+            }
+            break;
         }
     }
 
