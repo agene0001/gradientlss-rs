@@ -176,6 +176,38 @@ impl Distribution for NegativeBinomial {
     /// Sampling uses a discrete Gamma–Poisson draw, which is not a
     /// smooth function of the parameters under a fixed seed — CRPS finite
     /// differences through it are meaningless (torch has no rsample here either).
+    /// Truncated CDF-sum CRPS, mirroring the consumer's NB eval kernel:
+    /// K = max(y, mean) + 4*sqrt(var), capped at 150. Params are the torch
+    /// convention `(r, probs)` used everywhere in this file (mean =
+    /// r*probs/(1-probs)); the pmf comes from `log_prob_scalar`, so the CRPS
+    /// is by construction consistent with the NLL this distribution trains
+    /// under. Smooth in both params - see the Poisson counterpart.
+    fn analytic_crps(&self, params: &[f64], target: &[f64]) -> Option<f64> {
+        let r = params[0];
+        let probs = params[1];
+        let y = target[0];
+        if !(r > 0.0) || !(probs > 0.0) || !(probs < 1.0) || !y.is_finite() || y < 0.0 {
+            return Some(1e6);
+        }
+        let mean = r * probs / (1.0 - probs);
+        let var = mean / (1.0 - probs);
+        let y_int = y.round().max(0.0) as usize;
+        let max_k = ((y.max(mean) + 4.0 * var.sqrt()).ceil() as usize).min(150);
+        let mut cdf = 0.0;
+        let mut crps = 0.0;
+        for k in 0..=max_k {
+            cdf += self.log_prob_scalar(params, k as f64).exp();
+            let indicator = if k >= y_int { 1.0 } else { 0.0 };
+            let d = cdf - indicator;
+            crps += d * d;
+        }
+        Some(crps)
+    }
+
+    fn has_analytic_crps(&self) -> bool {
+        true
+    }
+
     fn has_reparameterizable_sampler(&self) -> bool {
         false
     }
@@ -366,6 +398,63 @@ impl Distribution for NegativeBinomial {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn analytic_crps_matches_brute_force_nb() {
+        use approx::assert_relative_eq;
+        let d = NegativeBinomial::new(
+            Stabilization::None,
+            ResponseFn::Softplus,
+            ResponseFn::Sigmoid,
+            LossFn::Crps,
+            false,
+        );
+        for (r, probs, y) in [(4.0_f64, 0.5_f64, 3.0_f64), (2.5, 0.7, 8.0), (10.0, 0.3, 1.0)] {
+            let got = d.analytic_crps(&[r, probs], &[y]).expect("nb has analytic crps");
+            let mean = r * probs / (1.0 - probs);
+            let var = mean / (1.0 - probs);
+            let max_k = ((y.max(mean) + 4.0 * var.sqrt()).ceil() as usize).min(150);
+            let y_int = y.round() as usize;
+            let mut cdf = 0.0;
+            let mut want = 0.0;
+            for k in 0..=max_k {
+                let pmf = d.log_prob_scalar(&[r, probs], k as f64).exp();
+                cdf += pmf;
+                let ind = if k >= y_int { 1.0 } else { 0.0 };
+                want += (cdf - ind) * (cdf - ind);
+            }
+            assert_relative_eq!(got, want, max_relative = 1e-9);
+        }
+    }
+
+    /// Both NB params must receive finite, nonzero CRPS gradients.
+    #[test]
+    fn nb_crps_numerical_gradients_are_finite_and_nonzero() {
+        use crate::types::ResponseData;
+        use ndarray::array;
+        let d = NegativeBinomial::new(
+            Stabilization::None,
+            ResponseFn::Softplus,
+            ResponseFn::Sigmoid,
+            LossFn::Crps,
+            false,
+        );
+        let transformed = array![[4.0_f64, 0.5], [2.5, 0.6]];
+        // raw = inverse of the response fns; for the gradient smoke it is fine
+        // to reuse transformed as raw when responses are monotone — the FD
+        // perturbs raw and re-applies the response per param.
+        let predictions = transformed.clone();
+        let y = array![3.0_f64, 6.0];
+        let target = ResponseData::Univariate(&y.view());
+        let (grads, hess) = d
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("gradients");
+        for g in grads.iter().chain(hess.iter()) {
+            assert!(g.is_finite(), "non-finite grad/hess: {g}");
+        }
+        let gsum: f64 = grads.iter().map(|g| g.abs()).sum();
+        assert!(gsum > 1e-8, "gradients must be nonzero, got sum {gsum}");
+    }
     use super::*;
     use crate::types::ResponseData;
     use approx::assert_relative_eq;

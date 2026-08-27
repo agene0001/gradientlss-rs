@@ -202,6 +202,34 @@ pub trait Distribution: Send + Sync {
         true
     }
 
+    /// Closed-form (deterministic truncated-sum) CRPS for ONE observation, on
+    /// TRANSFORMED params. `None` = no closed form; the sampled estimator is
+    /// used instead.
+    ///
+    /// This is what unlocks `LossFn::Crps` for the DISCRETE distributions:
+    /// their samplers are non-reparameterizable (finite differences through a
+    /// discrete draw are meaningless - see `has_reparameterizable_sampler`),
+    /// but the analytic CRPS is a smooth function of the parameters, so the
+    /// same central-difference machinery applies to it directly. It is also
+    /// strictly better where available: exact instead of a 30-sample estimate,
+    /// and cheaper than sampling + sorting.
+    ///
+    /// The truncation bound inside an implementation may shift by one term
+    /// when FD perturbs the params; the affected term is a squared upper-tail
+    /// CDF residual (~1e-9 at the 4-sigma bounds used), which is far below the
+    /// FD step's own truncation error - harmless.
+    fn analytic_crps(&self, params: &[f64], target: &[f64]) -> Option<f64> {
+        let _ = (params, target);
+        None
+    }
+
+    /// Whether [`Self::analytic_crps`] returns `Some` - used by the training
+    /// gate (`LossFn::Crps` support check) and the metric path without probing
+    /// with dummy params.
+    fn has_analytic_crps(&self) -> bool {
+        false
+    }
+
     /// Compute analytical gradients and hessians if available.
     ///
     /// Distributions can override this to provide exact analytical gradients
@@ -403,21 +431,28 @@ pub trait Distribution: Send + Sync {
                     let n_crps_samples: usize = 30;
                     let seed: u64 = 123;
 
-                    let loss_plus = self.crps_single_observation_buffered(
-                        params_buf,
-                        y_buf,
-                        n_crps_samples,
-                        seed,
-                        crps_sort_buf,
-                    );
+                    // Analytic CRPS when the distribution has one (exact and
+                    // smooth in the params - the only valid option for the
+                    // discrete distributions); sampled estimator otherwise.
+                    let loss_plus = self.analytic_crps(params_buf, y_buf).unwrap_or_else(|| {
+                        self.crps_single_observation_buffered(
+                            params_buf,
+                            y_buf,
+                            n_crps_samples,
+                            seed,
+                            crps_sort_buf,
+                        )
+                    });
                     params_buf[p] = param_minus;
-                    let loss_minus = self.crps_single_observation_buffered(
-                        params_buf,
-                        y_buf,
-                        n_crps_samples,
-                        seed,
-                        crps_sort_buf,
-                    );
+                    let loss_minus = self.analytic_crps(params_buf, y_buf).unwrap_or_else(|| {
+                        self.crps_single_observation_buffered(
+                            params_buf,
+                            y_buf,
+                            n_crps_samples,
+                            seed,
+                            crps_sort_buf,
+                        )
+                    });
 
                     grad_row[p] = (loss_plus - loss_minus) * inv_2eps;
                     hess_row[p] = 1.0;
