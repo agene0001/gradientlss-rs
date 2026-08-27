@@ -192,7 +192,7 @@ impl<B: Backend> GradientLSS<B> {
     /// `metric_fn` evaluates whichever loss the distribution was set up with —
     /// for "crps" it draws 30 samples (seed 123) and sums the empirical CRPS,
     /// not the NLL.
-    fn metric_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+    pub(crate) fn metric_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
         match self.dist.loss_fn() {
             LossFn::Nll => self.nll_on_transformed(transformed, labels),
             LossFn::Crps => {
@@ -206,6 +206,9 @@ impl<B: Backend> GradientLSS<B> {
                     if n == 0 {
                         return f64::NAN;
                     }
+                    // SUM over observations, matching `crps_score` and `nll` —
+                    // every metric this fork reports is a sum, and hyper_opt
+                    // aggregates fold scores under that convention.
                     let mut total = 0.0;
                     for i in 0..n {
                         let params: Vec<f64> = transformed.row(i).to_vec();
@@ -214,7 +217,7 @@ impl<B: Backend> GradientLSS<B> {
                             None => return f64::NAN,
                         }
                     }
-                    return total / n as f64;
+                    return total;
                 }
                 let samples = self.dist.sample(&transformed.view(), 30, 123);
                 if n_targets == 1 {
@@ -517,8 +520,10 @@ impl<B: Backend> GradientLSS<B> {
             // finalized (Mixture: softmaxed), which `nll` must not receive.
             // Mirrors hyper_opt.
             let preds = model.predict_transformed(&test_features)?;
-            let target = ResponseData::Univariate(&test_labels);
-            let score = self.dist.nll(&preds.view(), &target);
+            // Configured loss, not hardcoded NLL — see hyper_opt's fold
+            // scoring for the failure mode a mismatch causes.
+            let test_labels_owned = test_labels.to_owned();
+            let score = model.metric_on_transformed(&preds, &test_labels_owned);
             scores.push(score);
         }
 
@@ -633,9 +638,8 @@ impl<B: Backend> GradientLSS<B> {
             // Score on the internal transformed parameters (start values
             // added, no user-facing finalize) — see `cv`.
             let preds = model.predict_transformed(&test_features.view())?;
-            let test_labels_view = test_labels.view();
-            let target = ResponseData::Univariate(&test_labels_view);
-            let score = self.dist.nll(&preds.view(), &target);
+            // Configured loss, not hardcoded NLL — see `cv`.
+            let score = model.metric_on_transformed(&preds, &test_labels);
             scores.push(score);
         }
 
@@ -1258,5 +1262,41 @@ mod xgboost_tests {
             quantiles_result,
             Ok(PredictionOutput::Quantiles(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod analytic_metric_probe {
+    use super::*;
+    use crate::backend::XGBoostBackend;
+    use crate::distributions::{LossFn, Poisson, Stabilization};
+    use crate::utils::ResponseFn;
+    use ndarray::array;
+
+    /// Does the metric path actually reach the analytic-CRPS mean branch for
+    /// a Crps-configured Poisson? (2026-08-27 sweep showed sum-scale scores,
+    /// implying it does not.)
+    #[test]
+    fn metric_uses_analytic_mean_for_poisson_crps() {
+        let dist = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        eprintln!("has_analytic (concrete): {}", dist.has_analytic_crps());
+        let arced: std::sync::Arc<dyn Distribution> = std::sync::Arc::new(dist);
+        eprintln!("has_analytic (dyn):      {}", arced.has_analytic_crps());
+        let model = GradientLSS::<XGBoostBackend>::new(arced);
+        // 4 rows, rate 3.0 each
+        let transformed = array![[3.0_f64], [3.0], [3.0], [3.0]];
+        let labels = array![2.0_f64, 3.0, 4.0, 1.0];
+        let m = model.metric_on_transformed(&transformed, &labels);
+        eprintln!("metric value for 4 rows: {m:.4}");
+        // Must be the SUM of the per-row analytic values (fork convention).
+        let want: f64 = (0..4)
+            .map(|i| {
+                model
+                    .distribution()
+                    .analytic_crps(&[3.0], &[labels[i]])
+                    .expect("poisson analytic")
+            })
+            .sum();
+        assert!((m - want).abs() < 1e-9, "metric {m} != analytic sum {want}");
     }
 }

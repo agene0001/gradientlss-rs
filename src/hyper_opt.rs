@@ -982,11 +982,20 @@ fn cv_with_pruning<B: Backend>(
 
         // Score on the INTERNAL transformed parameters (start values added, no
         // user-facing finalize — Mixture's `nll` expects raw mixing logits).
+        //
+        // Scored with the model's CONFIGURED loss via `metric_on_transformed`,
+        // not a hardcoded `nll`. Under `LossFn::Nll` this is byte-identical to
+        // the old direct `nll` call (it delegates to the same function on the
+        // same transformed params). Under `LossFn::Crps` the old code ranked
+        // CRPS-trained trials — and chose their round counts — by an objective
+        // they were not optimizing, which selected hyperparameters that LOOK
+        // NLL-reasonable while the CRPS fit itself is unconverged or diverged
+        // (observed 2026-08-27: a tuned xgboost-lss Poisson CRPS model with
+        // test RMSE worse than predicting the training mean).
         let score = match fold_model.predict_transformed(&test_features.view()) {
             Ok(preds) => {
-                let test_labels_view = test_labels.view();
-                let target = crate::types::ResponseData::Univariate(&test_labels_view);
-                fold_model.distribution().nll(&preds.view(), &target)
+                let test_labels_owned = test_labels.to_owned();
+                fold_model.metric_on_transformed(&preds, &test_labels_owned)
             }
             Err(_) => f64::INFINITY,
         };
