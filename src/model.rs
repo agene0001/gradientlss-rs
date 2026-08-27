@@ -196,8 +196,27 @@ impl<B: Backend> GradientLSS<B> {
         match self.dist.loss_fn() {
             LossFn::Nll => self.nll_on_transformed(transformed, labels),
             LossFn::Crps => {
-                let samples = self.dist.sample(&transformed.view(), 30, 123);
                 let n_targets = self.dist.n_targets();
+                // Analytic CRPS when available: the metric then agrees EXACTLY
+                // with the quantity the FD gradients descend, instead of being
+                // a 30-sample estimate of it (which would make early stopping
+                // noisier than the training signal it monitors).
+                if n_targets == 1 && self.dist.has_analytic_crps() {
+                    let n = labels.len();
+                    if n == 0 {
+                        return f64::NAN;
+                    }
+                    let mut total = 0.0;
+                    for i in 0..n {
+                        let params: Vec<f64> = transformed.row(i).to_vec();
+                        match self.dist.analytic_crps(&params, &[labels[i]]) {
+                            Some(v) => total += v,
+                            None => return f64::NAN,
+                        }
+                    }
+                    return total / n as f64;
+                }
+                let samples = self.dist.sample(&transformed.view(), 30, 123);
                 if n_targets == 1 {
                     let target = ResponseData::Univariate(&labels.view());
                     self.dist.crps_score(&target, &samples.view())
@@ -397,7 +416,11 @@ impl<B: Backend> GradientLSS<B> {
         // (torch rsample analogue). Rejection/discrete samplers would turn each
         // accept/reject flip into a 1/(2ε)-amplified garbage gradient, so fail
         // fast instead (Python fails the same way: no rsample → error).
-        if self.dist.loss_fn() == LossFn::Crps && !self.dist.has_reparameterizable_sampler() {
+        if self.dist.loss_fn() == LossFn::Crps
+            && !self.dist.has_reparameterizable_sampler()
+            // An analytic CRPS sidesteps the sampler entirely, so the
+            // rejection/discrete-sampling objection does not apply.
+            && !self.dist.has_analytic_crps() {
             return Err(GradientLSSError::InvalidParameter(format!(
                 "LossFn::Crps is not supported for {}: its sampler uses rejection sampling or \
                  discrete draws, which are not differentiable (torch has no rsample for it \

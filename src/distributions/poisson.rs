@@ -91,6 +91,38 @@ impl Distribution for Poisson {
     /// Sampling uses a discrete draw, which is not a
     /// smooth function of the parameters under a fixed seed — CRPS finite
     /// differences through it are meaningless (torch has no rsample here either).
+    /// Truncated CDF-sum CRPS: sum_k (F(k) - 1{k >= round(y)})^2 up to
+    /// K = max(y, lambda) + 4*sqrt(lambda), capped at 100 - term-for-term the
+    /// consumer's Poisson CRPS eval kernel, so the training loss and the
+    /// selection metric agree on what "CRPS" means. Smooth in lambda, which is
+    /// what makes the central-difference gradients valid where the sampled
+    /// estimator's were not.
+    fn analytic_crps(&self, params: &[f64], target: &[f64]) -> Option<f64> {
+        let rate = params[0];
+        let y = target[0];
+        if !(rate > 0.0) || !y.is_finite() || y < 0.0 {
+            // Same convention as log_prob for out-of-support input: a large
+            // finite penalty keeps FD arithmetic defined (NaN/inf would poison
+            // the column means used for nan replacement).
+            return Some(1e6);
+        }
+        let y_int = y.round().max(0.0) as usize;
+        let max_k = ((y.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
+        let mut cdf = 0.0;
+        let mut crps = 0.0;
+        for k in 0..=max_k {
+            cdf += self.log_prob_scalar(params, k as f64).exp();
+            let indicator = if k >= y_int { 1.0 } else { 0.0 };
+            let d = cdf - indicator;
+            crps += d * d;
+        }
+        Some(crps)
+    }
+
+    fn has_analytic_crps(&self) -> bool {
+        true
+    }
+
     fn has_reparameterizable_sampler(&self) -> bool {
         false
     }
@@ -225,6 +257,54 @@ mod tests {
     use crate::types::ResponseData;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    /// The analytic CRPS must equal the definition it compresses: a
+    /// brute-force sum over (CDF(k) - 1{k >= y})^2 with independently
+    /// recomputed pmf terms.
+    #[test]
+    fn analytic_crps_matches_brute_force() {
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        for (lam, y) in [(3.5_f64, 4.0_f64), (0.5, 0.0), (12.0, 20.0), (7.3, 2.0)] {
+            let got = d.analytic_crps(&[lam], &[y]).expect("poisson has analytic crps");
+            // Independent recompute: pmf via the direct formula, same bound.
+            let max_k = ((y.max(lam) + 4.0 * lam.sqrt()).ceil() as usize).min(100);
+            let y_int = y.round() as usize;
+            let mut cdf = 0.0;
+            let mut want = 0.0;
+            let mut ln_fact = 0.0_f64;
+            for k in 0..=max_k {
+                if k > 0 {
+                    ln_fact += (k as f64).ln();
+                }
+                let pmf = (-lam + (k as f64) * lam.ln() - ln_fact).exp();
+                cdf += pmf;
+                let ind = if k >= y_int { 1.0 } else { 0.0 };
+                want += (cdf - ind) * (cdf - ind);
+            }
+            assert_relative_eq!(got, want, max_relative = 1e-9);
+        }
+    }
+
+    /// CRPS gradients through the analytic path must be finite and nonzero —
+    /// the property the sampled path could not deliver for a discrete
+    /// distribution (its gate rejected training outright).
+    #[test]
+    fn crps_numerical_gradients_are_finite_and_nonzero() {
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        // raw predictions (pre-response); response exp() → rates.
+        let predictions = array![[1.0_f64], [0.2], [2.0]];
+        let transformed = predictions.mapv(f64::exp);
+        let y = array![3.0_f64, 1.0, 6.0];
+        let target = ResponseData::Univariate(&y.view());
+        let (grads, hess) = d
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("gradients");
+        for g in grads.iter().chain(hess.iter()) {
+            assert!(g.is_finite(), "non-finite grad/hess: {g}");
+        }
+        let gsum: f64 = grads.iter().map(|g| g.abs()).sum();
+        assert!(gsum > 1e-8, "gradients must be nonzero, got sum {gsum}");
+    }
 
     #[test]
     fn test_poisson_creation() {
