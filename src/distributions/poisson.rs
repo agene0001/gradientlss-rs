@@ -59,6 +59,63 @@ impl Poisson {
     }
 }
 
+/// NGBoost's CRPS metric for a single Poisson rate, ported from ngboost-rs
+/// `poisson_crps_metric_value` (dist/poisson.rs): M = sum_y g(y)^2 * P(Y=y)
+/// with g(y) = lambda * dCRPS/dlambda = 2*lambda*(sum_{k>=y} pmf(k) -
+/// sum_k F(k) pmf(k)). Prefix/suffix sums over one pmf/cdf table, O(k_max).
+/// The caller-owned scratch vecs avoid per-row allocation in the hot loop.
+fn poisson_crps_metric(
+    lambda: f64,
+    pmf: &mut Vec<f64>,
+    cdf: &mut Vec<f64>,
+    fp: &mut Vec<f64>,
+    suf: &mut Vec<f64>,
+) -> f64 {
+    const CAP: usize = 200;
+    let std_dev = lambda.sqrt();
+    let y_max = (((lambda + 8.0 * std_dev).ceil() as usize).max(5)).min(CAP - 11);
+    let k_total = (((lambda + 6.0 * std_dev).ceil() as usize).max(y_max + 10)).min(CAP);
+    let len = k_total + 1;
+
+    pmf.clear();
+    cdf.clear();
+    let mut p = (-lambda).exp();
+    let mut f = 0.0;
+    for k in 0..len {
+        if k > 0 {
+            p *= lambda / k as f64;
+        }
+        f += p;
+        pmf.push(p);
+        cdf.push(f.min(1.0));
+    }
+
+    fp.clear();
+    let mut acc = 0.0;
+    for k in 0..len {
+        acc += cdf[k] * pmf[k];
+        fp.push(acc);
+    }
+    suf.clear();
+    suf.resize(len + 1, 0.0);
+    for k in (0..len).rev() {
+        suf[k] = suf[k + 1] + pmf[k];
+    }
+
+    let mut metric = 0.0;
+    for y in 0..=y_max {
+        let py = pmf[y];
+        if py < 1e-300 {
+            continue;
+        }
+        let inner_max = (((lambda + 6.0 * std_dev).ceil() as usize).max(y + 10)).min(len - 1);
+        let tail = suf[y] - suf[inner_max + 1];
+        let g = 2.0 * lambda * (tail - fp[inner_max]);
+        metric += g * g * py;
+    }
+    metric
+}
+
 impl Poisson {
     /// Closed-form CRPS gradients, replacing the FD path entirely for the
     /// 1-param Poisson.
@@ -96,28 +153,58 @@ impl Poisson {
 
         let mut gradients = Array2::zeros((n_samples, 1));
         let mut hessians = Array2::ones((n_samples, 1));
-        // Curvature-aware CRPS steps (2026-08-28 experiment): the same
-        // recurrence pass also yields the analytic second derivative,
+        // CRPS hessian mode (2026-08-28). Three arms, measured on real
+        // strikeout data (untuned xgb, 300 rounds, test CRPS; NLL twin 1.205):
         //
-        //   d2CRPS/dlambda2 = 2 sum_k [ pmf(k)^2 - (F(k) - I) * pmf(k) * (k/lambda - 1) ]
+        // * "unit"      — Python-parity hess = 1.0 (plain gradient descent):
+        //                 1.379, with a downward prediction drift that the FD
+        //                 path amplified into outright collapse.
+        // * "curvature" — analytic d2CRPS/dlambda2 floored at 1.0 (may only
+        //                 damp, never amplify — a 1e-2 floor exploded, pred
+        //                 mean 25 / RMSE 156, CRPS is not convex in lambda):
+        //                 1.230.
+        // * "metric"    — DEFAULT. NGBoost's CRPS metric preconditioner,
+        //                 M(lambda) = E_{y~Pois(lambda)}[ g(y)^2 ] with
+        //                 g(y) = lambda * dCRPS/dlambda the log-rate gradient
+        //                 (ported from ngboost-rs `poisson_crps_metric_value`).
+        //                 Positive by construction — a Riemannian metric, not
+        //                 a curvature, so no convexity caveat — this is the
+        //                 natural-gradient step in the lss framework. In
+        //                 margin space the hessian is M * (dlambda/dm / lambda)^2,
+        //                 which under the Exp response is exactly M.
         //
-        // (from dF/dlambda = -pmf and dpmf/dlambda = pmf * (k/lambda - 1)).
-        // The unit-hessian convention (Python parity) made CRPS training plain
-        // gradient descent while NLL enjoyed Newton steps — measured on real
-        // strikeout data (untuned, 300 rounds): NLL-trained test CRPS 1.205 vs
-        // CRPS-trained 1.379, i.e. the CRPS model lost at its own objective.
-        // CRPS is not convex in lambda, so the Hessian is floored at
-        // CRPS_MIN_HESS: negative-curvature rows fall back to conservative
-        // gradient steps rather than Newton overshoots.
-        // Floor at 1.0: curvature may only DAMP steps relative to the unit
-        // hessian, never amplify them. The 1e-2 floor was measured 2026-08-28
-        // to explode (negative-curvature rows became 100x steps: pred mean 25,
-        // RMSE 156). CRPS is not convex in lambda, so amplification off small
-        // hessians is structurally unsafe with XGBoost leaf values ~ g/h.
+        // The metric is floored: as lambda -> 0 both g and M vanish (M ~
+        // lambda^2), and XGBoost leaf values are ~ g/h with no line search to
+        // catch a blow-up — NGBoost itself pairs natural gradients WITH a line
+        // search. The floor bounds the amplification for near-zero-rate rows.
+        const CRPS_MIN_METRIC: f64 = 0.05;
         const CRPS_MIN_HESS: f64 = 1.0;
-        let use_curvature = std::env::var("GRADIENTLSS_CRPS_UNIT_HESS")
-            .map(|v| !matches!(v.trim(), "1" | "true" | "yes"))
-            .unwrap_or(true);
+        #[derive(PartialEq)]
+        enum CrpsHess {
+            Metric,
+            Curvature,
+            Unit,
+        }
+        let hess_mode = match std::env::var("GRADIENTLSS_CRPS_HESS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "unit" => CrpsHess::Unit,
+            "curvature" | "curv" => CrpsHess::Curvature,
+            _ => CrpsHess::Metric,
+        };
+        // Scratch tables for the metric expectation, reused across rows.
+        // Capacity bounds the table like ngboost's cap: beyond it the metric
+        // degrades gracefully toward the floor (huge-rate rows also have ~zero
+        // gradient under the same truncation, so no amplification pairs with
+        // it).
+        const METRIC_CAP: usize = 200;
+        let mut m_pmf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
+        let mut m_cdf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
+        let mut m_fp: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
+        let mut m_suf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 3);
         for i in 0..n_samples {
             let rate = t_rate[i].max(1e-6);
             let yi = y[i];
@@ -148,11 +235,27 @@ impl Poisson {
             }
             let d = rd[i];
             gradients[[i, 0]] = g_lambda * d;
-            if use_curvature {
-                // Chain rule to the raw margin, mirroring the NLL path:
-                // h = h_lambda * d^2 + g_lambda * d2lambda/dm2.
-                let sd = _rsd[i];
-                hessians[[i, 0]] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
+            match hess_mode {
+                CrpsHess::Unit => {}
+                CrpsHess::Curvature => {
+                    // Chain rule to the raw margin, mirroring the NLL path:
+                    // h = h_lambda * d^2 + g_lambda * d2lambda/dm2.
+                    let sd = _rsd[i];
+                    hessians[[i, 0]] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
+                }
+                CrpsHess::Metric => {
+                    let m = poisson_crps_metric(
+                        rate,
+                        &mut m_pmf,
+                        &mut m_cdf,
+                        &mut m_fp,
+                        &mut m_suf,
+                    );
+                    // M is the log-rate-space metric; map to margin space:
+                    // h = M * (dlambda/dm / lambda)^2 (= M for Exp response).
+                    let scale = d / rate;
+                    hessians[[i, 0]] = (m * scale * scale).max(CRPS_MIN_METRIC);
+                }
             }
         }
         Some((gradients, hessians))
@@ -428,9 +531,9 @@ mod tests {
                 (a - f).abs() <= 1e-4 * f.abs().max(1e-3),
                 "row {i}: analytic {a} vs fd {f}"
             );
-            // Closed-form path carries damping-only curvature (floored at
-            // 1.0 — may shrink steps, never amplify); FD keeps unit hessians.
-            assert!(h_an[[i, 0]] >= 1.0);
+            // Closed-form path carries a preconditioner (metric by default,
+            // floored at 0.05); FD keeps unit hessians.
+            assert!(h_an[[i, 0]] >= 0.05, "hessian {} under floor", h_an[[i, 0]]);
             assert_eq!(h_fd[[i, 0]], 1.0);
         }
     }
