@@ -139,6 +139,174 @@ impl NegativeBinomial {
     }
 }
 
+/// Scratch for one row of the NB CRPS closed-form pass — pmf/cdf tables and
+/// the per-parameter dF/dtheta prefix tables, reused across rows.
+#[derive(Default)]
+struct NbCrpsScratch {
+    pmf: Vec<f64>,
+    cdf: Vec<f64>,
+    /// F_r[k]     = sum_{i<=k} dpmf(i)/dr        (prefix of dpmf/dr)
+    fr: Vec<f64>,
+    /// F_p[k]     = sum_{i<=k} dpmf(i)/dprobs    (prefix of dpmf/dprobs)
+    fp_: Vec<f64>,
+    /// suffix sums of F_r / F_p (S_j(y) = sum_{k>=y} dF(k)/dtheta_j)
+    suf_r: Vec<f64>,
+    suf_p: Vec<f64>,
+}
+
+impl NegativeBinomial {
+    /// Closed-form CRPS gradients AND metric hessians for the two-parameter
+    /// NB, replacing the FD path (which trained with unit hessians — measured
+    /// on real strikeout data: tuned NB-CRPS test CRPS 1.293 vs 1.173 for the
+    /// NLL twin, the same deficiency natural gradients fixed for Poisson).
+    ///
+    /// # The identities
+    ///
+    /// With CRPS(theta) = sum_k (F(k) - 1{k>=y})^2 and Ftheta(k) = dF(k)/dtheta:
+    ///
+    ///     dCRPS/dtheta = 2 [ sum_k F(k) Ftheta(k)  -  sum_{k>=y} Ftheta(k) ]
+    ///                  = 2 [ A - S(y) ]
+    ///
+    /// so ONE set of prefix/suffix tables serves every y — both the observed
+    /// gradient (y = y_obs) and the metric expectation over hypothetical y.
+    /// The per-parameter pmf derivatives need no special functions:
+    ///
+    ///     dpmf(i)/dprobs = pmf(i) * (i/probs - r/(1-probs))
+    ///     dpmf(i)/dr     = pmf(i) * (H_i + ln(1-probs)),
+    ///         H_i = psi(r+i) - psi(r) = sum_{t<i} 1/(r+t)   (telescoped —
+    ///         the digamma difference is a plain running sum).
+    ///
+    /// # The hessian
+    ///
+    /// NGBoost's CRPS metric, diagonal per parameter in MARGIN space:
+    ///
+    ///     M_jj = E_{y~NB(theta)} [ ( dCRPS/dtheta_j * dtheta_j/dm_j )^2 ]
+    ///
+    /// positive by construction (a Riemannian metric, not a curvature), same
+    /// floor rationale as the Poisson port: XGBoost leaf values are ~ g/h
+    /// with no line search, and the metric can vanish faster than an observed
+    /// tail gradient at degenerate parameter corners.
+    fn analytical_crps_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
+        let y = match target {
+            ResponseData::Univariate(arr) => arr,
+            ResponseData::Multivariate(_) => return None,
+        };
+        let n_samples = predictions.nrows();
+        let r_response_fn = &self.params[0].response_fn;
+        let probs_response_fn = &self.params[1].response_fn;
+        let t_r = transformed.column(0);
+        let t_probs = transformed.column(1);
+        let p_r = predictions.column(0);
+        let p_probs = predictions.column(1);
+        let (rd_r, _) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
+        let (rd_p, _) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
+
+        const CRPS_MIN_METRIC: f64 = 0.05;
+        const CAP: usize = 220;
+        let unit_hess = std::env::var("GRADIENTLSS_CRPS_HESS")
+            .map(|v| v.trim().eq_ignore_ascii_case("unit"))
+            .unwrap_or(false);
+
+        let mut gradients = Array2::zeros((n_samples, 2));
+        let mut hessians = Array2::ones((n_samples, 2));
+        let mut sc = NbCrpsScratch::default();
+
+        for i in 0..n_samples {
+            let r = t_r[i];
+            let probs = t_probs[i];
+            let yi = y[i];
+            if !(r > 0.0) || !(probs > 0.0) || !(probs < 1.0) || !yi.is_finite() || yi < 0.0 {
+                // Out of support: FD saw the flat 1e6 penalty — zero gradient,
+                // unit hessian.
+                continue;
+            }
+            let mean = r * probs / (1.0 - probs);
+            let var = mean / (1.0 - probs);
+            let sd = var.sqrt();
+            let y_int = yi.round().max(0.0) as usize;
+            // Table long enough for BOTH the observed-y gradient and the
+            // metric expectation over hypothetical y (mean + 8 sigma).
+            let y_hyp_max = (((mean + 8.0 * sd).ceil() as usize).max(5)).min(CAP - 11);
+            let k_total = (((yi.max(mean) + 6.0 * sd).ceil() as usize).max(y_hyp_max + 10)).min(CAP);
+            let len = k_total + 1;
+
+            // ---- one pass: pmf, cdf, and the two dF/dtheta prefixes -------
+            sc.pmf.clear();
+            sc.cdf.clear();
+            sc.fr.clear();
+            sc.fp_.clear();
+            let ln_1mp = (-probs).ln_1p(); // ln(1 - probs)
+            let mut pmf = (r * ln_1mp).exp();
+            let mut cdf = 0.0;
+            let mut h_i = 0.0; // psi(r+i) - psi(r), telescoped
+            let mut acc_r = 0.0;
+            let mut acc_p = 0.0;
+            for k in 0..len {
+                if k > 0 {
+                    pmf *= probs * (r + k as f64 - 1.0) / k as f64;
+                    h_i += 1.0 / (r + k as f64 - 1.0);
+                }
+                cdf += pmf;
+                acc_r += pmf * (h_i + ln_1mp);
+                acc_p += pmf * (k as f64 / probs - r / (1.0 - probs));
+                sc.pmf.push(pmf);
+                sc.cdf.push(cdf.min(1.0));
+                sc.fr.push(acc_r);
+                sc.fp_.push(acc_p);
+            }
+
+            // A_j = sum_k F(k) * Ftheta_j(k); suffix sums S_j
+            sc.suf_r.clear();
+            sc.suf_r.resize(len + 1, 0.0);
+            sc.suf_p.clear();
+            sc.suf_p.resize(len + 1, 0.0);
+            let mut a_r = 0.0;
+            let mut a_p = 0.0;
+            for k in (0..len).rev() {
+                sc.suf_r[k] = sc.suf_r[k + 1] + sc.fr[k];
+                sc.suf_p[k] = sc.suf_p[k + 1] + sc.fp_[k];
+            }
+            for k in 0..len {
+                a_r += sc.cdf[k] * sc.fr[k];
+                a_p += sc.cdf[k] * sc.fp_[k];
+            }
+
+            // ---- observed gradient: g_j = 2 (A_j - S_j(y_obs)) ------------
+            let yo = y_int.min(len - 1);
+            let g_r = 2.0 * (a_r - sc.suf_r[yo]);
+            let g_p = 2.0 * (a_p - sc.suf_p[yo]);
+            gradients[[i, 0]] = g_r * rd_r[i];
+            gradients[[i, 1]] = g_p * rd_p[i];
+
+            // ---- metric hessians: M_jj = E_y[(g_j(y) * dtheta/dm)^2] ------
+            if !unit_hess {
+                let mut m_r = 0.0;
+                let mut m_p = 0.0;
+                for yh in 0..=y_hyp_max {
+                    let py = sc.pmf[yh];
+                    if py < 1e-300 {
+                        continue;
+                    }
+                    let gr = 2.0 * (a_r - sc.suf_r[yh]);
+                    let gp = 2.0 * (a_p - sc.suf_p[yh]);
+                    m_r += gr * gr * py;
+                    m_p += gp * gp * py;
+                }
+                let dr = rd_r[i];
+                let dp = rd_p[i];
+                hessians[[i, 0]] = (m_r * dr * dr).max(CRPS_MIN_METRIC);
+                hessians[[i, 1]] = (m_p * dp * dp).max(CRPS_MIN_METRIC);
+            }
+        }
+        Some((gradients, hessians))
+    }
+}
+
 #[typetag::serde]
 impl Distribution for NegativeBinomial {
     fn clone_box(&self) -> Box<dyn Distribution> {
@@ -263,6 +431,9 @@ impl Distribution for NegativeBinomial {
         transformed: &ArrayView2<f64>,
         target: &ResponseData,
     ) -> Option<(Array2<f64>, Array2<f64>)> {
+        if self.loss_fn == LossFn::Crps {
+            return self.analytical_crps_gradients(predictions, transformed, target);
+        }
         if self.loss_fn != LossFn::Nll {
             return None;
         }
@@ -412,6 +583,58 @@ impl Distribution for NegativeBinomial {
 
 #[cfg(test)]
 mod tests {
+
+    /// The closed-form NB CRPS gradients must agree with FD over the analytic
+    /// loss for BOTH parameters. FD carries O(eps^2) truncation error and the
+    /// two paths use slightly different tail bounds (4 vs 6 sigma), hence the
+    /// modest tolerance.
+    #[test]
+    fn nb_closed_form_crps_gradients_match_finite_differences() {
+        use crate::types::ResponseData;
+        use ndarray::array;
+        let d = NegativeBinomial::new(
+            Stabilization::None,
+            ResponseFn::Softplus,
+            ResponseFn::Sigmoid,
+            LossFn::Crps,
+            false,
+        );
+        // raw margins; softplus/sigmoid map them to (r, probs)
+        let predictions = array![[2.0_f64, 0.3], [4.0, -0.5], [1.0, 0.8], [3.0, 0.0]];
+        let transformed = {
+            let mut t = predictions.clone();
+            for i in 0..t.nrows() {
+                let m0 = predictions[[i, 0]];
+                t[[i, 0]] = (m0.exp().ln_1p()).max(1e-12); // softplus
+                let m1 = predictions[[i, 1]];
+                t[[i, 1]] = 1.0 / (1.0 + (-m1).exp()); // sigmoid
+            }
+            t
+        };
+        let y = array![3.0_f64, 8.0, 0.0, 5.0];
+        let target = ResponseData::Univariate(&y.view());
+
+        let (g_an, h_an) = d
+            .analytical_crps_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("closed-form NB CRPS gradients");
+        let (g_fd, _h_fd) = d
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("fd gradients");
+        for i in 0..y.len() {
+            for j in 0..2 {
+                let (a, f) = (g_an[[i, j]], g_fd[[i, j]]);
+                assert!(
+                    (a - f).abs() <= 2e-3 * f.abs().max(1e-2),
+                    "row {i} param {j}: analytic {a} vs fd {f}"
+                );
+                assert!(
+                    h_an[[i, j]] >= 0.05 && h_an[[i, j]].is_finite(),
+                    "row {i} param {j}: metric hessian {} invalid",
+                    h_an[[i, j]]
+                );
+            }
+        }
+    }
 
     #[test]
     fn analytic_crps_matches_brute_force_nb() {
