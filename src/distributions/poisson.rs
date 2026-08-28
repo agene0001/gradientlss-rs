@@ -92,9 +92,32 @@ impl Poisson {
         let t_rate = transformed.column(0);
         let p_rate = predictions.column(0);
         let (rd, _rsd) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
+        let _rsd = &_rsd;
 
         let mut gradients = Array2::zeros((n_samples, 1));
-        let hessians = Array2::ones((n_samples, 1));
+        let mut hessians = Array2::ones((n_samples, 1));
+        // Curvature-aware CRPS steps (2026-08-28 experiment): the same
+        // recurrence pass also yields the analytic second derivative,
+        //
+        //   d2CRPS/dlambda2 = 2 sum_k [ pmf(k)^2 - (F(k) - I) * pmf(k) * (k/lambda - 1) ]
+        //
+        // (from dF/dlambda = -pmf and dpmf/dlambda = pmf * (k/lambda - 1)).
+        // The unit-hessian convention (Python parity) made CRPS training plain
+        // gradient descent while NLL enjoyed Newton steps — measured on real
+        // strikeout data (untuned, 300 rounds): NLL-trained test CRPS 1.205 vs
+        // CRPS-trained 1.379, i.e. the CRPS model lost at its own objective.
+        // CRPS is not convex in lambda, so the Hessian is floored at
+        // CRPS_MIN_HESS: negative-curvature rows fall back to conservative
+        // gradient steps rather than Newton overshoots.
+        // Floor at 1.0: curvature may only DAMP steps relative to the unit
+        // hessian, never amplify them. The 1e-2 floor was measured 2026-08-28
+        // to explode (negative-curvature rows became 100x steps: pred mean 25,
+        // RMSE 156). CRPS is not convex in lambda, so amplification off small
+        // hessians is structurally unsafe with XGBoost leaf values ~ g/h.
+        const CRPS_MIN_HESS: f64 = 1.0;
+        let use_curvature = std::env::var("GRADIENTLSS_CRPS_UNIT_HESS")
+            .map(|v| !matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(true);
         for i in 0..n_samples {
             let rate = t_rate[i].max(1e-6);
             let yi = y[i];
@@ -108,18 +131,29 @@ impl Poisson {
             let mut pmf = (-rate).exp();
             let mut cdf = 0.0;
             let mut g_lambda = 0.0;
+            let mut h_lambda = 0.0;
             for k in 0..=max_k {
                 if k > 0 {
                     pmf *= rate / k as f64;
                 }
                 cdf += pmf;
                 let indicator = if k >= y_int { 1.0 } else { 0.0 };
-                g_lambda -= 2.0 * (cdf - indicator) * pmf;
+                let resid = cdf - indicator;
+                g_lambda -= 2.0 * resid * pmf;
+                let dpmf = pmf * (k as f64 / rate - 1.0);
+                h_lambda += 2.0 * (pmf * pmf - resid * dpmf);
                 if k >= y_int && 1.0 - cdf < 1e-9 {
                     break;
                 }
             }
-            gradients[[i, 0]] = g_lambda * rd[i];
+            let d = rd[i];
+            gradients[[i, 0]] = g_lambda * d;
+            if use_curvature {
+                // Chain rule to the raw margin, mirroring the NLL path:
+                // h = h_lambda * d^2 + g_lambda * d2lambda/dm2.
+                let sd = _rsd[i];
+                hessians[[i, 0]] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
+            }
         }
         Some((gradients, hessians))
     }
@@ -394,7 +428,9 @@ mod tests {
                 (a - f).abs() <= 1e-4 * f.abs().max(1e-3),
                 "row {i}: analytic {a} vs fd {f}"
             );
-            assert_eq!(h_an[[i, 0]], 1.0);
+            // Closed-form path carries damping-only curvature (floored at
+            // 1.0 — may shrink steps, never amplify); FD keeps unit hessians.
+            assert!(h_an[[i, 0]] >= 1.0);
             assert_eq!(h_fd[[i, 0]], 1.0);
         }
     }
