@@ -193,13 +193,27 @@ impl Distribution for NegativeBinomial {
         let var = mean / (1.0 - probs);
         let y_int = y.round().max(0.0) as usize;
         let max_k = ((y.max(mean) + 4.0 * var.sqrt()).ceil() as usize).min(150);
+        // pmf recurrence — one multiply per term instead of a full
+        // ln_gamma + exp per term (see the Poisson counterpart; the FD
+        // gradient path evaluates this 4x per sample per round for the two
+        // params, so the per-term cost is the whole ballgame). pmf(0) =
+        // (1 - probs)^r in the torch parameterization; pmf(k)/pmf(k-1) =
+        // probs * (r + k - 1) / k. Underflow at extreme means is benign under
+        // the k <= 150 cap, as in the Poisson case.
+        let mut pmf = (r * (-probs).ln_1p()).exp();
         let mut cdf = 0.0;
         let mut crps = 0.0;
         for k in 0..=max_k {
-            cdf += self.log_prob_scalar(params, k as f64).exp();
+            if k > 0 {
+                pmf *= probs * (r + k as f64 - 1.0) / k as f64;
+            }
+            cdf += pmf;
             let indicator = if k >= y_int { 1.0 } else { 0.0 };
             let d = cdf - indicator;
             crps += d * d;
+            if k >= y_int && 1.0 - cdf < 1e-9 {
+                break;
+            }
         }
         Some(crps)
     }

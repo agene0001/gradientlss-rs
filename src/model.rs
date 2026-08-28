@@ -1265,7 +1265,7 @@ mod xgboost_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xgboost"))]
 mod analytic_metric_probe {
     use super::*;
     use crate::backend::XGBoostBackend;

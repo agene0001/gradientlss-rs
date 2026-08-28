@@ -59,6 +59,72 @@ impl Poisson {
     }
 }
 
+impl Poisson {
+    /// Closed-form CRPS gradients, replacing the FD path entirely for the
+    /// 1-param Poisson.
+    ///
+    /// With CRPS(lambda) = sum_k (F(k) - 1{k>=y})^2 and the classic identity
+    /// dF(k)/dlambda = -pmf(k), the gradient is
+    ///
+    ///     dCRPS/dlambda = sum_k 2 (F(k) - 1{k>=y}) * (-pmf(k))
+    ///
+    /// computed in the SAME single pmf-recurrence pass as the loss itself —
+    /// one pass per sample instead of the FD path's two full loss evaluations,
+    /// and exact instead of O(eps^2)-approximate. The truncation boundary's
+    /// dependence on lambda is ignored, as the FD path implicitly did: the
+    /// boundary terms are squared upper-tail residuals (~1e-9 at the 4-sigma
+    /// bound).
+    ///
+    /// Hessians are 1.0, matching the numerical CRPS path exactly (Python
+    /// parity: xgboostlss trains CRPS with unit hessians).
+    fn analytical_crps_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
+        let y = match target {
+            ResponseData::Univariate(arr) => arr,
+            ResponseData::Multivariate(_) => return None,
+        };
+        let n_samples = predictions.nrows();
+        let rate_response_fn = &self.params[0].response_fn;
+        let t_rate = transformed.column(0);
+        let p_rate = predictions.column(0);
+        let (rd, _rsd) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
+
+        let mut gradients = Array2::zeros((n_samples, 1));
+        let hessians = Array2::ones((n_samples, 1));
+        for i in 0..n_samples {
+            let rate = t_rate[i].max(1e-6);
+            let yi = y[i];
+            if !yi.is_finite() || yi < 0.0 {
+                // Out of support: the FD path saw the flat 1e6 penalty on both
+                // sides, i.e. a zero gradient.
+                continue;
+            }
+            let y_int = yi.round().max(0.0) as usize;
+            let max_k = ((yi.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
+            let mut pmf = (-rate).exp();
+            let mut cdf = 0.0;
+            let mut g_lambda = 0.0;
+            for k in 0..=max_k {
+                if k > 0 {
+                    pmf *= rate / k as f64;
+                }
+                cdf += pmf;
+                let indicator = if k >= y_int { 1.0 } else { 0.0 };
+                g_lambda -= 2.0 * (cdf - indicator) * pmf;
+                if k >= y_int && 1.0 - cdf < 1e-9 {
+                    break;
+                }
+            }
+            gradients[[i, 0]] = g_lambda * rd[i];
+        }
+        Some((gradients, hessians))
+    }
+}
+
 #[typetag::serde]
 impl Distribution for Poisson {
     fn clone_box(&self) -> Box<dyn Distribution> {
@@ -108,13 +174,28 @@ impl Distribution for Poisson {
         }
         let y_int = y.round().max(0.0) as usize;
         let max_k = ((y.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
+        // One exp + a multiply per term, via pmf(k) = pmf(k-1) * rate / k —
+        // the previous form paid a full ln_gamma + exp PER TERM, which made
+        // every FD gradient evaluation ~an order of magnitude dearer than it
+        // needed to be. Underflow at large rate is benign: the sum is capped
+        // at k <= 100, where the true pmf mass is ~0 anyway, so a pmf(0)
+        // underflowing to 0.0 yields the same capped sum the ln form did.
+        let mut pmf = (-rate).exp();
         let mut cdf = 0.0;
         let mut crps = 0.0;
         for k in 0..=max_k {
-            cdf += self.log_prob_scalar(params, k as f64).exp();
+            if k > 0 {
+                pmf *= rate / k as f64;
+            }
+            cdf += pmf;
             let indicator = if k >= y_int { 1.0 } else { 0.0 };
             let d = cdf - indicator;
             crps += d * d;
+            // Past y with the CDF saturated, every remaining term is
+            // (cdf - 1)^2 < 1e-18 — stop paying for them.
+            if k >= y_int && 1.0 - cdf < 1e-9 {
+                break;
+            }
         }
         Some(crps)
     }
@@ -160,6 +241,9 @@ impl Distribution for Poisson {
         transformed: &ArrayView2<f64>,
         target: &ResponseData,
     ) -> Option<(Array2<f64>, Array2<f64>)> {
+        if self.loss_fn == LossFn::Crps {
+            return self.analytical_crps_gradients(predictions, transformed, target);
+        }
         if self.loss_fn != LossFn::Nll {
             return None;
         }
@@ -282,6 +366,91 @@ mod tests {
                 want += (cdf - ind) * (cdf - ind);
             }
             assert_relative_eq!(got, want, max_relative = 1e-9);
+        }
+    }
+
+    /// The closed-form CRPS gradient must agree with the FD gradient it
+    /// replaces — same loss surface, two differentiation methods. FD carries
+    /// O(eps^2) truncation error, hence the loose-ish tolerance.
+    #[test]
+    fn closed_form_crps_gradients_match_finite_differences() {
+        use ndarray::array;
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        // raw margins -> rates via exp: rates ~ {2.0, 7.4, 20.1, 3.3}
+        let predictions = array![[0.7_f64], [2.0], [3.0], [1.2]];
+        let transformed = predictions.mapv(f64::exp);
+        let y = array![3.0_f64, 5.0, 30.0, 0.0];
+        let target = ResponseData::Univariate(&y.view());
+
+        let (g_an, h_an) = d
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)
+            .expect("closed-form CRPS gradients");
+        let (g_fd, h_fd) = d
+            .numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target)
+            .expect("fd gradients");
+        for i in 0..y.len() {
+            let (a, f) = (g_an[[i, 0]], g_fd[[i, 0]]);
+            assert!(
+                (a - f).abs() <= 1e-4 * f.abs().max(1e-3),
+                "row {i}: analytic {a} vs fd {f}"
+            );
+            assert_eq!(h_an[[i, 0]], 1.0);
+            assert_eq!(h_fd[[i, 0]], 1.0);
+        }
+    }
+
+    /// Speed probe for the two CRPS-path optimizations (recurrence + closed
+    /// form). Not a regression gate — prints measured per-call costs.
+    #[test]
+    #[ignore = "manual benchmark - run with --ignored --nocapture"]
+    fn bench_crps_gradient_paths() {
+        use ndarray::Array2;
+        use std::time::Instant;
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        let n = 15_000usize;
+        let predictions =
+            Array2::from_shape_fn((n, 1), |(i, _)| 0.5 + ((i * 37 % 100) as f64) / 60.0);
+        let transformed = predictions.mapv(f64::exp);
+        let yv: Vec<f64> = (0..n).map(|i| ((i * 13) % 12) as f64).collect();
+        let y = ndarray::Array1::from_vec(yv);
+        let target = ResponseData::Univariate(&y.view());
+
+        // Third arm: the pre-recurrence per-term cost (full ln_gamma + exp
+        // per CDF term via log_prob_scalar) — what shipped before 2026-08-28.
+        let old_style = |params: &[f64], y: f64| -> f64 {
+            let rate = params[0];
+            let y_int = y.round().max(0.0) as usize;
+            let max_k = ((y.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
+            let mut cdf = 0.0;
+            let mut crps = 0.0;
+            for k in 0..=max_k {
+                cdf += d.log_prob_scalar(params, k as f64).exp();
+                let ind = if k >= y_int { 1.0 } else { 0.0 };
+                crps += (cdf - ind) * (cdf - ind);
+            }
+            crps
+        };
+
+        for _ in 0..3 {
+            let t = Instant::now();
+            // Old FD = 2 old-style evals per row (the eps offsets don't change cost).
+            let mut sink = 0.0;
+            for i in 0..n {
+                let lam = transformed[[i, 0]];
+                sink += old_style(&[lam + 1e-4], y[i]) - old_style(&[lam - 1e-4], y[i]);
+            }
+            let old_ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(sink);
+            let t = Instant::now();
+            let _ = d.numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target);
+            let fd_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            let _ = d.analytical_gradients(&predictions.view(), &transformed.view(), &target);
+            let an_ms = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "{n} rows: OLD ln_gamma-FD {old_ms:.2} ms   FD(recurrence) {fd_ms:.2} ms                    closed-form {an_ms:.2} ms   (old/new = {:.0}x)",
+                old_ms / an_ms
+            );
         }
     }
 
