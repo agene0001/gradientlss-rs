@@ -903,9 +903,17 @@ fn stabilize_mad(arr: &mut Array2<f64>) {
         for (j, &v) in col.iter().enumerate() {
             buf[j] = (v - median).abs();
         }
-        let mad = median_inplace(&mut buf).max(1e-4);
+        let mad = median_inplace(&mut buf);
 
-        let inv_mad = 1.0 / mad;
+        // A (near-)constant column has no spread to normalize: dividing by
+        // the 1e-4 clamp would multiply it by ~1e4 instead. This is not
+        // hypothetical — the CRPS metric hessian depends only on the fitted
+        // parameters, so at round 0 (constant init margins) every row is
+        // identical, and unit-hess mode is constant EVERY round; Mad-stab
+        // was silently crushing those leaf values ~1e-4x. Python XGBoostLSS
+        // has the same clamp bug; parity is preserved for every
+        // non-degenerate column.
+        let inv_mad = if mad < 1e-12 { 1.0 } else { 1.0 / mad.max(1e-4) };
         for v in col.iter_mut() {
             *v *= inv_mad;
         }

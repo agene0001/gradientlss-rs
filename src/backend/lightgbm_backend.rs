@@ -44,6 +44,10 @@ impl Default for LightGBMParams {
         params.set("verbose", ParamValue::Int(-1));
         // Use "none" objective since we provide custom gradients
         params.set("objective", ParamValue::from("none"));
+        // Without this, `subsample`/`bagging_fraction` is SILENTLY INERT —
+        // LightGBM only bags when bagging_freq >= 1. Harmless when no
+        // fraction is set (default 1.0 = no sampling).
+        params.set("bagging_freq", ParamValue::Int(1));
         params
     }
 }
