@@ -59,6 +59,11 @@ impl Default for XGBoostParams {
 
 impl BackendParams for XGBoostParams {
     fn set(&mut self, key: &str, value: ParamValue) {
+        // Normalize the alias so a caller-set "learning_rate" can never
+        // coexist with the default "eta": params reach the booster via a
+        // HashMap iteration, and the sampled value winning over the default
+        // previously depended on dmlc's alphabetical alias resolution.
+        let key = if key == "learning_rate" { "eta" } else { key };
         self.inner.insert(key.to_string(), value);
     }
 

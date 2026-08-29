@@ -261,11 +261,29 @@ pub trait FoldTransform: Sync {
 /// TPE study can tune the pipeline and the model together.
 pub const TRANSFORM_PARAM_PREFIX: &str = "__";
 
+/// Per-fold TRAIN-row weight generator: called with the fold's train length,
+/// returns that many sample weights applied to the fold's training dataset
+/// only (the scoring fold stays unweighted, mirroring an ES holdout). Lets a
+/// caller whose FINAL fit is sample-weighted (e.g. a recency ramp) make the
+/// search answer the same weighted question — without it, hyperparameters
+/// and CV round counts are selected on an unweighted problem the served
+/// model never trains on.
+#[derive(Clone)]
+pub struct FoldWeightFn(pub std::sync::Arc<dyn Fn(usize) -> Vec<f64> + Send + Sync>);
+
+impl std::fmt::Debug for FoldWeightFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldWeightFn(..)")
+    }
+}
+
 /// Configuration for hyperparameter optimization.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
     /// Number of optimization trials
     pub n_trials: u32,
+    /// See [`FoldWeightFn`]. `None` = unweighted folds (historical behaviour).
+    pub fold_weight_fn: Option<FoldWeightFn>,
     /// Number of cross-validation folds
     pub n_folds: usize,
     /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
@@ -331,6 +349,7 @@ impl Default for HyperOptConfig {
     fn default() -> Self {
         Self {
             n_trials: 100,
+            fold_weight_fn: None,
             n_folds: 5,
             cv_scheme: CvScheme::KFold,
             seed: 42,
@@ -667,6 +686,7 @@ pub fn hyper_opt_with_transform<B: Backend>(
             n_completed_trials,
             fold_transform,
             &trial_params,
+            config.fold_weight_fn.as_ref(),
         );
 
         // Report result to optimizers (even for pruned trials). `cv_score` is
@@ -794,6 +814,7 @@ fn cv_with_pruning<B: Backend>(
     n_completed_trials: usize,
     fold_transform: Option<&dyn FoldTransform>,
     trial_params: &HashMap<String, Value>,
+    fold_weight_fn: Option<&FoldWeightFn>,
 ) -> (f64, bool, Vec<f64>, Vec<usize>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
@@ -929,6 +950,15 @@ fn cv_with_pruning<B: Backend>(
                 continue;
             }
         };
+        // Weight the fold's TRAIN rows the same way the caller's final fit
+        // will (see `FoldWeightFn`); the scoring fold stays unweighted.
+        if let Some(wf) = fold_weight_fn {
+            let w = Array1::from_vec((wf.0)(train_labels.len()));
+            if train_data.set_weights(w.view()).is_err() {
+                intermediate_scores.push(f64::INFINITY);
+                continue;
+            }
+        }
 
         // Validation dataset = the held-out fold. Passing it to `train` enables
         // the backend's early stopping (`config.early_stopping_rounds`). Without
@@ -1391,6 +1421,7 @@ mod xgboost_hyper_opt_tests {
                     0,
                     None,
                     &HashMap::new(),
+                    None,
                 );
                 assert!(score.is_finite());
             }
