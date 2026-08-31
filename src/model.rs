@@ -192,7 +192,39 @@ impl<B: Backend> GradientLSS<B> {
     /// `metric_fn` evaluates whichever loss the distribution was set up with —
     /// for "crps" it draws 30 samples (seed 123) and sums the empirical CRPS,
     /// not the NLL.
+    /// PER-OBSERVATION metric (mean, not sum).
+    ///
+    /// Every raw scorer in this fork (`nll`, `crps_score`, `analytic_crps`)
+    /// totals over observations; this one divides by the observation count
+    /// before returning. Three reasons:
+    ///
+    /// * **Fold weighting.** `cv` averages per-fold scores. With sums, a fold
+    ///   holding more rows silently counts for more — forward-chaining splits
+    ///   are not exactly equal (e.g. 6213/6213/6215 on 24,854 rows), so the
+    ///   last fold was slightly overweighted. Means weight folds equally.
+    /// * **Warm-start priors survive a growing dataset.** Consumers cache a
+    ///   search's best score and replay it into later searches. A summed score
+    ///   scales with row count, so as the dataset grows the prior reads as
+    ///   worse than it was and biases TPE AWAY from a good config. A mean is
+    ///   scale-free.
+    /// * **Comparability.** 13,485 and 2.16 described equally good models; only
+    ///   the units differed from the other model families.
+    ///
+    /// Safe for every existing caller because they all compare metrics
+    /// RELATIVELY: early stopping across rounds on one validation set
+    /// (`is_significant_improvement` uses a relative delta), median pruning
+    /// across trials, and hyper-parameter ranking within a search — all
+    /// unchanged by a constant divisor.
     pub(crate) fn metric_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
+        let n_obs = {
+            let t = self.dist.n_targets().max(1);
+            (labels.len() / t).max(1)
+        };
+        self.metric_total_on_transformed(transformed, labels) / n_obs as f64
+    }
+
+    /// The raw total the scorers produce, before per-observation averaging.
+    fn metric_total_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
         match self.dist.loss_fn() {
             LossFn::Nll => self.nll_on_transformed(transformed, labels),
             LossFn::Crps => {
@@ -206,9 +238,8 @@ impl<B: Backend> GradientLSS<B> {
                     if n == 0 {
                         return f64::NAN;
                     }
-                    // SUM over observations, matching `crps_score` and `nll` —
-                    // every metric this fork reports is a sum, and hyper_opt
-                    // aggregates fold scores under that convention.
+                    // SUM here; `metric_on_transformed` divides by the
+                    // observation count on the way out.
                     let mut total = 0.0;
                     for i in 0..n {
                         let params: Vec<f64> = transformed.row(i).to_vec();
