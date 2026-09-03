@@ -192,6 +192,18 @@ impl NegativeBinomial {
         transformed: &ArrayView2<f64>,
         target: &ResponseData,
     ) -> Option<(Array2<f64>, Array2<f64>)> {
+        self.analytical_crps_gradients_impl(predictions, transformed, target, false)
+    }
+
+    /// [`analytical_crps_gradients`] with the row-parallel fill forced off —
+    /// the reference the parity test compares against.
+    fn analytical_crps_gradients_impl(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+        force_serial: bool,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
         let y = match target {
             ResponseData::Univariate(arr) => arr,
             ResponseData::Multivariate(_) => return None,
@@ -214,16 +226,19 @@ impl NegativeBinomial {
 
         let mut gradients = Array2::zeros((n_samples, 2));
         let mut hessians = Array2::ones((n_samples, 2));
-        let mut sc = NbCrpsScratch::default();
-
-        for i in 0..n_samples {
+        // One row: writes its (r, probs) gradient / hessian into the 2-wide
+        // chunks it owns, with its own scratch tables. Rows are independent,
+        // so the parallel driver below is bit-identical to the serial one
+        // (pinned by `crps_gradients_parallel_matches_serial`). Serial until
+        // 2026-09-03 — ~4 ms per boosting round at 18.6k rows on one core.
+        let row = |i: usize, sc: &mut NbCrpsScratch, gc: &mut [f64], hc: &mut [f64]| {
             let r = t_r[i];
             let probs = t_probs[i];
             let yi = y[i];
             if !(r > 0.0) || !(probs > 0.0) || !(probs < 1.0) || !yi.is_finite() || yi < 0.0 {
                 // Out of support: FD saw the flat 1e6 penalty — zero gradient,
                 // unit hessian.
-                continue;
+                return;
             }
             let mean = r * probs / (1.0 - probs);
             let var = mean / (1.0 - probs);
@@ -280,8 +295,8 @@ impl NegativeBinomial {
             let yo = y_int.min(len - 1);
             let g_r = 2.0 * (a_r - sc.suf_r[yo]);
             let g_p = 2.0 * (a_p - sc.suf_p[yo]);
-            gradients[[i, 0]] = g_r * rd_r[i];
-            gradients[[i, 1]] = g_p * rd_p[i];
+            gc[0] = g_r * rd_r[i];
+            gc[1] = g_p * rd_p[i];
 
             // ---- metric hessians: M_jj = E_y[(g_j(y) * dtheta/dm)^2] ------
             if !unit_hess {
@@ -299,8 +314,27 @@ impl NegativeBinomial {
                 }
                 let dr = rd_r[i];
                 let dp = rd_p[i];
-                hessians[[i, 0]] = (m_r * dr * dr).max(CRPS_MIN_METRIC);
-                hessians[[i, 1]] = (m_p * dp * dp).max(CRPS_MIN_METRIC);
+                hc[0] = (m_r * dr * dr).max(CRPS_MIN_METRIC);
+                hc[1] = (m_p * dp * dp).max(CRPS_MIN_METRIC);
+            }
+        };
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let use_parallel = !force_serial && n_samples >= 256;
+        if use_parallel {
+            g_slice
+                .par_chunks_mut(2)
+                .zip(h_slice.par_chunks_mut(2))
+                .enumerate()
+                .for_each_init(NbCrpsScratch::default, |sc, (i, (gc, hc))| row(i, sc, gc, hc));
+        } else {
+            let mut sc = NbCrpsScratch::default();
+            for (i, (gc, hc)) in g_slice.chunks_mut(2).zip(h_slice.chunks_mut(2)).enumerate() {
+                row(i, &mut sc, gc, hc);
             }
         }
         Some((gradients, hessians))
@@ -785,3 +819,47 @@ mod tests {
         assert_relative_eq!(nll, 2.0 * expected_single, epsilon = 1e-10);
     }
 }
+
+#[cfg(test)]
+mod crps_par_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// Row-parallel NB CRPS gradients must be bit-identical to the serial
+    /// fill (both parameters, gradients and metric hessians).
+    #[test]
+    fn crps_gradients_parallel_matches_serial() {
+        let d = NegativeBinomial::new(
+            Stabilization::None,
+            ResponseFn::Softplus,
+            ResponseFn::Sigmoid,
+            LossFn::Crps,
+            false,
+        );
+        let n = 3_000usize;
+        let mut state = 11u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (1u64 << 31) as f64
+        };
+        let margins = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { next() * 6.0 - 1.0 } else { next() * 6.0 - 3.0 });
+        let transformed = Array2::from_shape_fn((n, 2), |(i, j)| {
+            let m = margins[[i, j]];
+            if j == 0 { (1.0 + m.exp()).ln() } else { 1.0 / (1.0 + (-m).exp()) }
+        });
+        let mut y = Array1::from_shape_fn(n, |_| (next() * 25.0).floor());
+        y[5] = -2.0;
+        let yv = y.view();
+        let target = ResponseData::Univariate(&yv);
+        let (gp, hp) = d
+            .analytical_crps_gradients_impl(&margins.view(), &transformed.view(), &target, false)
+            .unwrap();
+        let (gs, hs) = d
+            .analytical_crps_gradients_impl(&margins.view(), &transformed.view(), &target, true)
+            .unwrap();
+        assert_eq!(gp, gs, "gradients differ between parallel and serial");
+        assert_eq!(hp, hs, "hessians differ between parallel and serial");
+        assert!(gp.iter().any(|v| *v != 0.0));
+    }
+}
+

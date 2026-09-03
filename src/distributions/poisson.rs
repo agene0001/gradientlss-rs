@@ -140,6 +140,18 @@ impl Poisson {
         transformed: &ArrayView2<f64>,
         target: &ResponseData,
     ) -> Option<(Array2<f64>, Array2<f64>)> {
+        self.analytical_crps_gradients_impl(predictions, transformed, target, false)
+    }
+
+    /// [`analytical_crps_gradients`] with the row-parallel fill forced off —
+    /// the reference the parity test compares against.
+    fn analytical_crps_gradients_impl(
+        &self,
+        predictions: &ArrayView2<f64>,
+        transformed: &ArrayView2<f64>,
+        target: &ResponseData,
+        force_serial: bool,
+    ) -> Option<(Array2<f64>, Array2<f64>)> {
         let y = match target {
             ResponseData::Univariate(arr) => arr,
             ResponseData::Multivariate(_) => return None,
@@ -179,7 +191,7 @@ impl Poisson {
         // search. The floor bounds the amplification for near-zero-rate rows.
         const CRPS_MIN_METRIC: f64 = 0.05;
         const CRPS_MIN_HESS: f64 = 1.0;
-        #[derive(PartialEq)]
+        #[derive(PartialEq, Clone, Copy)]
         enum CrpsHess {
             Metric,
             Curvature,
@@ -195,23 +207,39 @@ impl Poisson {
             "curvature" | "curv" => CrpsHess::Curvature,
             _ => CrpsHess::Metric,
         };
-        // Scratch tables for the metric expectation, reused across rows.
+        // Scratch tables for the metric expectation. One set per THREAD
+        // (`for_each_init`) on the parallel path, one for the serial path.
         // Capacity bounds the table like ngboost's cap: beyond it the metric
         // degrades gracefully toward the floor (huge-rate rows also have ~zero
         // gradient under the same truncation, so no amplification pairs with
         // it).
         const METRIC_CAP: usize = 200;
-        let mut m_pmf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
-        let mut m_cdf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
-        let mut m_fp: Vec<f64> = Vec::with_capacity(METRIC_CAP + 2);
-        let mut m_suf: Vec<f64> = Vec::with_capacity(METRIC_CAP + 3);
-        for i in 0..n_samples {
+        #[derive(Default)]
+        struct Scratch {
+            pmf: Vec<f64>,
+            cdf: Vec<f64>,
+            fp: Vec<f64>,
+            suf: Vec<f64>,
+        }
+        let make_scratch = || Scratch {
+            pmf: Vec::with_capacity(METRIC_CAP + 2),
+            cdf: Vec::with_capacity(METRIC_CAP + 2),
+            fp: Vec::with_capacity(METRIC_CAP + 2),
+            suf: Vec::with_capacity(METRIC_CAP + 3),
+        };
+        // One row: writes its gradient / hessian into the 1-wide chunks it
+        // owns. Rows are independent, so the parallel driver below produces
+        // bit-identical output to the serial one (pinned by
+        // `crps_gradients_parallel_matches_serial`). Until 2026-09-03 this
+        // ran serially — ~4 ms per boosting round at 18.6k rows, about the
+        // cost of the tree itself at 263 features, on one core.
+        let row = |i: usize, sc: &mut Scratch, gc: &mut [f64], hc: &mut [f64]| {
             let rate = t_rate[i].max(1e-6);
             let yi = y[i];
             if !yi.is_finite() || yi < 0.0 {
                 // Out of support: the FD path saw the flat 1e6 penalty on both
                 // sides, i.e. a zero gradient.
-                continue;
+                return;
             }
             let y_int = yi.round().max(0.0) as usize;
             let max_k = ((yi.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
@@ -234,28 +262,48 @@ impl Poisson {
                 }
             }
             let d = rd[i];
-            gradients[[i, 0]] = g_lambda * d;
+            gc[0] = g_lambda * d;
             match hess_mode {
                 CrpsHess::Unit => {}
                 CrpsHess::Curvature => {
                     // Chain rule to the raw margin, mirroring the NLL path:
                     // h = h_lambda * d^2 + g_lambda * d2lambda/dm2.
                     let sd = _rsd[i];
-                    hessians[[i, 0]] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
+                    hc[0] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
                 }
                 CrpsHess::Metric => {
                     let m = poisson_crps_metric(
                         rate,
-                        &mut m_pmf,
-                        &mut m_cdf,
-                        &mut m_fp,
-                        &mut m_suf,
+                        &mut sc.pmf,
+                        &mut sc.cdf,
+                        &mut sc.fp,
+                        &mut sc.suf,
                     );
                     // M is the log-rate-space metric; map to margin space:
                     // h = M * (dlambda/dm / lambda)^2 (= M for Exp response).
                     let scale = d / rate;
-                    hessians[[i, 0]] = (m * scale * scale).max(CRPS_MIN_METRIC);
+                    hc[0] = (m * scale * scale).max(CRPS_MIN_METRIC);
                 }
+            }
+        };
+        let g_slice = gradients
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        let h_slice = hessians
+            .as_slice_mut()
+            .expect("freshly-allocated Array2 is contiguous");
+        // Same threshold as the NLL gradient path in `base.rs`.
+        let use_parallel = !force_serial && n_samples >= 256;
+        if use_parallel {
+            g_slice
+                .par_chunks_mut(1)
+                .zip(h_slice.par_chunks_mut(1))
+                .enumerate()
+                .for_each_init(make_scratch, |sc, (i, (gc, hc))| row(i, sc, gc, hc));
+        } else {
+            let mut sc = make_scratch();
+            for (i, (gc, hc)) in g_slice.chunks_mut(1).zip(h_slice.chunks_mut(1)).enumerate() {
+                row(i, &mut sc, gc, hc);
             }
         }
         Some((gradients, hessians))
@@ -673,3 +721,41 @@ mod tests {
         assert_relative_eq!(nll, 2.0 * expected_single, epsilon = 1e-10);
     }
 }
+
+#[cfg(test)]
+mod crps_par_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// The row-parallel CRPS gradient fill must reproduce the serial fill bit
+    /// for bit — same gradients, same metric-preconditioned hessians — above
+    /// the parallel threshold, including out-of-support rows and rates from
+    /// near-zero to well past the truncation cap.
+    #[test]
+    fn crps_gradients_parallel_matches_serial() {
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        let n = 3_000usize;
+        let mut state = 9u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (1u64 << 31) as f64
+        };
+        let margins = Array2::from_shape_fn((n, 1), |_| next() * 7.0 - 3.0); // rate e^-3 .. e^4
+        let transformed = margins.mapv(f64::exp);
+        let mut y = Array1::from_shape_fn(n, |_| (next() * 25.0).floor());
+        y[17] = -1.0; // out of support: zero gradient row
+        y[18] = f64::NAN;
+        let yv = y.view();
+        let target = ResponseData::Univariate(&yv);
+        let (gp, hp) = d
+            .analytical_crps_gradients_impl(&margins.view(), &transformed.view(), &target, false)
+            .unwrap();
+        let (gs, hs) = d
+            .analytical_crps_gradients_impl(&margins.view(), &transformed.view(), &target, true)
+            .unwrap();
+        assert_eq!(gp, gs, "gradients differ between parallel and serial");
+        assert_eq!(hp, hs, "hessians differ between parallel and serial");
+        assert!(gp.iter().any(|v| *v != 0.0), "test data produced no gradient at all");
+    }
+}
+
