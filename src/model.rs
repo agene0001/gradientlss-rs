@@ -1327,7 +1327,10 @@ mod analytic_metric_probe {
                     .analytic_crps(&[3.0], &[labels[i]])
                     .expect("poisson analytic")
             })
-            .sum();
-        assert!((m - want).abs() < 1e-9, "metric {m} != analytic sum {want}");
+            .sum::<f64>()
+            / 4.0;
+        // `metric_on_transformed` is a PER-OBSERVATION mean since 985cec7
+        // (2026-08-31); this expectation was left at the raw sum.
+        assert!((m - want).abs() < 1e-9, "metric {m} != analytic mean {want}");
     }
 }
