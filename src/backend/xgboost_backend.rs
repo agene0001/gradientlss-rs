@@ -199,6 +199,7 @@ impl XGBoostDataset {
         xgb_params: &HashMap<String, String>,
         n_params: usize,
         start_values: Option<&Array1<f64>>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
     ) -> Result<DMatrix> {
         // First n_rows labels; for multivariate targets these are dummies (the
         // objective reads the real labels from `full_labels`).
@@ -233,14 +234,9 @@ impl XGBoostDataset {
         };
 
         // Start values as base margin, matching Python:
-        // base_margin = np.ones((n_rows, 1)) * start_values, flattened row-major.
-        if let Some(sv) = start_values {
-            let mut margin = Vec::with_capacity(self.n_rows * n_params);
-            for _i in 0..self.n_rows {
-                for j in 0..n_params {
-                    margin.push(sv[j] as f32);
-                }
-            }
+        // base_margin = np.ones((n_rows, 1)) * start_values, flattened row-major —
+        // plus the optional per-row offsets on top (see the trait doc).
+        if let Some(margin) = base_margin_rows(self.n_rows, n_params, start_values, row_offsets)? {
             dmatrix.set_base_margin(&margin).map_err(|e| {
                 GradientLSSError::BackendError(format!("Failed to set base_margin: {}", e))
             })?;
@@ -309,6 +305,42 @@ fn copy_preds_into(preds: &[f32], out: &mut Array2<f64>) -> Result<()> {
 }
 
 /// Helper to reshape flat predictions from XGBoost into (n_samples, n_params).
+/// Row-major `(n_rows × n_params)` base margin = start values (constant per
+/// parameter) + per-row offsets, as f32 for XGBoost. `None` when neither is
+/// given (XGBoost then uses its own `base_score`). Offsets are validated
+/// against the expected shape — a silent shape mismatch would misalign every
+/// row's margin.
+fn base_margin_rows(
+    n_rows: usize,
+    n_params: usize,
+    start_values: Option<&Array1<f64>>,
+    row_offsets: Option<ArrayView2<'_, f64>>,
+) -> Result<Option<Vec<f32>>> {
+    if start_values.is_none() && row_offsets.is_none() {
+        return Ok(None);
+    }
+    if let Some(off) = row_offsets {
+        if off.nrows() != n_rows || off.ncols() != n_params {
+            return Err(GradientLSSError::InvalidParameter(format!(
+                "row_offsets shape ({}, {}) does not match (n_rows, n_params) = ({}, {})",
+                off.nrows(),
+                off.ncols(),
+                n_rows,
+                n_params
+            )));
+        }
+    }
+    let mut margin = Vec::with_capacity(n_rows * n_params);
+    for i in 0..n_rows {
+        for j in 0..n_params {
+            let sv = start_values.map_or(0.0, |s| s[j]);
+            let off = row_offsets.map_or(0.0, |o| o[[i, j]]);
+            margin.push((sv + off) as f32);
+        }
+    }
+    Ok(Some(margin))
+}
+
 fn prediction_to_array2(preds: &[f32], n_samples: usize, n_params: usize) -> Array2<f64> {
     let mut result = Array2::zeros((n_samples, n_params));
     // XGBoost multi-output returns predictions row-major: [s0_p0, s0_p1, ..., s1_p0, ...]
@@ -347,6 +379,8 @@ impl BackendModel for XGBoostModel {
                 metric_fn,
                 start_values,
                 None,
+                None,
+                None,
             )?;
         Ok(model)
     }
@@ -359,6 +393,8 @@ impl BackendModel for XGBoostModel {
         objective_fn: F,
         metric_fn: M,
         start_values: Option<&Array1<f64>>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+        valid_row_offsets: Option<ArrayView2<'_, f64>>,
         mut callbacks: Option<&mut C>,
     ) -> Result<(Self, TrainingResult)>
     where
@@ -400,7 +436,8 @@ impl BackendModel for XGBoostModel {
         // Training DMatrix, built with the forced params in hand so the
         // quantile binning (hist) sees the same max_bin as the booster;
         // carries base margin (start values) and weights.
-        let train_dmat = train_data.build_train_dmatrix(&xgb_params, n_params, start_values)?;
+        let train_dmat =
+            train_data.build_train_dmatrix(&xgb_params, n_params, start_values, row_offsets)?;
 
         // For validation-based early stopping.
         let (valid_features, valid_labels) = if let Some(ref vd) = valid_data {
@@ -421,13 +458,14 @@ impl BackendModel for XGBoostModel {
                 let mut dm = DMatrix::from_dense(vd.features(), *vr).map_err(|e| {
                     GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
                 })?;
-                if let Some(sv) = start_values {
-                    let mut margin = Vec::with_capacity(*vr * n_params);
-                    for _i in 0..*vr {
-                        for j in 0..n_params {
-                            margin.push(sv[j] as f32);
-                        }
-                    }
+                if row_offsets.is_some() && valid_row_offsets.is_none() {
+                    return Err(GradientLSSError::InvalidParameter(
+                        "row_offsets given for the train set but no valid_row_offsets for the \
+                         validation set — early stopping would score a margin-less model"
+                            .to_string(),
+                    ));
+                }
+                if let Some(margin) = base_margin_rows(*vr, n_params, start_values, valid_row_offsets)? {
                     dm.set_base_margin(&margin).map_err(|e| {
                         GradientLSSError::BackendError(format!(
                             "Failed to set valid base_margin: {}",
@@ -1217,6 +1255,8 @@ mod tests {
             sq_metric,
             None,
             None,
+            None,
+            None,
         )
         .unwrap()
     }
@@ -1332,6 +1372,8 @@ mod tests {
             &config,
             sq_objective,
             sq_metric,
+            None,
+            None,
             None,
             None,
         )

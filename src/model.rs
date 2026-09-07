@@ -59,6 +59,13 @@ pub struct GradientLSS<B: Backend> {
     /// instead of recomputing them (see `preset_start_values`). Consumed by
     /// that call, so any later train recomputes as usual. Not serialized.
     start_values_preset: bool,
+    /// Set by `train_with_callbacks_and_offsets` when per-row offsets were
+    /// supplied: the trees then encode ADJUSTMENTS around a per-row prior and
+    /// only predict correctly when `predict_with_offset` receives that row's
+    /// offset again. In-process guard only — not serialized (the bincode state
+    /// is not self-describing, so adding a field would break every saved
+    /// model); a loaded model's caller owns this knowledge.
+    trained_with_row_offsets: bool,
     _backend: PhantomData<B>,
 }
 
@@ -69,6 +76,7 @@ impl<B: Backend> GradientLSS<B> {
             model: None,
             start_values: None,
             start_values_preset: false,
+            trained_with_row_offsets: false,
             _backend: PhantomData,
         }
     }
@@ -142,6 +150,7 @@ impl<B: Backend> GradientLSS<B> {
             model: Some(model),
             start_values: state.start_values,
             start_values_preset: false,
+            trained_with_row_offsets: false,
             _backend: PhantomData,
         })
     }
@@ -445,6 +454,35 @@ impl<B: Backend> GradientLSS<B> {
         config: TrainConfig,
         callbacks: Option<&mut C>,
     ) -> Result<((), TrainingResult)> {
+        self.train_with_callbacks_and_offsets(
+            train_data, valid_data, params, config, callbacks, None, None,
+        )
+    }
+
+    /// [`train_with_callbacks`] with a per-row boosting OFFSET.
+    ///
+    /// `row_offsets` is `(n_train_rows, n_params)` in RAW (pre-response)
+    /// parameter space and is added on top of the unconditional start values
+    /// as each row's base margin: the trees then learn adjustments around a
+    /// per-row prior instead of around one global constant. The classic use is
+    /// a location column holding `link⁻¹(prior expected value)` — e.g.
+    /// `ln(expected count)` under an `Exp` response — with zeros elsewhere.
+    /// `valid_row_offsets` must accompany `valid_data`. Predictions from a
+    /// model trained this way need the row's offset back:
+    /// [`predict_with_offset`] / [`predict_transformed_with_offset`].
+    ///
+    /// `cv` / `hyper_opt` do not thread offsets (they call the plain train);
+    /// a tuned run wanting offsets must supply them per fold itself.
+    pub fn train_with_callbacks_and_offsets<C: TrainingCallback>(
+        &mut self,
+        train_data: &mut B::Dataset,
+        valid_data: Option<&mut B::Dataset>,
+        params: B::Params,
+        config: TrainConfig,
+        callbacks: Option<&mut C>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+        valid_row_offsets: Option<ArrayView2<'_, f64>>,
+    ) -> Result<((), TrainingResult)> {
         // CRPS gradients are finite differences through `sample` with a fixed
         // seed — only meaningful when the sampler is smooth in its parameters
         // (torch rsample analogue). Rejection/discrete samplers would turn each
@@ -500,10 +538,13 @@ impl<B: Backend> GradientLSS<B> {
             self.create_objective_fn(Arc::clone(&transform_cache)),
             self.create_metric_fn(transform_cache),
             self.start_values.as_ref(),
+            row_offsets,
+            valid_row_offsets,
             callbacks,
         )?;
 
         self.model = Some(model);
+        self.trained_with_row_offsets = row_offsets.is_some();
         Ok(((), result))
     }
 
@@ -699,14 +740,45 @@ impl<B: Backend> GradientLSS<B> {
     /// `Distribution::finalize_predicted_params`), which must NOT be fed back
     /// into `nll`. CV/hyper-opt scoring therefore uses this method.
     pub(crate) fn predict_transformed(&self, features: &ArrayView2<f64>) -> Result<Array2<f64>> {
+        self.predict_transformed_with_offset(features, None)
+    }
+
+    /// [`predict_transformed`] for a model trained with per-row offsets: the
+    /// same `(n_rows, n_params)` raw-space offsets the rows would have carried
+    /// in training are added back before the response functions. A model that
+    /// was trained with offsets in this process refuses to predict without
+    /// them (it would silently drop every row's prior).
+    pub fn predict_transformed_with_offset(
+        &self,
+        features: &ArrayView2<f64>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+    ) -> Result<Array2<f64>> {
         let model = self
             .model
             .as_ref()
             .ok_or(GradientLSSError::ModelNotTrained)?;
+        if self.trained_with_row_offsets && row_offsets.is_none() {
+            return Err(GradientLSSError::InvalidParameter(
+                "model was trained with row offsets; predict_with_offset needs them back"
+                    .to_string(),
+            ));
+        }
 
-        // `predict_raw` hands us an owned array — add the start values in place
-        // rather than cloning a second full matrix.
+        // `predict_raw` hands us an owned array — add the start values (and
+        // offsets) in place rather than cloning a second full matrix.
         let mut predictions = model.predict_raw(features)?;
+        if let Some(off) = row_offsets {
+            if off.nrows() != predictions.nrows() || off.ncols() != predictions.ncols() {
+                return Err(GradientLSSError::InvalidParameter(format!(
+                    "row_offsets shape ({}, {}) does not match predictions ({}, {})",
+                    off.nrows(),
+                    off.ncols(),
+                    predictions.nrows(),
+                    predictions.ncols()
+                )));
+            }
+            predictions += &off;
+        }
         if let Some(ref start_vals) = self.start_values {
             for mut row in predictions.rows_mut() {
                 for (j, val) in row.iter_mut().enumerate() {
@@ -726,7 +798,21 @@ impl<B: Backend> GradientLSS<B> {
         quantiles: &[f64],
         seed: u64,
     ) -> Result<PredictionOutput> {
-        let params = self.predict_transformed(features)?;
+        self.predict_with_offset(features, None, pred_type, n_samples, quantiles, seed)
+    }
+
+    /// [`predict`] with the per-row offsets a model trained through
+    /// [`train_with_callbacks_and_offsets`] needs back.
+    pub fn predict_with_offset(
+        &self,
+        features: &ArrayView2<f64>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+        pred_type: PredType,
+        n_samples: usize,
+        quantiles: &[f64],
+        seed: u64,
+    ) -> Result<PredictionOutput> {
+        let params = self.predict_transformed_with_offset(features, row_offsets)?;
 
         match pred_type {
             PredType::Parameters => Ok(PredictionOutput::Parameters(
@@ -845,6 +931,9 @@ impl<B: Backend> GradientLSS<B> {
 #[cfg(all(test, feature = "lightgbm"))]
 mod lightgbm_tests {
     use super::*;
+    use crate::backend::BackendDataset;
+    #[cfg(feature = "xgboost")]
+    use crate::backend::XGBoostBackend;
     use crate::backend::lightgbm_backend::LightGBMBackend;
     use crate::distributions::{
         Dirichlet, Expectile, Gaussian, LossFn, MVN, MVNLoRa, MVT, Stabilization,
@@ -852,6 +941,131 @@ mod lightgbm_tests {
     use crate::utils::ResponseFn;
     use ndarray::array;
     use std::sync::Arc;
+
+    /// Row offsets: all-zero offsets must reproduce the offset-free model
+    /// exactly, and shifting every row's location offset by δ must move the
+    /// predicted (identity-linked) Gaussian mean by exactly δ — the trees see
+    /// identical gradients either way, only the margin differs.
+    fn row_offset_contract<B: Backend>()
+    where
+        B::Dataset: BackendDataset,
+    {
+        let dist = || {
+            Arc::new(Gaussian::new(
+                Stabilization::None,
+                ResponseFn::Exp,
+                LossFn::Nll,
+                false,
+            )) as Arc<dyn Distribution>
+        };
+        // 400 rows: LightGBM's default min_data_in_leaf (20) makes no split at
+        // all on a few dozen rows, leaving both models at the constant start
+        // value — nothing to compare.
+        let n = 400usize;
+        let features: Array2<f64> =
+            Array2::from_shape_fn((n, 2), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0);
+        let labels: Array1<f64> = Array1::from_shape_fn(n, |i| 2.0 + features[[i, 0]] * 3.0 - features[[i, 1]]);
+        let params = B::create_params(2);
+        let mut config = TrainConfig::default();
+        config.num_boost_round = 20;
+        config.early_stopping_rounds = None;
+
+        let mut plain = GradientLSS::<B>::new(dist());
+        let mut d = B::Dataset::from_data(features.view(), labels.view()).unwrap();
+        plain.train(&mut d, None, params.clone(), config.clone()).unwrap();
+        let p_plain = plain.predict_transformed(&features.view()).unwrap();
+
+        let zeros = Array2::<f64>::zeros((n, 2));
+        let mut with_zero = GradientLSS::<B>::new(dist());
+        let mut d = B::Dataset::from_data(features.view(), labels.view()).unwrap();
+        with_zero
+            .train_with_callbacks_and_offsets(
+                &mut d,
+                None,
+                params.clone(),
+                config.clone(),
+                None::<&mut crate::backend::HistoryCallback>,
+                Some(zeros.view()),
+                None,
+            )
+            .unwrap();
+        assert!(
+            with_zero.predict_transformed(&features.view()).is_err(),
+            "offset-trained model must refuse to predict without offsets"
+        );
+        let p_zero = with_zero
+            .predict_transformed_with_offset(&features.view(), Some(zeros.view()))
+            .unwrap();
+        assert_eq!(p_plain, p_zero, "zero offsets must equal no offsets, bitwise");
+
+        // δ on the location column (param 0; identity link for Gaussian loc).
+        let delta = 1.5;
+        let mut off = Array2::<f64>::zeros((n, 2));
+        off.column_mut(0).fill(delta);
+        let mut shifted = GradientLSS::<B>::new(dist());
+        let mut d = B::Dataset::from_data(features.view(), labels.view()).unwrap();
+        shifted
+            .train_with_callbacks_and_offsets(
+                &mut d,
+                None,
+                params,
+                config,
+                None::<&mut crate::backend::HistoryCallback>,
+                Some(off.view()),
+                None,
+            )
+            .unwrap();
+        // Additivity: for ONE trained model the offset is added back in raw
+        // space, so predicting with every location offset moved by +1 must move
+        // the identity-linked Gaussian mean by exactly 1 and leave the scale
+        // untouched. (A δ-shifted margin does NOT reproduce the offset-free
+        // model after a fixed number of rounds — the trees only absorb the
+        // shift at convergence — so that is deliberately not asserted.)
+        let p_shift = shifted
+            .predict_transformed_with_offset(&features.view(), Some(off.view()))
+            .unwrap();
+        let mut off_plus = off.clone();
+        off_plus.column_mut(0).mapv_inplace(|v| v + 1.0);
+        let p_plus = shifted
+            .predict_transformed_with_offset(&features.view(), Some(off_plus.view()))
+            .unwrap();
+        for i in 0..n {
+            assert!(
+                ((p_plus[[i, 0]] - p_shift[[i, 0]]) - 1.0).abs() < 1e-9,
+                "row {i}: loc moved by {} not 1.0",
+                p_plus[[i, 0]] - p_shift[[i, 0]]
+            );
+            assert_eq!(p_plus[[i, 1]], p_shift[[i, 1]], "row {i}: scale must not move");
+        }
+        // And the prior genuinely entered training: the shifted model's raw
+        // trees differ from the plain model's (they fit a different residual).
+        let raw_shift = shifted
+            .predict_transformed_with_offset(&features.view(), Some(zeros.view()))
+            .unwrap();
+        let max_diff = (0..n)
+            .map(|i| (raw_shift[[i, 0]] - p_plain[[i, 0]]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "[row_offset_contract] max |shifted-trees − plain| = {max_diff:.6}; plain loc[0..3] = {:?}; shifted loc[0..3] = {:?}",
+            &p_plain.column(0).to_vec()[..3],
+            &raw_shift.column(0).to_vec()[..3]
+        );
+        assert!(
+            max_diff > 1e-6,
+            "offset-trained trees must differ from the plain model's (max diff {max_diff})"
+        );
+    }
+
+    #[cfg(feature = "xgboost")]
+    #[test]
+    fn row_offsets_xgboost_contract() {
+        row_offset_contract::<XGBoostBackend>();
+    }
+
+    #[test]
+    fn row_offsets_lightgbm_contract() {
+        row_offset_contract::<LightGBMBackend>();
+    }
 
     #[test]
     fn test_univariate_training() {

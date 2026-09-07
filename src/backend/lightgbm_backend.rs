@@ -322,6 +322,8 @@ impl BackendModel for LightGBMModel {
                 metric_fn,
                 start_values,
                 None,
+                None,
+                None,
             )?;
         Ok(model)
     }
@@ -334,6 +336,8 @@ impl BackendModel for LightGBMModel {
         objective_fn: F,
         metric_fn: M,
         start_values: Option<&Array1<f64>>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+        valid_row_offsets: Option<ArrayView2<'_, f64>>,
         mut callbacks: Option<&mut C>,
     ) -> Result<(Self, TrainingResult)>
     where
@@ -343,6 +347,24 @@ impl BackendModel for LightGBMModel {
     {
         let n_params = params.n_dist_params();
         let n_samples = train_data.num_rows();
+        if let Some(off) = row_offsets {
+            if off.nrows() != n_samples || off.ncols() != n_params {
+                return Err(GradientLSSError::InvalidParameter(format!(
+                    "row_offsets shape ({}, {}) does not match (n_rows, n_params) = ({}, {})",
+                    off.nrows(),
+                    off.ncols(),
+                    n_samples,
+                    n_params
+                )));
+            }
+            if valid_data.is_some() && valid_row_offsets.is_none() {
+                return Err(GradientLSSError::InvalidParameter(
+                    "row_offsets given for the train set but no valid_row_offsets for the \
+                     validation set — early stopping would score a margin-less model"
+                        .to_string(),
+                ));
+            }
+        }
         let n_features = train_data.n_cols();
         let labels = train_data.get_labels()?;
 
@@ -366,7 +388,10 @@ impl BackendModel for LightGBMModel {
             GradientLSSError::BackendError(format!("Failed to create Booster: {}", e))
         })?;
 
-        // Initialize predictions
+        // Initialize predictions: constant start values + optional per-row
+        // offsets (the LightGBM analogue of XGBoost's base_margin — the raw
+        // booster output is added to this seed every round, and the caller
+        // adds the same seed back at prediction).
         let mut predictions = Array2::zeros((n_samples, n_params));
         if let Some(sv) = start_values {
             for i in 0..n_samples {
@@ -374,6 +399,9 @@ impl BackendModel for LightGBMModel {
                     predictions[[i, j]] = sv[j];
                 }
             }
+        }
+        if let Some(off) = row_offsets {
+            predictions += &off;
         }
 
         // Prepare validation data if available (Mat borrows the dataset's
@@ -396,6 +424,18 @@ impl BackendModel for LightGBMModel {
                     valid_predictions[[i, j]] = sv[j];
                 }
             }
+        }
+        if let (Some(off), true) = (valid_row_offsets, valid_n_samples > 0) {
+            if off.nrows() != valid_n_samples || off.ncols() != n_params {
+                return Err(GradientLSSError::InvalidParameter(format!(
+                    "valid_row_offsets shape ({}, {}) does not match ({}, {})",
+                    off.nrows(),
+                    off.ncols(),
+                    valid_n_samples,
+                    n_params
+                )));
+            }
+            valid_predictions += &off;
         }
 
         // Whether the per-round train metric is needed at all: it drives early
@@ -1067,6 +1107,8 @@ mod tests {
             sq_metric,
             None,
             None,
+            None,
+            None,
         )
         .unwrap()
     }
@@ -1172,6 +1214,8 @@ mod tests {
             &config,
             sq_objective,
             sq_metric,
+            None,
+            None,
             None,
             None,
         )

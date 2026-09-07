@@ -800,6 +800,13 @@ pub trait BackendModel: Sized {
     /// * `objective_fn` - Custom objective function returning gradients and hessians
     /// * `metric_fn` - Metric function for evaluation
     /// * `start_values` - Optional start values for distributional parameters
+    /// * `row_offsets` - Optional per-row additive margin, `(n_train_rows, n_params)`,
+    ///   added ON TOP of `start_values` before the first tree (a boosting offset /
+    ///   base margin per row — e.g. `log(prior expected count)` in the location
+    ///   column so the trees learn adjustments around a per-row prior). The caller
+    ///   must add the same offsets back at prediction (`GradientLSS::predict_with_offset`).
+    /// * `valid_row_offsets` - The validation set's offsets, `(n_valid_rows, n_params)`;
+    ///   required whenever `valid_data` and `row_offsets` are both given.
     /// * `callbacks` - Optional callbacks for monitoring and control
     ///
     /// # Returns
@@ -812,6 +819,8 @@ pub trait BackendModel: Sized {
         objective_fn: F,
         metric_fn: M,
         start_values: Option<&Array1<f64>>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+        valid_row_offsets: Option<ArrayView2<'_, f64>>,
         callbacks: Option<&mut C>,
     ) -> Result<(Self, TrainingResult)>
     where
