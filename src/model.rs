@@ -84,9 +84,20 @@ impl<B: Backend> GradientLSS<B> {
     /// Pre-set the unconditional start values so the NEXT `train` call skips
     /// the L-BFGS start-value fit. Intended for callers that retrain on the
     /// same labels repeatedly (e.g. `hyper_opt` reuses each CV fold's start
-    /// values across trials — they depend only on the fold's train labels).
-    /// The preset applies to exactly one train call.
-    pub(crate) fn preset_start_values(&mut self, start_values: Array1<f64>) {
+    /// values across trials — they depend only on the fold's train labels),
+    /// and for OFFSET models: the built-in start is fit to the labels alone,
+    /// so with per-row offsets (`train_with_callbacks_and_offsets`) the
+    /// boosting starts `mean(offset)` too high in the location column. A
+    /// caller that knows the link can pass the offset-aware intercept (for
+    /// a Poisson under `exp` with offsets `o_i`: `ln(Σ y_i / Σ exp(o_i))`).
+    /// Starting that far off is not merely slow — when the fitted mean sits
+    /// several times above every label, each row's gradient is proportional
+    /// to its hessian, no split has positive gain under an L2 penalty, and
+    /// LightGBM reports the fit FINISHED at round 0 with zero trees (XGBoost
+    /// emits constant stumps and walks the intercept down instead).
+    /// The preset applies to exactly one train call and is saved with the
+    /// model like a computed start value, so prediction adds it back.
+    pub fn preset_start_values(&mut self, start_values: Array1<f64>) {
         self.start_values = Some(start_values);
         self.start_values_preset = true;
     }
