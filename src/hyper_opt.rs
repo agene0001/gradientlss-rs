@@ -277,11 +277,32 @@ impl std::fmt::Debug for FoldWeightFn {
     }
 }
 
+/// A caller-supplied fold score: `(transformed params of the scored fold,
+/// n_rows x n_params, on the distribution's natural scale - a Poisson's
+/// column 0 is its rate; the fold's labels) -> score to MINIMIZE`.
+///
+/// When set, every trial is ranked (and pruned, and its round count chosen)
+/// by this instead of the model's own loss. It lets a search select
+/// hyperparameters by what is actually decided downstream - e.g. a pinball
+/// loss on the 90th percentile when only the over tail is bet - while the
+/// trees still descend their configured loss.
+#[derive(Clone)]
+pub struct FoldScoreFn(pub std::sync::Arc<dyn Fn(&Array2<f64>, &Array1<f64>) -> f64 + Send + Sync>);
+
+impl std::fmt::Debug for FoldScoreFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldScoreFn(..)")
+    }
+}
+
 /// Configuration for hyperparameter optimization.
 #[derive(Debug, Clone)]
 pub struct HyperOptConfig {
     /// Number of optimization trials
     pub n_trials: u32,
+    /// Score each fold with this instead of the model's loss (see
+    /// [`FoldScoreFn`]). `None` (the default) scores by the configured loss.
+    pub fold_score_fn: Option<FoldScoreFn>,
     /// See [`FoldWeightFn`]. `None` = unweighted folds (historical behaviour).
     pub fold_weight_fn: Option<FoldWeightFn>,
     /// Number of cross-validation folds
@@ -349,6 +370,7 @@ impl Default for HyperOptConfig {
     fn default() -> Self {
         Self {
             n_trials: 100,
+            fold_score_fn: None,
             fold_weight_fn: None,
             n_folds: 5,
             cv_scheme: CvScheme::KFold,
@@ -687,6 +709,7 @@ pub fn hyper_opt_with_transform<B: Backend>(
             fold_transform,
             &trial_params,
             config.fold_weight_fn.as_ref(),
+            config.fold_score_fn.as_ref(),
         );
 
         // Report result to optimizers (even for pruned trials). `cv_score` is
@@ -815,6 +838,7 @@ fn cv_with_pruning<B: Backend>(
     fold_transform: Option<&dyn FoldTransform>,
     trial_params: &HashMap<String, Value>,
     fold_weight_fn: Option<&FoldWeightFn>,
+    fold_score_fn: Option<&FoldScoreFn>,
 ) -> (f64, bool, Vec<f64>, Vec<usize>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
@@ -1025,7 +1049,11 @@ fn cv_with_pruning<B: Backend>(
         let score = match fold_model.predict_transformed(&test_features.view()) {
             Ok(preds) => {
                 let test_labels_owned = test_labels.to_owned();
-                fold_model.metric_on_transformed(&preds, &test_labels_owned)
+                match fold_score_fn {
+                    // The caller's objective, on the same transformed params.
+                    Some(f) => (f.0)(&preds, &test_labels_owned),
+                    None => fold_model.metric_on_transformed(&preds, &test_labels_owned),
+                }
             }
             Err(_) => f64::INFINITY,
         };
@@ -1166,6 +1194,53 @@ pub fn hyper_opt_simple<B: Backend>(
 ) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
     let result = hyper_opt(model, features, labels, hp_dict, n_trials, n_folds, 42)?;
     Ok(result.best_params)
+}
+
+#[cfg(all(test, feature = "xgboost"))]
+mod fold_score_fn_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// With a custom fold score the search ranks trials by it: a score that
+    /// is the predicted rate's mean distance from 4.0 picks a search whose
+    /// best score is the smallest such distance over the trials, and the
+    /// reported `best_score` is on that scale (not an NLL).
+    #[test]
+    fn fold_score_fn_replaces_the_loss_as_the_trial_score() {
+        use crate::backend::XGBoostBackend;
+        use crate::distributions::{LossFn, Poisson, Stabilization};
+        use crate::utils::ResponseFn;
+        use ndarray::Array;
+        let n = 400;
+        let x = Array::from_shape_fn((n, 3), |(i, j)| ((i * 7 + j * 13) % 17) as f64 / 17.0);
+        let y = Array::from_shape_fn(n, |i| ((i * 5) % 9) as f64);
+        let mut hp = HashMap::new();
+        hp.insert("max_depth".to_string(), serde_json::json!({"low": 2, "high": 4, "type": "int"}));
+        hp.insert("learning_rate".to_string(), serde_json::json!({"low": 0.05, "high": 0.3}));
+        let score_fn = FoldScoreFn(std::sync::Arc::new(|preds: &Array2<f64>, _y: &Array1<f64>| {
+            preds.column(0).iter().map(|r| (r - 4.0).abs()).sum::<f64>() / preds.nrows() as f64
+        }));
+        let config = HyperOptConfig {
+            n_trials: 4,
+            n_folds: 2,
+            num_boost_round: 20,
+            early_stopping_rounds: Some(5),
+            fold_score_fn: Some(score_fn),
+            verbose: false,
+            ..Default::default()
+        };
+        let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Poisson::new(
+            Stabilization::None,
+            ResponseFn::Exp,
+            LossFn::Nll,
+            false,
+        )));
+        let result = hyper_opt_with_transform(&mut model, &x, &y, &hp, config, None).expect("search");
+        // A mean absolute distance of rates from 4.0 on y in 0..9: well under
+        // the Poisson NLL (~2.5) the loss would report, and finite.
+        assert!(result.best_score.is_finite());
+        assert!(result.best_score < 2.0, "best_score {} is not on the custom scale", result.best_score);
+    }
 }
 
 #[cfg(test)]
@@ -1421,6 +1496,7 @@ mod xgboost_hyper_opt_tests {
                     0,
                     None,
                     &HashMap::new(),
+                    None,
                     None,
                 );
                 assert!(score.is_finite());
