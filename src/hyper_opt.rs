@@ -337,9 +337,14 @@ pub struct HyperOptConfig {
     /// setting is generous — large enough to keep real late improvements,
     /// small enough to cut a search that has plainly converged.
     ///
-    /// Only COMPLETED trials count: a pruned trial was killed precisely
-    /// because it was bad, and letting those advance the counter would end a
-    /// search that is still exploring productively.
+    /// EVERY trial advances the counter, pruned ones included (2026-10-28).
+    /// The counter asks whether the sampler's last `patience` draws found a
+    /// better configuration, and a pruned draw did not. The earlier rule
+    /// counted COMPLETED trials only; with the median pruner cutting ~2/3 of
+    /// the trials after warmup, a patience of 40 then needed ~120 draws, and
+    /// every search of the consumer's 2026-10-28 run spent its full 100-trial
+    /// budget although the net searches (9/9) had their final best, to within
+    /// 0.03 %, by trial 50.
     pub plateau_patience: Option<u32>,
     /// A previous search's winning params + score, replayed into the TPE
     /// optimizers as an observation BEFORE trial 1.
@@ -728,10 +733,9 @@ pub fn hyper_opt_with_transform<B: Backend>(
             }
         }
 
-        // Track best (only from completed trials)
-        if !pruned {
-            trials_since_best = trials_since_best.saturating_add(1);
-        }
+        // Every trial, pruned or not, is one more draw without a new best
+        // until the branch below says otherwise (see `plateau_patience`).
+        trials_since_best = trials_since_best.saturating_add(1);
         if !pruned && cv_score < best_score {
             best_score = cv_score;
             trials_since_best = 0;
