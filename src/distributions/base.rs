@@ -629,6 +629,19 @@ pub trait Distribution: Send + Sync {
         target: &ResponseData,
         max_iter: usize,
     ) -> Result<(f64, Array1<f64>)> {
+        self.calculate_start_values_default(target, max_iter)
+    }
+
+    /// The L-BFGS start-value search over the per-parameter response
+    /// functions — the default body of [`Self::calculate_start_values`], kept
+    /// callable so a distribution that overrides the start values for one of
+    /// its parameterizations can still reach it for the others
+    /// (`NegativeBinomial::MeanDispersion`, 2026-10-31).
+    fn calculate_start_values_default(
+        &self,
+        target: &ResponseData,
+        max_iter: usize,
+    ) -> Result<(f64, Array1<f64>)> {
         let n_params = self.n_params();
 
         // Clone target data for the optimization problem

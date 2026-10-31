@@ -71,12 +71,51 @@ pub(crate) fn nb_lgamma_ratio(r: f64, k: f64) -> Option<f64> {
     }
 }
 
+/// Which coordinates the two boosters descend in (2026-10-31).
+///
+/// `TotalCountProbs` is the torch convention this head always had: tree 0 is
+/// `total_count` (r), tree 1 is `probs`, and the mean r·p/(1−p) depends on
+/// BOTH — so every r step moves the mean and the p tree then corrects it; the
+/// Fisher information is not diagonal in (r, p). On NBA points the head
+/// settled at θ ≈ 2.0 against ~4.5 and sat 4 % CRPS behind the served
+/// Poisson-plus-width tree.
+///
+/// `MeanDispersion` descends in (log µ, log θ) — the NB2 coordinates in which
+/// the Fisher information IS diagonal, so the two trees do not fight: tree 0
+/// moves the mean with θ fixed, tree 1 moves the width with µ fixed. The
+/// Hessians are the expected Fisher information for log µ (µθ/(µ+θ)) and the
+/// observed information for log θ floored at `NB_THETA_HESS_FLOOR` (the usual
+/// LSS stabilisation — the observed form can go negative). Start values are
+/// the closed-form moments (no L-BFGS). A plain xgboost twin of this fit beat
+/// the served Poisson + width tree on CRPS and NLL 6/6 on the NBA points folds
+/// (`python_tests/nba_lit_width_experiments.py`, EXP=nbsched). The transformed
+/// / predicted parameters are STILL reported as `(total_count, probs)` — every
+/// consumer of the (n, p) convention is untouched; only the boosting
+/// coordinates differ. NLL only: the closed-form CRPS path chains through
+/// per-parameter response derivatives, which the joint transform has not.
+/// Old model files deserialize to `TotalCountProbs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NbParameterization {
+    #[default]
+    TotalCountProbs,
+    MeanDispersion,
+}
+
+/// Floor on the log-θ observed information in `MeanDispersion` mode.
+pub const NB_THETA_HESS_FLOOR: f64 = 1e-2;
+/// Floor on the log-µ Fisher information in `MeanDispersion` mode.
+pub const NB_MU_HESS_FLOOR: f64 = 1e-6;
+/// θ start value clip (method of moments can explode on under-dispersed data).
+pub const NB_THETA_START_CLIP: (f64, f64) = (0.2, 50.0);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegativeBinomial {
     params: Vec<DistributionParam>,
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
+    #[serde(default)]
+    parameterization: NbParameterization,
 }
 
 impl NegativeBinomial {
@@ -96,7 +135,48 @@ impl NegativeBinomial {
             stabilization,
             loss_fn,
             initialize,
+            parameterization: NbParameterization::TotalCountProbs,
         }
+    }
+
+    /// The `MeanDispersion` head (see [`NbParameterization`]): boosting in
+    /// (log µ, log θ) with `Exp` responses, moments start values, outputs
+    /// reported as (total_count, probs). `LossFn::Crps` is not supported in
+    /// this mode and falls back to the legacy parameterization with a warning.
+    pub fn new_mean_dispersion(stabilization: Stabilization, loss_fn: LossFn) -> Self {
+        if loss_fn == LossFn::Crps {
+            eprintln!(
+                "gradientlss: NegativeBinomial MeanDispersion supports NLL only — \
+                 using the total_count/probs parameterization for the CRPS loss"
+            );
+            return Self::new(stabilization, ResponseFn::Softplus, ResponseFn::Sigmoid, loss_fn, true);
+        }
+        let params = vec![
+            // The NAMES stay the output convention: column 0 is reported as
+            // total_count (= θ), column 1 as probs (= µ/(µ+θ)); the response
+            // functions here are the per-coordinate maps raw → (µ, θ) that
+            // `transform_params` composes with the joint reparameterization.
+            DistributionParam::new("total_count", ResponseFn::Exp),
+            DistributionParam::new("probs", ResponseFn::Exp),
+        ];
+        Self {
+            params,
+            stabilization,
+            loss_fn,
+            initialize: true,
+            parameterization: NbParameterization::MeanDispersion,
+        }
+    }
+
+    pub fn parameterization(&self) -> NbParameterization {
+        self.parameterization
+    }
+
+    /// `MeanDispersion`: raw (f, g) = (log µ, log θ) → (r, probs) = (θ, µ/(µ+θ)).
+    fn mean_dispersion_to_r_probs(f: f64, g: f64) -> (f64, f64) {
+        let mu = f.clamp(-10.0, 6.0).exp();
+        let theta = g.clamp(-6.0, 8.0).exp();
+        (theta, (mu / (mu + theta)).clamp(1e-6, 1.0 - 1e-6))
     }
 
     pub fn default() -> Self {
@@ -341,8 +421,135 @@ impl NegativeBinomial {
     }
 }
 
+impl NegativeBinomial {
+    /// The legacy L-BFGS start values (the trait default, kept callable from
+    /// the override so the two parameterizations can share one method).
+    fn calculate_start_values_lbfgs(
+        &self,
+        target: &ResponseData,
+        max_iter: usize,
+    ) -> crate::error::Result<(f64, ndarray::Array1<f64>)> {
+        // Re-dispatch through a legacy-mode clone so the trait default sees
+        // per-parameter response functions it can apply.
+        let mut legacy = self.clone();
+        legacy.parameterization = NbParameterization::TotalCountProbs;
+        Distribution::calculate_start_values_default(&legacy, target, max_iter)
+    }
+
+    /// `MeanDispersion` NLL gradients / Hessians in the raw coordinates
+    /// (f, g) = (log µ, log θ), NB2 log-likelihood
+    /// ℓ = lnΓ(y+θ) − lnΓ(θ) − lnΓ(y+1) + θ ln θ + y ln µ − (y+θ) ln(µ+θ):
+    ///   ∂ℓ/∂f = (y − µ) θ / (µ + θ)                 Fisher E[−∂²ℓ/∂f²] = µθ/(µ+θ)
+    ///   ∂ℓ/∂g = θ·a,  a = ψ(y+θ) − ψ(θ) + ln θ + 1 − ln(µ+θ) − (y+θ)/(µ+θ)
+    ///   ∂²ℓ/∂g² = θ·a + θ²·(ψ′(y+θ) − ψ′(θ) + 1/θ − 1/(µ+θ) − (µ−y)/(µ+θ)²)
+    /// Returned as the NLL (negated) gradient and the positive Hessians.
+    fn mean_dispersion_gradients(
+        &self,
+        predictions: &ArrayView2<f64>,
+        y: &ndarray::ArrayView1<f64>,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let n_samples = predictions.nrows();
+        let f_col = predictions.column(0);
+        let g_col = predictions.column(1);
+        let compute = |i: usize| -> (f64, f64, f64, f64) {
+            let k = y[i];
+            if !k.is_finite() || k < 0.0 {
+                return (0.0, NB_MU_HESS_FLOOR, 0.0, NB_THETA_HESS_FLOOR);
+            }
+            let f = if f_col[i].is_finite() { f_col[i] } else { 0.0 };
+            let g = if g_col[i].is_finite() { g_col[i] } else { 0.0 };
+            let mu = f.clamp(-10.0, 6.0).exp();
+            let th = g.clamp(-6.0, 8.0).exp();
+            let s = mu + th;
+            // log mu
+            let grad_f = (mu - k) * th / s;
+            let hess_f = (mu * th / s).max(NB_MU_HESS_FLOOR);
+            // log theta: psi differences (exact rational sums for integer k)
+            let (neg_dpsi, pos_dtri) = nb_psi_diff(th, k)
+                .unwrap_or_else(|| (-digamma(th + k) + digamma(th), -trigamma(th + k) + trigamma(th)));
+            let dpsi = -neg_dpsi; // ψ(y+θ) − ψ(θ)
+            let dtri = -pos_dtri; // ψ′(y+θ) − ψ′(θ)
+            let a = dpsi + th.ln() + 1.0 - s.ln() - (k + th) / s;
+            let dl_dg = th * a;
+            let d2 = th * a + th * th * (dtri + 1.0 / th - 1.0 / s - (mu - k) / (s * s));
+            let grad_g = -dl_dg;
+            let hess_g = (-d2).max(NB_THETA_HESS_FLOOR);
+            (grad_f, hess_f, grad_g, hess_g)
+        };
+        let mut gradients = Array2::zeros((n_samples, 2));
+        let mut hessians = Array2::zeros((n_samples, 2));
+        let g_slice = gradients.as_slice_mut().expect("contiguous");
+        let h_slice = hessians.as_slice_mut().expect("contiguous");
+        const PAR_MIN: usize = 256;
+        if n_samples >= PAR_MIN {
+            g_slice.par_chunks_mut(2).zip(h_slice.par_chunks_mut(2)).enumerate().for_each(|(i, (gc, hc))| {
+                let (g0, h0, g1, h1) = compute(i);
+                gc[0] = g0; gc[1] = g1; hc[0] = h0; hc[1] = h1;
+            });
+        } else {
+            g_slice.chunks_mut(2).zip(h_slice.chunks_mut(2)).enumerate().for_each(|(i, (gc, hc))| {
+                let (g0, h0, g1, h1) = compute(i);
+                gc[0] = g0; gc[1] = g1; hc[0] = h0; hc[1] = h1;
+            });
+        }
+        (gradients, hessians)
+    }
+}
+
 #[typetag::serde]
 impl Distribution for NegativeBinomial {
+    fn transform_params(&self, predictions: &ArrayView2<f64>) -> Array2<f64> {
+        if self.parameterization == NbParameterization::TotalCountProbs {
+            let mut result = Array2::zeros(predictions.dim());
+            for (i, param) in self.params.iter().enumerate() {
+                let col = predictions.column(i);
+                let mut out_col = result.column_mut(i);
+                param.response_fn.apply_into(&col, &mut out_col);
+            }
+            return result;
+        }
+        // MeanDispersion: a JOINT map — probs needs both raw scores.
+        let n = predictions.nrows();
+        let mut result = Array2::zeros((n, 2));
+        for i in 0..n {
+            let f = predictions[[i, 0]];
+            let g = predictions[[i, 1]];
+            let (f, g) = (if f.is_finite() { f } else { 0.0 }, if g.is_finite() { g } else { 0.0 });
+            let (r, probs) = Self::mean_dispersion_to_r_probs(f, g);
+            result[[i, 0]] = r;
+            result[[i, 1]] = probs;
+        }
+        result
+    }
+
+    fn calculate_start_values(
+        &self,
+        target: &ResponseData,
+        max_iter: usize,
+    ) -> crate::error::Result<(f64, ndarray::Array1<f64>)> {
+        if self.parameterization == NbParameterization::TotalCountProbs {
+            return self.calculate_start_values_lbfgs(target, max_iter);
+        }
+        // MeanDispersion: closed-form method of moments in the raw coordinates
+        // (log mean, log of the NB2 dispersion µ²/(var − µ)), θ clipped.
+        let y: Vec<f64> = match target {
+            ResponseData::Univariate(arr) => arr.iter().copied().filter(|v| v.is_finite() && *v >= 0.0).collect(),
+            ResponseData::Multivariate(_) => {
+                return Err(crate::error::GradientLSSError::InvalidInput(
+                    "NegativeBinomial is univariate".to_string(),
+                ))
+            }
+        };
+        let n = y.len().max(1) as f64;
+        let mean = (y.iter().sum::<f64>() / n).max(1e-3);
+        let var = y.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+        let theta = (mean * mean / (var - mean).max(1e-3)).clamp(NB_THETA_START_CLIP.0, NB_THETA_START_CLIP.1);
+        let raw = ndarray::Array1::from_vec(vec![mean.ln(), theta.ln()]);
+        let (r, probs) = Self::mean_dispersion_to_r_probs(raw[0], raw[1]);
+        let loss = self.compute_total_loss(&[r, probs], target);
+        Ok((loss, raw))
+    }
+
     fn clone_box(&self) -> Box<dyn Distribution> {
         Box::new(self.clone())
     }
@@ -478,6 +685,10 @@ impl Distribution for NegativeBinomial {
         };
 
         let n_samples = predictions.nrows();
+
+        if self.parameterization == NbParameterization::MeanDispersion {
+            return Some(self.mean_dispersion_gradients(predictions, y));
+        }
 
         let r_response_fn = &self.params[0].response_fn;
         let probs_response_fn = &self.params[1].response_fn;
@@ -730,6 +941,134 @@ mod tests {
     use crate::types::ResponseData;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    /// MeanDispersion (2026-10-31): the analytical (log µ, log θ) gradients match
+    /// central finite differences of the NLL taken through `transform_params`
+    /// (the joint map), and both Hessians are positive.
+    #[test]
+    fn mean_dispersion_gradients_match_finite_differences_through_the_joint_transform() {
+        let dist = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
+        let y = ndarray::array![0.0, 3.0, 7.0, 12.0, 25.0, 1.0];
+        let yv = y.view();
+        let target = ResponseData::Univariate(&yv);
+        let raw = ndarray::array![
+            [1.5f64, 1.0], [2.0, 0.5], [2.3, 1.6], [2.6, 2.2], [3.1, 0.2], [0.4, -0.5]
+        ];
+        let (g, h) = dist.analytical_gradients(&raw.view(), &dist.transform_params(&raw.view()).view(), &target).unwrap();
+        let eps = 1e-5;
+        for i in 0..raw.nrows() {
+            for j in 0..2 {
+                let mut up = raw.clone(); up[[i, j]] += eps;
+                let mut dn = raw.clone(); dn[[i, j]] -= eps;
+                let tu = dist.transform_params(&up.view());
+                let td = dist.transform_params(&dn.view());
+                let nll_u = -dist.log_prob(&[tu[[i, 0]], tu[[i, 1]]], &[y[i]]);
+                let nll_d = -dist.log_prob(&[td[[i, 0]], td[[i, 1]]], &[y[i]]);
+                let fd = (nll_u - nll_d) / (2.0 * eps);
+                assert!((g[[i, j]] - fd).abs() < 1e-5 * (1.0 + fd.abs()), "row {i} param {j}: analytical {} vs FD {fd}", g[[i, j]]);
+                assert!(h[[i, j]] > 0.0, "row {i} param {j}: hessian {} must be positive", h[[i, j]]);
+            }
+        }
+    }
+
+    /// The joint transform reports the legacy (total_count, probs) convention —
+    /// mean = r·p/(1−p) = µ, variance = µ + µ²/θ — so every downstream consumer
+    /// of (n, p) is untouched; the moments start values land on the raw
+    /// (log µ̄, log θ_mom) and are clipped.
+    #[test]
+    fn mean_dispersion_transform_and_start_values_keep_the_output_convention() {
+        let dist = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
+        let raw = ndarray::array![[2.0f64, 1.0], [0.0, 3.0]];
+        let t = dist.transform_params(&raw.view());
+        for i in 0..2 {
+            let (mu, th) = (raw[[i, 0]].exp(), raw[[i, 1]].exp());
+            let (r, probs) = (t[[i, 0]], t[[i, 1]]);
+            assert!((r - th).abs() < 1e-12);
+            let mean = r * probs / (1.0 - probs);
+            let var = mean / (1.0 - probs);
+            assert!((mean - mu).abs() < 1e-9, "mean {mean} vs mu {mu}");
+            assert!((var - (mu + mu * mu / th)).abs() < 1e-8, "var {var} vs NB2 {}", mu + mu * mu / th);
+        }
+        // start values: mean 10, var 40 -> theta = 100 / 30
+        let y = ndarray::Array1::from_vec(vec![4.0, 6.0, 10.0, 10.0, 14.0, 16.0, 2.0, 18.0, 8.0, 12.0]);
+        let yv = y.view();
+        let (_, sv) = dist.calculate_start_values(&ResponseData::Univariate(&yv), 10).unwrap();
+        let mean = y.mean().unwrap();
+        let var = y.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / y.len() as f64;
+        assert!((sv[0] - mean.ln()).abs() < 1e-12);
+        assert!((sv[1] - (mean * mean / (var - mean)).clamp(NB_THETA_START_CLIP.0, NB_THETA_START_CLIP.1).ln()).abs() < 1e-12);
+        // legacy mode still answers through the L-BFGS default
+        let legacy = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true);
+        assert_eq!(legacy.parameterization(), NbParameterization::TotalCountProbs);
+        let (_, sv2) = legacy.calculate_start_values(&ResponseData::Univariate(&yv), 10).unwrap();
+        assert_eq!(sv2.len(), 2);
+    }
+
+    /// A serialized legacy model (no `parameterization` field) deserializes to
+    /// `TotalCountProbs`; a MeanDispersion head round-trips.
+    #[test]
+    fn parameterization_serde_defaults_to_the_legacy_convention() {
+        let legacy_json = r#"{"params":[{"name":"total_count","response_fn":"Softplus"},{"name":"probs","response_fn":"Sigmoid"}],"stabilization":"None","loss_fn":"Nll","initialize":true}"#;
+        let d: NegativeBinomial = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(d.parameterization(), NbParameterization::TotalCountProbs);
+        let md = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
+        let back: NegativeBinomial = serde_json::from_str(&serde_json::to_string(&md).unwrap()).unwrap();
+        assert_eq!(back.parameterization(), NbParameterization::MeanDispersion);
+    }
+
+    /// θ RECOVERY on synthetic NB2 data (the measured failure: the legacy head
+    /// settled at θ ≈ 2.0 on NBA points where ~4.5 fits). µ = exp(1.5 + 0.8·x₀),
+    /// θ = 4 everywhere, 6,000 rows; both heads boosted 300 rounds at eta 0.05.
+    /// The MeanDispersion head must land within 25 % of the true θ in the
+    /// median and must not be further from it than the legacy head.
+    #[cfg(feature = "xgboost")]
+    #[test]
+    fn mean_dispersion_recovers_theta_on_synthetic_nb2_data() {
+        use crate::backend::{Backend, BackendDataset, BackendParams, ParamValue, PredictionOutput, TrainConfig, XGBoostBackend};
+        use crate::model::{GradientLSS, PredType};
+        use rand::RngExt;
+        use std::sync::Arc;
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let n = 6000usize;
+        let theta_true = 4.0f64;
+        let mut x = Array2::<f64>::zeros((n, 3));
+        let mut y = ndarray::Array1::<f64>::zeros(n);
+        for i in 0..n {
+            for j in 0..3 { x[[i, j]] = rng.random_range(-1.0..1.0); }
+            let mu = (1.5 + 0.8 * x[[i, 0]]).exp();
+            // NB2 draw: Gamma(theta, mu/theta) rate, then Poisson
+            let g = RandGamma::new(theta_true, mu / theta_true).unwrap().sample(&mut rng);
+            y[i] = RandPoisson::new(g.max(1e-9)).unwrap().sample(&mut rng);
+        }
+        let fit = |dist: NegativeBinomial| -> (f64, f64) {
+            let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(dist));
+            let mut ds = <XGBoostBackend as Backend>::Dataset::from_data(x.view(), y.view()).unwrap();
+            let mut params = XGBoostBackend::create_params(model.n_params());
+            params.set("eta", ParamValue::Float(0.05));
+            params.set("max_depth", ParamValue::Int(3));
+            let cfg = TrainConfig { num_boost_round: 300, early_stopping_rounds: None, verbose: false, collect_train_metrics: false, seed: 3 };
+            model.train(&mut ds, None, params, cfg).unwrap();
+            let out = match model.predict(&x.view(), PredType::Parameters, 0, &[], 1).unwrap() {
+                PredictionOutput::Parameters(p) => p,
+                _ => unreachable!(),
+            };
+            // total_count column = theta in both conventions
+            let mut th: Vec<f64> = out.column(0).to_vec();
+            th.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_theta = th[th.len() / 2];
+            let mean_abs_mu_err = (0..n).map(|i| {
+                let (r, pr) = (out[[i, 0]], out[[i, 1]]);
+                ((r * pr / (1.0 - pr)) - (1.5 + 0.8 * x[[i, 0]]).exp()).abs()
+            }).sum::<f64>() / n as f64;
+            (med_theta, mean_abs_mu_err)
+        };
+        let (th_md, mu_err_md) = fit(NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll));
+        let (th_legacy, mu_err_legacy) = fit(NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true));
+        eprintln!("theta: mean-dispersion {th_md:.2} legacy {th_legacy:.2} (true {theta_true}); mean |mu err| {mu_err_md:.3} vs {mu_err_legacy:.3}");
+        assert!((th_md - theta_true).abs() / theta_true < 0.25, "mean-dispersion theta {th_md} vs true {theta_true}");
+        assert!((th_md - theta_true).abs() <= (th_legacy - theta_true).abs() + 0.25, "legacy {th_legacy} closer than mean-dispersion {th_md}");
+        assert!(mu_err_md < 1.5 * mu_err_legacy + 0.05, "the mean must not degrade: {mu_err_md} vs {mu_err_legacy}");
+    }
 
     #[test]
     fn test_negative_binomial_creation() {
