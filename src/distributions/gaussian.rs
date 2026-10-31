@@ -178,11 +178,17 @@ impl Distribution for Gaussian {
             let g0 = -diff / scale_sq;
             let h0 = 1.0 / scale_sq;
             let grad_scale_param = 1.0 / scale - diff_sq / (scale_sq * scale);
-            let hess_scale_param = -1.0 / scale_sq + 3.0 * diff_sq / (scale_sq * scale_sq);
             let rd = resp_deriv[i];
-            let rsd = resp_second[i];
+            // Scale Hessian = the EXPECTED (Fisher) information 2/σ², chained
+            // through the response derivative (2026-10-31). The observed form
+            // −1/σ² + 3(y−µ)²/σ⁴ (plus grad·response″) is ≈ 0 for a row whose
+            // residual is small and NEGATIVE for |y−µ| < σ/√3 — unfloored, its
+            // Newton step g/h on the scale column blows up or flips sign row by
+            // row; with the `Exp` response this collapses to the constant 2 in
+            // log σ, the textbook LSS Gaussian. The `grad·response″` chain term
+            // has expectation zero and is dropped with it.
+            let h1 = (2.0 / scale_sq) * rd * rd;
             let g1 = grad_scale_param * rd;
-            let h1 = hess_scale_param * rd * rd + grad_scale_param * rsd;
             (g0, h0, g1, h1)
         };
 
@@ -235,6 +241,25 @@ mod tests {
     use crate::types::ResponseData;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    /// The scale Hessian is the Fisher information: with the `Exp` response it
+    /// is exactly 2 for every row, whatever the residual (the observed form was
+    /// ~0 or negative for small residuals), and the loc Hessian stays 1/σ².
+    #[test]
+    fn scale_hessian_is_the_fisher_information() {
+        let dist = Gaussian::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false);
+        let y = ndarray::array![1.0, 1.05, 3.0, -2.0];
+        let yv = y.view();
+        let raw = ndarray::array![[1.0f64, 0.0], [1.0, 0.0], [1.0, 0.7], [1.0, -0.5]];
+        let t = dist.transform_params(&raw.view());
+        let (_, h) = dist.analytical_gradients(&raw.view(), &t.view(), &ResponseData::Univariate(&yv)).unwrap();
+        for i in 0..4 {
+            // the Exp response adds EPSILON (sigma = e^eta + eps), so 2*sigma^2/(sigma+eps)^2, not 2 to 1e-9
+            assert!((h[[i, 1]] - 2.0).abs() < 1e-5, "row {i}: scale hessian {}", h[[i, 1]]);
+            let sigma = t[[i, 1]]; // the transformed scale (e^eta + EPSILON)
+            assert!((h[[i, 0]] - 1.0 / (sigma * sigma)).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn test_gaussian_creation() {
