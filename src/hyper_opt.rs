@@ -277,6 +277,21 @@ impl std::fmt::Debug for FoldWeightFn {
     }
 }
 
+/// Per-fold SCORING-row weights: called with the scoring rows' positions in
+/// the original row order, returns one weight per row (or `None` = the plain
+/// mean). The trial score is then the weighted mean of the configured loss,
+/// so a caller whose final fit down-weights some rows (e.g. short-minute NBA
+/// rows) ranks hyperparameters on the rows that fit cares about. Early
+/// stopping inside a fold still monitors the unweighted loss.
+#[derive(Clone)]
+pub struct FoldValWeightFn(pub std::sync::Arc<dyn Fn(&[usize]) -> Option<Vec<f64>> + Send + Sync>);
+
+impl std::fmt::Debug for FoldValWeightFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldValWeightFn(..)")
+    }
+}
+
 /// A caller-supplied fold score: `(transformed params of the scored fold,
 /// n_rows x n_params, on the distribution's natural scale - a Poisson's
 /// column 0 is its rate; the fold's labels) -> score to MINIMIZE`.
@@ -305,6 +320,8 @@ pub struct HyperOptConfig {
     pub fold_score_fn: Option<FoldScoreFn>,
     /// See [`FoldWeightFn`]. `None` = unweighted folds (historical behaviour).
     pub fold_weight_fn: Option<FoldWeightFn>,
+    /// See [`FoldValWeightFn`]. `None` = the plain mean (historical behaviour).
+    pub fold_val_weight_fn: Option<FoldValWeightFn>,
     /// Number of cross-validation folds
     pub n_folds: usize,
     /// How CV folds are partitioned (`KFold` default; `TimeSeries` for forward
@@ -377,6 +394,7 @@ impl Default for HyperOptConfig {
             n_trials: 100,
             fold_score_fn: None,
             fold_weight_fn: None,
+            fold_val_weight_fn: None,
             n_folds: 5,
             cv_scheme: CvScheme::KFold,
             seed: 42,
@@ -715,6 +733,7 @@ pub fn hyper_opt_with_transform<B: Backend>(
             &trial_params,
             config.fold_weight_fn.as_ref(),
             config.fold_score_fn.as_ref(),
+            config.fold_val_weight_fn.as_ref(),
         );
 
         // Report result to optimizers (even for pruned trials). `cv_score` is
@@ -843,6 +862,7 @@ fn cv_with_pruning<B: Backend>(
     trial_params: &HashMap<String, Value>,
     fold_weight_fn: Option<&FoldWeightFn>,
     fold_score_fn: Option<&FoldScoreFn>,
+    fold_val_weight_fn: Option<&FoldValWeightFn>,
 ) -> (f64, bool, Vec<f64>, Vec<usize>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
@@ -1053,10 +1073,12 @@ fn cv_with_pruning<B: Backend>(
         let score = match fold_model.predict_transformed(&test_features.view()) {
             Ok(preds) => {
                 let test_labels_owned = test_labels.to_owned();
-                match fold_score_fn {
+                let val_weights = fold_val_weight_fn.and_then(|f| (f.0)(&valid_idx));
+                match (fold_score_fn, val_weights) {
                     // The caller's objective, on the same transformed params.
-                    Some(f) => (f.0)(&preds, &test_labels_owned),
-                    None => fold_model.metric_on_transformed(&preds, &test_labels_owned),
+                    (Some(f), _) => (f.0)(&preds, &test_labels_owned),
+                    (None, Some(w)) => fold_model.metric_on_transformed_weighted(&preds, &test_labels_owned, &w),
+                    (None, None) => fold_model.metric_on_transformed(&preds, &test_labels_owned),
                 }
             }
             Err(_) => f64::INFINITY,

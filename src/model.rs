@@ -243,6 +243,51 @@ impl<B: Backend> GradientLSS<B> {
         self.metric_total_on_transformed(transformed, labels) / n_obs as f64
     }
 
+    /// [`Self::metric_on_transformed`] as a WEIGHTED mean over observations:
+    /// `Σ wᵢ ℓᵢ / Σ wᵢ` with `ℓᵢ` the row's NLL (`−log_prob`) or analytic CRPS
+    /// — the configured loss, row by row. With unit weights it equals the
+    /// unweighted metric (NaN rows are skipped like `par_nansum`). Falls back
+    /// to the unweighted metric where no per-row form exists (multivariate
+    /// targets, sample-based CRPS) or when the weights do not fit the rows.
+    pub(crate) fn metric_on_transformed_weighted(
+        &self,
+        transformed: &Array2<f64>,
+        labels: &Array1<f64>,
+        weights: &[f64],
+    ) -> f64 {
+        let n = labels.len();
+        let per_row_crps = matches!(self.dist.loss_fn(), LossFn::Crps);
+        if self.dist.n_targets() != 1
+            || weights.len() != n
+            || transformed.nrows() != n
+            || (per_row_crps && !self.dist.has_analytic_crps())
+        {
+            return self.metric_on_transformed(transformed, labels);
+        }
+        let (mut num, mut den) = (0.0_f64, 0.0_f64);
+        for i in 0..n {
+            let w = weights[i];
+            if !(w.is_finite() && w > 0.0) {
+                continue;
+            }
+            let params: Vec<f64> = transformed.row(i).to_vec();
+            let loss = if per_row_crps {
+                match self.dist.analytic_crps(&params, &[labels[i]]) {
+                    Some(v) => v,
+                    None => return f64::NAN,
+                }
+            } else {
+                -self.dist.log_prob(&params, &[labels[i]])
+            };
+            if loss.is_nan() {
+                continue;
+            }
+            num += w * loss;
+            den += w;
+        }
+        if den > 0.0 { num / den } else { f64::NAN }
+    }
+
     /// The raw total the scorers produce, before per-observation averaging.
     fn metric_total_on_transformed(&self, transformed: &Array2<f64>, labels: &Array1<f64>) -> f64 {
         match self.dist.loss_fn() {
