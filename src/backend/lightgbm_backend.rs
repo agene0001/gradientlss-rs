@@ -136,6 +136,11 @@ pub struct LightGBMDataset {
     features: Vec<f32>,
     /// Per-sample training weights, applied to grad/hess in the objective.
     weights: Option<Array1<f64>>,
+    /// Keep the binned Dataset for the next fit of this data (see
+    /// [`BackendDataset::retain_binned`]).
+    retain_binned: bool,
+    /// The kept Dataset and the key it was binned under.
+    binned: Option<(String, Arc<Dataset>)>,
 }
 
 impl std::fmt::Debug for LightGBMDataset {
@@ -161,7 +166,13 @@ impl BackendDataset for LightGBMDataset {
             labels: labels.to_owned(),
             features: features_f32,
             weights: None,
+            retain_binned: false,
+            binned: None,
         })
+    }
+
+    fn retain_binned(&mut self) {
+        self.retain_binned = true;
     }
 
     fn set_init_score(&mut self, _init_score: &Array1<f64>) -> Result<()> {
@@ -207,20 +218,105 @@ impl BackendDataset for LightGBMDataset {
     }
 }
 
+/// Rows at or below which LightGBM bins on every row, so `seed` cannot reach
+/// the bin mappers (`bin_construct_sample_cnt`'s default).
+const BIN_SAMPLE_ROWS: usize = 200_000;
+
+/// Params that configure the BOOSTER only, so fits differing in them can share
+/// one binned Dataset. An allow-list: anything not named here (`max_bin`,
+/// `min_data_in_leaf`, `feature_pre_filter`, ...) stays in the key, so an
+/// unknown knob rebuilds rather than reuses.
+fn is_booster_only_param(key: &str) -> bool {
+    matches!(
+        key,
+        "learning_rate"
+            | "eta"
+            | "max_depth"
+            | "num_leaves"
+            | "lambda_l1"
+            | "reg_alpha"
+            | "lambda_l2"
+            | "reg_lambda"
+            | "bagging_fraction"
+            | "subsample"
+            | "bagging_freq"
+            | "subsample_freq"
+            | "feature_fraction"
+            | "colsample_bytree"
+            | "feature_fraction_bynode"
+            | "colsample_bynode"
+            | "extra_trees"
+            | "min_sum_hessian_in_leaf"
+            | "min_child_weight"
+            | "min_gain_to_split"
+            | "gamma"
+    )
+}
+
 impl LightGBMDataset {
+    /// The Dataset-level part of `params`. Order-insensitive.
+    fn binned_key(&self, params: &Parameters) -> String {
+        let seed_is_inert = self.n_rows <= BIN_SAMPLE_ROWS;
+        let mut kept: Vec<String> = params
+            .0
+            .iter()
+            .filter(|(k, _)| !is_booster_only_param(k) && !(seed_is_inert && k == "seed"))
+            .map(|(k, v)| format!("{k}={v:?}"))
+            .collect();
+        kept.sort_unstable();
+        kept.join(",")
+    }
+
+    /// The training Dataset for `params`: the kept one when it was binned under
+    /// the same key, else freshly built (and kept, if retaining).
+    fn train_dataset(&mut self, params: &Parameters) -> Result<(String, Arc<Dataset>)> {
+        let key = self.binned_key(params);
+        if let Some((k, ds)) = &self.binned
+            && *k == key
+        {
+            return Ok((key, Arc::clone(ds)));
+        }
+        let ds = Arc::new(self.build_dataset(params, None)?);
+        if self.retain_binned {
+            self.binned = Some((key.clone(), Arc::clone(&ds)));
+        }
+        Ok((key, ds))
+    }
+
+    /// The validation Dataset binned against `reference`. Its key names the
+    /// reference, so a rebuilt training Dataset never pairs with a stale one.
+    fn valid_dataset(
+        &mut self,
+        reference: &Arc<Dataset>,
+        reference_key: &str,
+        params: &Parameters,
+    ) -> Result<Arc<Dataset>> {
+        let key = format!("{:p}|{reference_key}", Arc::as_ptr(reference));
+        if let Some((k, ds)) = &self.binned
+            && *k == key
+        {
+            return Ok(Arc::clone(ds));
+        }
+        let ds = Arc::new(self.build_dataset(params, Some(reference))?);
+        if self.retain_binned {
+            self.binned = Some((key, Arc::clone(&ds)));
+        }
+        Ok(ds)
+    }
+
     /// Build the binned `lgbm::Dataset` with the given (training) params —
     /// the bin mappers must see the same params as the booster, exactly like
-    /// `lgb.train`'s lazy `lgb.Dataset` construction in Python. Called once per
-    /// training run, for the training data only (validation data is predicted
-    /// through Mats and never needs binning).
-    fn build_dataset(&self, params: &Parameters) -> Result<Dataset> {
+    /// `lgb.train`'s lazy `lgb.Dataset` construction in Python. A validation
+    /// set passes the training Dataset as `reference` and shares its bin
+    /// mappers, which is what lets the booster keep its scores incrementally.
+    fn build_dataset(&self, params: &Parameters, reference: Option<&Dataset>) -> Result<Dataset> {
         let mat = Mat::from_slice(
             &self.features,
             self.n_rows,
             self.n_cols,
             lgbm::mat::RowMajor,
         );
-        let mut dataset = Dataset::from_mat(&mat, None, params).map_err(|e| {
+        let mut dataset = Dataset::from_mat(&mat, reference, params).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to create Dataset: {}", e))
         })?;
 
@@ -383,7 +479,7 @@ impl BackendModel for LightGBMModel {
 
         // Build the binned Dataset with the SAME params as the booster (see
         // `build_dataset`), then the booster on top of it.
-        let train_dataset = Arc::new(train_data.build_dataset(&full_params)?);
+        let (train_key, train_dataset) = train_data.train_dataset(&full_params)?;
         let mut booster = Booster::new(Arc::clone(&train_dataset), &full_params).map_err(|e| {
             GradientLSSError::BackendError(format!("Failed to create Booster: {}", e))
         })?;
@@ -392,36 +488,42 @@ impl BackendModel for LightGBMModel {
         // offsets (the LightGBM analogue of XGBoost's base_margin — the raw
         // booster output is added to this seed every round, and the caller
         // adds the same seed back at prediction).
-        let mut predictions = Array2::zeros((n_samples, n_params));
+        let mut train_seed = Array2::zeros((n_samples, n_params));
         if let Some(sv) = start_values {
             for i in 0..n_samples {
                 for j in 0..n_params {
-                    predictions[[i, j]] = sv[j];
+                    train_seed[[i, j]] = sv[j];
                 }
             }
         }
         if let Some(off) = row_offsets {
-            predictions += &off;
+            train_seed += &off;
         }
+        let mut predictions = train_seed.clone();
 
-        // Prepare validation data if available (Mat borrows the dataset's
-        // feature buffer — no copy).
-        let valid_ref = valid_data.as_deref();
-        let (valid_mat, valid_labels, valid_n_samples) = if let Some(vd) = valid_ref {
+        // Register the validation set with the booster, binned against the
+        // training Dataset, so LightGBM keeps its scores round by round.
+        let mut valid_data = valid_data;
+        let (valid_labels, valid_n_samples) = if let Some(vd) = valid_data.as_deref_mut() {
             let vl = vd.get_labels()?;
-            (Some(vd.features_mat()), Some(vl), vd.num_rows())
+            let n = vd.num_rows();
+            let binned = vd.valid_dataset(&train_dataset, &train_key, &full_params)?;
+            booster.add_valid_data(binned).map_err(|e| {
+                GradientLSSError::BackendError(format!("Failed to add validation data: {}", e))
+            })?;
+            (Some(vl), n)
         } else {
-            (None, None, 0)
+            (None, 0)
         };
+        let has_valid = valid_labels.is_some();
 
-        // Running validation margin, accumulated one iteration at a time (mirrors
-        // `predictions`). Seeded with start_values; zero-sized when there's no
-        // validation set.
-        let mut valid_predictions = Array2::zeros((valid_n_samples, n_params));
+        // The validation seed, mirroring `train_seed`; zero-sized when there's
+        // no validation set.
+        let mut valid_seed = Array2::zeros((valid_n_samples, n_params));
         if let Some(sv) = start_values {
             for i in 0..valid_n_samples {
                 for j in 0..n_params {
-                    valid_predictions[[i, j]] = sv[j];
+                    valid_seed[[i, j]] = sv[j];
                 }
             }
         }
@@ -435,8 +537,9 @@ impl BackendModel for LightGBMModel {
                     n_params
                 )));
             }
-            valid_predictions += &off;
+            valid_seed += &off;
         }
+        let mut valid_predictions = valid_seed.clone();
 
         // Whether the per-round train metric is needed at all: it drives early
         // stopping when there is no validation set, feeds verbose logging and
@@ -446,7 +549,7 @@ impl BackendModel for LightGBMModel {
         let need_train_metric = config.collect_train_metrics
             || config.verbose
             || callbacks.is_some()
-            || valid_mat.is_none();
+            || !has_valid;
 
         let mut best_loss = f64::INFINITY;
         let mut best_iteration = 0usize;
@@ -459,10 +562,6 @@ impl BackendModel for LightGBMModel {
         // Training history
         let mut train_history = Vec::with_capacity(config.num_boost_round);
         let mut valid_history = Vec::with_capacity(config.num_boost_round);
-
-        // Borrow the training features as a Mat for the per-round predicts
-        let train_mat = train_data.features_mat();
-        let pred_params = Parameters::new();
 
         // Notify callbacks of training start
         if let Some(ref mut cb) = callbacks {
@@ -513,25 +612,15 @@ impl BackendModel for LightGBMModel {
                 break;
             }
 
-            // Predict ONLY the iteration just added and accumulate into the running
-            // margin. RawScore is additive across trees, so summing each iteration's
-            // contribution equals re-predicting all trees — but at O(n) per round
-            // instead of O(n * trees_so_far), turning the loop from O(rounds^2) to
-            // O(rounds). This matters most for multi-output (num_class>1, e.g. the
-            // NegativeBinomial), where the full re-predict over 2x the trees was the
-            // dominant cost. `predictions` already carries start_values from init, so
-            // we no longer re-add them each round.
-            let delta = booster
-                .predict_for_mat(
-                    &train_mat,
-                    PredictType::RawScore,
-                    round,
-                    Some(1),
-                    &pred_params,
-                )
+            // Read the margin LightGBM keeps for its own training
+            // (`LGBM_BoosterGetPredict`): the booster already applied this tree
+            // to every row in bin space, so this is a copy, O(n). The old
+            // `predict_for_mat` of the new iteration walked the raw matrix
+            // again and was ~60 % of a fit (performance audit 2026-11-03).
+            let scores = booster
+                .get_predict(0)
                 .map_err(|e| GradientLSSError::BackendError(format!("Prediction failed: {}", e)))?;
-            let delta = prediction_to_array2(&delta, n_samples, n_params)?;
-            predictions += &delta;
+            seed_plus_scores(&train_seed, scores.values(), &mut predictions)?;
 
             // Compute training loss (only when something consumes it)
             let train_loss = if need_train_metric {
@@ -542,16 +631,13 @@ impl BackendModel for LightGBMModel {
                 None
             };
 
-            // Compute validation loss if available — same per-iteration accumulation
-            // into the running `valid_predictions` margin (carries start_values).
-            let valid_loss = if let (Some(vm), Some(vl)) = (&valid_mat, &valid_labels) {
-                let vdelta = booster
-                    .predict_for_mat(vm, PredictType::RawScore, round, Some(1), &pred_params)
-                    .map_err(|e| {
-                        GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
-                    })?;
-                let vdelta = prediction_to_array2(&vdelta, valid_n_samples, n_params)?;
-                valid_predictions += &vdelta;
+            // Compute validation loss if available, from the booster's own
+            // scores like the training margin above.
+            let valid_loss = if let Some(vl) = &valid_labels {
+                let scores = booster.get_predict(1).map_err(|e| {
+                    GradientLSSError::BackendError(format!("Valid prediction failed: {}", e))
+                })?;
+                seed_plus_scores(&valid_seed, scores.values(), &mut valid_predictions)?;
 
                 let vl_loss = metric_fn(&valid_predictions, vl);
                 valid_history.push(vl_loss);
@@ -648,8 +734,7 @@ impl BackendModel for LightGBMModel {
         // AND `early_stopping_rounds` configured (matching the XGBoost backend).
         // Without a validation set the monitored loss is the train loss, which
         // keeps descending — truncating on it would discard useful trees.
-        let model_best_iteration = if valid_mat.is_some() && config.early_stopping_rounds.is_some()
-        {
+        let model_best_iteration = if has_valid && config.early_stopping_rounds.is_some() {
             Some(best_iteration)
         } else {
             None
@@ -845,6 +930,24 @@ impl Backend for LightGBMBackend {
     }
 }
 
+/// `seed + scores` into `out`. `LGBM_BoosterGetPredict` lays a dataset's scores
+/// out COLUMN-major by parameter, unlike `predict_for_mat`'s row-major output.
+fn seed_plus_scores(seed: &Array2<f64>, scores: &[f64], out: &mut Array2<f64>) -> Result<()> {
+    let (n_samples, n_params) = out.dim();
+    if scores.len() != n_samples * n_params {
+        return Err(GradientLSSError::ShapeMismatch {
+            expected_shape: format!("{}", n_samples * n_params),
+            actual_shape: format!("{}", scores.len()),
+        });
+    }
+    for j in 0..n_params {
+        for i in 0..n_samples {
+            out[[i, j]] = seed[[i, j]] + scores[j * n_samples + i];
+        }
+    }
+    Ok(())
+}
+
 /// Convert lgbm::Prediction to Array2.
 fn prediction_to_array2(
     prediction: &Prediction,
@@ -965,7 +1068,7 @@ mod tests {
         let ds = LightGBMDataset::from_data(feats.view(), labels.view()).expect("dataset");
         let mut params = LightGBMParams::default();
         params.set_n_dist_params(num_class);
-        let dataset = Arc::new(ds.build_dataset(params.inner()).expect("binned dataset"));
+        let dataset = Arc::new(ds.build_dataset(params.inner(), None).expect("binned dataset"));
         let mut booster = Booster::new(dataset, params.inner()).expect("booster");
 
         // A few rounds with per-sample-varying custom gradients (column-major by
@@ -1073,6 +1176,79 @@ mod tests {
             s += d * d;
         }
         s / n as f64
+    }
+
+    /// The per-round margins come from the booster's own scores, laid out
+    /// column-major by parameter: on two parameters, a transposed or stale
+    /// read would part from a full re-predict of the finished model.
+    #[test]
+    fn round_margins_match_a_full_repredict_on_two_parameters() {
+        let (tf, tl, vf, vl) = overfit_dataset();
+        let mut train = LightGBMDataset::from_data(tf.view(), tl.view()).unwrap();
+        let mut valid = LightGBMDataset::from_data(vf.view(), vl.view()).unwrap();
+
+        let mut params = LightGBMParams::default();
+        params.set_n_dist_params(2);
+        params.set("learning_rate", ParamValue::Float(0.3));
+        params.set("num_leaves", ParamValue::Int(15));
+        params.set("min_data_in_leaf", ParamValue::Int(2));
+
+        let config = TrainConfig {
+            num_boost_round: 25,
+            early_stopping_rounds: None,
+            verbose: false,
+            seed: 7,
+            collect_train_metrics: true,
+        };
+        let start = Array1::from(vec![0.5, -0.25]);
+        let target = |y: f64, j: usize| if j == 0 { y } else { 2.0 * y };
+        let loss = |p: &Array2<f64>, y: &Array1<f64>| {
+            let mut s = 0.0;
+            for (i, &yi) in y.iter().enumerate() {
+                s += (p[[i, 0]] - target(yi, 0)).powi(2) + 3.0 * (p[[i, 1]] - target(yi, 1)).powi(2);
+            }
+            s / y.len() as f64
+        };
+
+        let (model, result) = LightGBMModel::train_with_objective_and_callbacks::<
+            _,
+            _,
+            super::super::traits::HistoryCallback,
+        >(
+            &params,
+            &mut train,
+            Some(&mut valid),
+            &config,
+            |p: &Array2<f64>, y: &Array1<f64>, _w: Option<&Array1<f64>>| {
+                let mut gradients = Array2::zeros(p.raw_dim());
+                for (i, &yi) in y.iter().enumerate() {
+                    gradients[[i, 0]] = p[[i, 0]] - target(yi, 0);
+                    gradients[[i, 1]] = 3.0 * (p[[i, 1]] - target(yi, 1));
+                }
+                Ok(GradientsAndHessians {
+                    gradients,
+                    hessians: Array2::from_elem(p.raw_dim(), 1.0),
+                })
+            },
+            loss,
+            Some(&start),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let with_start = |x: &Array2<f64>| {
+            let mut raw = model.predict_raw(&x.view()).unwrap();
+            for mut row in raw.rows_mut() {
+                row += &start;
+            }
+            raw
+        };
+        let train_full = loss(&with_start(&tf), &tl);
+        let valid_full = loss(&with_start(&vf), &vl);
+        assert!((result.train_history.last().unwrap() - train_full).abs() < 1e-9);
+        assert!((result.valid_history.last().unwrap() - valid_full).abs() < 1e-9);
     }
 
     fn train_overfit_model() -> (LightGBMModel, TrainingResult) {

@@ -113,6 +113,12 @@ pub struct XGBoostDataset {
     full_labels: Vec<f64>,
     /// Per-sample training weights, applied to grad/hess in the objective.
     weights: Option<Array1<f64>>,
+    /// Keep the built `DMatrix` for the next fit of this data (see
+    /// [`BackendDataset::retain_binned`]).
+    retain_binned: bool,
+    /// The kept matrix: `Some(max_bin)` for a quantile matrix, `None` for a
+    /// plain one. Margins and weights are written afresh on every use.
+    binned: Option<(Option<u32>, DMatrix)>,
 }
 
 impl std::fmt::Debug for XGBoostDataset {
@@ -138,7 +144,13 @@ impl BackendDataset for XGBoostDataset {
             features: features_f32,
             full_labels: labels.to_vec(),
             weights: None,
+            retain_binned: false,
+            binned: None,
         })
+    }
+
+    fn retain_binned(&mut self) {
+        self.retain_binned = true;
     }
 
     fn set_init_score(&mut self, _init_score: &Array1<f64>) -> Result<()> {
@@ -184,9 +196,25 @@ impl BackendDataset for XGBoostDataset {
 }
 
 impl XGBoostDataset {
-    /// Build the training `DMatrix` with base margin, labels, and weights.
-    ///
-    /// Under the `hist` tree method this is a `QuantileDMatrix`
+    /// The binning key `xgb_params` builds a training matrix under.
+    fn train_binned_key(xgb_params: &HashMap<String, String>) -> Option<u32> {
+        (xgb_params.get("tree_method").map(String::as_str) == Some("hist")).then(|| {
+            xgb_params
+                .get("max_bin")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256)
+        })
+    }
+
+    /// Hand a matrix back for the next fit, when this dataset retains them.
+    fn keep_binned(&mut self, key: Option<u32>, matrix: DMatrix) {
+        if self.retain_binned {
+            self.binned = Some((key, matrix));
+        }
+    }
+
+    /// The matrix for `key`: the kept one when it matches, else a new one with
+    /// labels. Under the `hist` tree method this is a `QuantileDMatrix`
     /// (`from_dense_quantile`): pre-binned storage, ~4x less memory, no
     /// separate sketching pass — with `max_bin` taken from the training params
     /// so the binning always matches the booster (a mismatch is a hard XGBoost
@@ -194,13 +222,13 @@ impl XGBoostDataset {
     /// matrices are `hist`-only. Prediction on a quantile matrix is exact for
     /// its own trees (hist split thresholds are bin boundaries), so the
     /// training loop's cached per-round predicts are unaffected.
-    fn build_train_dmatrix(
-        &self,
-        xgb_params: &HashMap<String, String>,
-        n_params: usize,
-        start_values: Option<&Array1<f64>>,
-        row_offsets: Option<ArrayView2<'_, f64>>,
-    ) -> Result<DMatrix> {
+    fn train_matrix(&mut self, key: Option<u32>) -> Result<DMatrix> {
+        if let Some((k, _)) = &self.binned
+            && *k == key
+        {
+            return Ok(self.binned.take().expect("checked above").1);
+        }
+        self.binned = None;
         // First n_rows labels; for multivariate targets these are dummies (the
         // objective reads the real labels from `full_labels`).
         let labels_f32: Vec<f32> = self
@@ -210,19 +238,14 @@ impl XGBoostDataset {
             .map(|&x| x as f32)
             .collect();
 
-        let use_quantile = xgb_params.get("tree_method").map(String::as_str) == Some("hist");
-        let mut dmatrix = if use_quantile {
-            let max_bin: u32 = xgb_params
-                .get("max_bin")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256);
+        if let Some(max_bin) = key {
             DMatrix::from_dense_quantile(&self.features, self.n_rows, Some(&labels_f32), max_bin)
                 .map_err(|e| {
                     GradientLSSError::BackendError(format!(
                         "Failed to create QuantileDMatrix: {}",
                         e
                     ))
-                })?
+                })
         } else {
             let mut dm = DMatrix::from_dense(&self.features, self.n_rows).map_err(|e| {
                 GradientLSSError::BackendError(format!("Failed to create DMatrix: {}", e))
@@ -230,8 +253,19 @@ impl XGBoostDataset {
             dm.set_labels(&labels_f32).map_err(|e| {
                 GradientLSSError::BackendError(format!("Failed to set labels: {}", e))
             })?;
-            dm
-        };
+            Ok(dm)
+        }
+    }
+
+    /// Build the training `DMatrix` with base margin, labels, and weights.
+    fn build_train_dmatrix(
+        &mut self,
+        xgb_params: &HashMap<String, String>,
+        n_params: usize,
+        start_values: Option<&Array1<f64>>,
+        row_offsets: Option<ArrayView2<'_, f64>>,
+    ) -> Result<DMatrix> {
+        let mut dmatrix = self.train_matrix(Self::train_binned_key(xgb_params))?;
 
         // Start values as base margin, matching Python:
         // base_margin = np.ones((n_rows, 1)) * start_values, flattened row-major —
@@ -453,11 +487,18 @@ impl BackendModel for XGBoostModel {
         // old loop did) was pure waste. Plain (non-quantile) DMatrix: it is
         // prediction-only, and prediction on raw values is exact for
         // hist-trained trees.
-        let valid_dmat: Option<DMatrix> = match (&valid_data, &valid_features) {
+        let mut valid_data = valid_data;
+        let mut valid_dmat: Option<DMatrix> = match (valid_data.as_deref_mut(), &valid_features) {
             (Some(vd), Some((vr, _vc))) => {
-                let mut dm = DMatrix::from_dense(vd.features(), *vr).map_err(|e| {
-                    GradientLSSError::BackendError(format!("Failed to create valid DMatrix: {}", e))
-                })?;
+                let mut dm = match vd.binned.take() {
+                    Some((None, dm)) => dm,
+                    _ => DMatrix::from_dense(vd.features(), *vr).map_err(|e| {
+                        GradientLSSError::BackendError(format!(
+                            "Failed to create valid DMatrix: {}",
+                            e
+                        ))
+                    })?,
+                };
                 if row_offsets.is_some() && valid_row_offsets.is_none() {
                     return Err(GradientLSSError::InvalidParameter(
                         "row_offsets given for the train set but no valid_row_offsets for the \
@@ -708,6 +749,11 @@ impl BackendModel for XGBoostModel {
         booster
             .reset()
             .map_err(|e| GradientLSSError::BackendError(format!("Booster reset failed: {}", e)))?;
+
+        train_data.keep_binned(XGBoostDataset::train_binned_key(&xgb_params), train_dmat);
+        if let (Some(vd), Some(dm)) = (valid_data.as_deref_mut(), valid_dmat.take()) {
+            vd.keep_binned(None, dm);
+        }
 
         Ok((
             Self {

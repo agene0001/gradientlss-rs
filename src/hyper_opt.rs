@@ -532,6 +532,20 @@ pub fn hyper_opt_with_transform<B: Backend>(
     config: HyperOptConfig,
     fold_transform: Option<&dyn FoldTransform>,
 ) -> Result<HyperOptResult, Box<dyn std::error::Error>> {
+    // `GRADIENTLSS_FOLD_REUSE=0` rebuilds every fold per trial, for comparison.
+    let reuse_fold_data = std::env::var("GRADIENTLSS_FOLD_REUSE").map_or(true, |v| v != "0");
+    search(model, features, labels, hp_dict, config, fold_transform, reuse_fold_data)
+}
+
+fn search<B: Backend>(
+    model: &mut GradientLSS<B>,
+    features: &Array2<f64>,
+    labels: &Array1<f64>,
+    hp_dict: &HashMap<String, Value>,
+    config: HyperOptConfig,
+    fold_transform: Option<&dyn FoldTransform>,
+    reuse_fold_data: bool,
+) -> Result<HyperOptResult, Box<dyn std::error::Error>> {
     use std::time::Instant;
 
     // Use hp_seed for hyperparameter sampling, falling back to seed
@@ -637,6 +651,10 @@ pub fn hyper_opt_with_transform<B: Backend>(
         config.n_folds
     };
     let mut fold_start_values: Vec<Option<Array1<f64>>> = vec![None; n_fold_slots];
+    // Each fold's data, kept across trials. The rows never change, and neither
+    // does a transform that takes no trial parameter.
+    let mut fold_data: Vec<Option<FoldData<B::Dataset>>> =
+        (0..n_fold_slots).map(|_| None).collect();
 
     let mut best_score = f64::INFINITY;
     let mut trials_since_best: u32 = 0;
@@ -716,6 +734,10 @@ pub fn hyper_opt_with_transform<B: Backend>(
             seed: config.seed + trial as u64,
         };
 
+        // A transform-only axis (imputer rank, ...) changes the features per trial.
+        let trial_reuses_fold_data = reuse_fold_data
+            && !trial_params.keys().any(|k| k.starts_with(TRANSFORM_PARAM_PREFIX));
+
         let (cv_score, pruned, intermediate_scores, fold_best_rounds) = cv_with_pruning(
             model,
             features,
@@ -724,6 +746,11 @@ pub fn hyper_opt_with_transform<B: Backend>(
             config.cv_scheme,
             fold_perm.as_deref(),
             &mut fold_start_values,
+            if trial_reuses_fold_data {
+                &mut fold_data[..]
+            } else {
+                &mut []
+            },
             backend_params,
             train_config,
             &config.pruning,
@@ -831,6 +858,16 @@ pub fn hyper_opt_with_transform<B: Backend>(
     })
 }
 
+/// One CV fold, materialized: the slices, the transform's output and the
+/// backends' binned datasets, which depend on nothing a trial samples.
+struct FoldData<D> {
+    train: D,
+    val: D,
+    test_features: Array2<f64>,
+    test_labels: Array1<f64>,
+    valid_idx: Vec<usize>,
+}
+
 /// Cross-validation with pruning support.
 ///
 /// `n_folds >= 2` runs standard k-fold CV. `n_folds <= 1` runs a single 80/20
@@ -853,6 +890,7 @@ fn cv_with_pruning<B: Backend>(
     cv_scheme: CvScheme,
     fold_perm: Option<&[usize]>,
     fold_start_values: &mut [Option<Array1<f64>>],
+    fold_data: &mut [Option<FoldData<B::Dataset>>],
     params: B::Params,
     config: TrainConfig,
     pruning_strategy: &PruningStrategy,
@@ -880,7 +918,8 @@ fn cv_with_pruning<B: Backend>(
     let mut fold_best_rounds: Vec<usize> = Vec::with_capacity(n_iters);
     let mut pruned = false;
 
-    for i in 0..n_iters {
+    let retain_fold_data = !fold_data.is_empty();
+    let build_fold = |i: usize| -> Option<FoldData<B::Dataset>> {
         // Partition fold `i` into (train, test). `TimeSeries` trains only on rows
         // strictly before the test segment (no future leakage); `KFold`/holdout
         // trains on all other rows.
@@ -940,16 +979,14 @@ fn cv_with_pruning<B: Backend>(
                     match ndarray::concatenate(Axis(0), &[train_features_1, train_features_2]) {
                         Ok(f) => f,
                         Err(_) => {
-                            intermediate_scores.push(f64::INFINITY);
-                            continue;
+                            return None;
                         }
                     };
                 let train_labels =
                     match ndarray::concatenate(Axis(0), &[train_labels_1, train_labels_2]) {
                         Ok(l) => l,
                         Err(_) => {
-                            intermediate_scores.push(f64::INFINITY);
-                            continue;
+                            return None;
                         }
                     };
                 // Contiguous arms: indices are the ranges themselves, in the
@@ -986,25 +1023,16 @@ fn cv_with_pruning<B: Backend>(
             if std::env::var("GRADIENTLSS_VERBOSE").is_ok() {
                 eprintln!("fold {i}: fold transform failed ({e}); scoring as infinite");
             }
-            intermediate_scores.push(f64::INFINITY);
-            continue;
+            return None;
         }
 
-        let mut train_data = match B::Dataset::from_data(train_features.view(), train_labels.view())
-        {
-            Ok(d) => d,
-            Err(_) => {
-                intermediate_scores.push(f64::INFINITY);
-                continue;
-            }
-        };
+        let mut train_data = B::Dataset::from_data(train_features.view(), train_labels.view()).ok()?;
         // Weight the fold's TRAIN rows the same way the caller's final fit
         // will (see `FoldWeightFn`); the scoring fold stays unweighted.
         if let Some(wf) = fold_weight_fn {
             let w = Array1::from_vec((wf.0)(train_labels.len()));
             if train_data.set_weights(w.view()).is_err() {
-                intermediate_scores.push(f64::INFINITY);
-                continue;
+                return None;
             }
         }
 
@@ -1015,12 +1043,26 @@ fn cv_with_pruning<B: Backend>(
         // Reusing the scoring fold as the early-stopping monitor makes each
         // trial's score mildly optimistic, but uniformly so across trials — the
         // TPE ranking (all that matters for HPO) is unaffected.
-        let mut val_data = match B::Dataset::from_data(test_features.view(), test_labels.view()) {
-            Ok(d) => d,
-            Err(_) => {
-                intermediate_scores.push(f64::INFINITY);
-                continue;
-            }
+        let mut val_data = B::Dataset::from_data(test_features.view(), test_labels.view()).ok()?;
+        if retain_fold_data {
+            train_data.retain_binned();
+            val_data.retain_binned();
+        }
+
+        Some(FoldData {
+            train: train_data,
+            val: val_data,
+            test_features,
+            test_labels,
+            valid_idx,
+        })
+    };
+
+    for i in 0..n_iters {
+        let cached = fold_data.get_mut(i).and_then(Option::take);
+        let Some(mut fold) = cached.or_else(|| build_fold(i)) else {
+            intermediate_scores.push(f64::INFINITY);
+            continue;
         };
 
         let mut fold_model = GradientLSS::<B>::new(model.distribution().clone_arc());
@@ -1031,8 +1073,8 @@ fn cv_with_pruning<B: Backend>(
             fold_model.preset_start_values(sv.clone());
         }
         let train_result = match fold_model.train_with_callbacks(
-            &mut train_data,
-            Some(&mut val_data),
+            &mut fold.train,
+            Some(&mut fold.val),
             params.clone(),
             config.clone(),
             None::<&mut crate::backend::HistoryCallback>,
@@ -1070,10 +1112,10 @@ fn cv_with_pruning<B: Backend>(
         // NLL-reasonable while the CRPS fit itself is unconverged or diverged
         // (observed 2026-08-27: a tuned xgboost-lss Poisson CRPS model with
         // test RMSE worse than predicting the training mean).
-        let score = match fold_model.predict_transformed(&test_features.view()) {
+        let score = match fold_model.predict_transformed(&fold.test_features.view()) {
             Ok(preds) => {
-                let test_labels_owned = test_labels.to_owned();
-                let val_weights = fold_val_weight_fn.and_then(|f| (f.0)(&valid_idx));
+                let test_labels_owned = fold.test_labels.clone();
+                let val_weights = fold_val_weight_fn.and_then(|f| (f.0)(&fold.valid_idx));
                 match (fold_score_fn, val_weights) {
                     // The caller's objective, on the same transformed params.
                     (Some(f), _) => (f.0)(&preds, &test_labels_owned),
@@ -1085,6 +1127,9 @@ fn cv_with_pruning<B: Backend>(
         };
 
         intermediate_scores.push(score);
+        if let Some(slot) = fold_data.get_mut(i) {
+            *slot = Some(fold);
+        }
 
         // Check if we should prune after this fold. Skipped in single-holdout
         // mode — there are no further folds to save by pruning.
@@ -1407,8 +1452,36 @@ mod xgboost_hyper_opt_tests {
     }
 
     fn run_search(seed: u64) -> HyperOptResult {
+        run_search_on::<XGBoostBackend>(seed, true)
+    }
+
+    /// Reusing the folds' datasets is bit-identical to rebuilding them per
+    /// trial, on both backends: same draws, same scores, same round count.
+    fn assert_fold_reuse_is_identical<B: Backend>() {
+        let reused = run_search_on::<B>(13, true);
+        let rebuilt = run_search_on::<B>(13, false);
+
+        assert_eq!(reused.trials.len(), rebuilt.trials.len());
+        for (a, b) in reused.trials.iter().zip(&rebuilt.trials) {
+            assert_eq!(a.params, b.params);
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+        }
+        assert_eq!(reused.opt_rounds, rebuilt.opt_rounds);
+    }
+
+    #[test]
+    fn fold_reuse_is_bit_identical_on_xgboost() {
+        assert_fold_reuse_is_identical::<XGBoostBackend>();
+    }
+
+    #[test]
+    fn fold_reuse_is_bit_identical_on_lightgbm() {
+        assert_fold_reuse_is_identical::<crate::backend::LightGBMBackend>();
+    }
+
+    fn run_search_on<B: Backend>(seed: u64, reuse_fold_data: bool) -> HyperOptResult {
         let (features, labels) = noisy_dataset();
-        let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+        let mut model = GradientLSS::<B>::new(Arc::new(Gaussian::default()));
 
         let mut hp_dict = HashMap::new();
         hp_dict.insert("eta".to_string(), serde_json::json!([0.05, 0.5]));
@@ -1427,7 +1500,7 @@ mod xgboost_hyper_opt_tests {
             ..Default::default()
         };
 
-        hyper_opt_with_config(&mut model, &features, &labels, &hp_dict, config).unwrap()
+        search(&mut model, &features, &labels, &hp_dict, config, None, reuse_fold_data).unwrap()
     }
 
     #[test]
@@ -1515,6 +1588,7 @@ mod xgboost_hyper_opt_tests {
                     CvScheme::KFold,
                     None,
                     cache,
+                    &mut [],
                     params,
                     config.clone(),
                     &PruningStrategy::None,
@@ -1522,6 +1596,7 @@ mod xgboost_hyper_opt_tests {
                     0,
                     None,
                     &HashMap::new(),
+                    None,
                     None,
                     None,
                 );

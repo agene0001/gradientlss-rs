@@ -740,6 +740,11 @@ pub trait BackendDataset: Sized {
         Ok(ds)
     }
 
+    /// Keep this dataset's binned form (XGBoost `DMatrix`, LightGBM `Dataset`)
+    /// for the next fit, for callers that fit the same rows repeatedly: a
+    /// search's folds would otherwise re-bin per trial. Inert by default.
+    fn retain_binned(&mut self) {}
+
     /// Get the number of rows.
     fn num_rows(&self) -> usize;
 
