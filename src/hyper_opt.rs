@@ -948,6 +948,12 @@ struct FoldData<D> {
 /// Returns (final_score, was_pruned, intermediate_scores, fold_best_rounds)
 /// where `fold_best_rounds` holds each successful fold's early-stopped
 /// optimal round count (`best_iteration + 1`, or the rounds actually run).
+/// Added to a pruned trial's best-so-far validation loss when it is reported
+/// to TPE (see `cv_with_pruning`): larger than any plausible gap between a
+/// completed trial and the pool's best, so pruned trials sort behind every
+/// completed one but keep their own order.
+const ASHA_PRUNED_OFFSET: f64 = 1.0;
+
 /// The per-round ASHA check for one fold's fit (see `PruningStrategy::Asha`).
 struct AshaCallback<'a> {
     learning_rate: f64,
@@ -1218,9 +1224,15 @@ fn cv_with_pruning<B: Backend>(
                 continue;
             }
         };
-        if asha.as_ref().is_some_and(|cb| cb.stopped) {
-            // Stopped at a rung: this trial ranks behind every completed one.
-            intermediate_scores.push(f64::INFINITY);
+        if let Some(cb) = asha.as_ref().filter(|cb| cb.stopped) {
+            // Stopped at a rung. Told to TPE as its best validation loss so far
+            // plus `ASHA_PRUNED_OFFSET`: behind every completed trial (a partial
+            // best is optimistic and on the fold's own scale), yet ORDERED
+            // among the pruned ones, as Optuna ranks pruned trials by their
+            // last intermediate value. With a flat INFINITY for every pruned
+            // trial (v2, 2026-11-07) TPE saw 75 % of its draws as equally bad
+            // and the live search landed 0.2 % behind the median rule on CV.
+            intermediate_scores.push(if cb.best.is_finite() { cb.best + ASHA_PRUNED_OFFSET } else { f64::INFINITY });
             if let Some(slot) = fold_data.get_mut(i) {
                 *slot = Some(fold);
             }
@@ -1674,7 +1686,8 @@ mod xgboost_hyper_opt_tests {
             };
             let pruned = result.trials.iter().filter(|t| t.pruned).count();
             assert!(pruned >= 1, "{backend}: nothing pruned");
-            assert!(result.trials.iter().filter(|t| t.pruned).all(|t| t.score.is_infinite()), "{backend}: a pruned trial carries a finite score");
+            let worst_completed = result.trials.iter().filter(|t| !t.pruned).map(|t| t.score).fold(f64::NEG_INFINITY, f64::max);
+            assert!(result.trials.iter().filter(|t| t.pruned).all(|t| t.score > worst_completed), "{backend}: a pruned trial ranks among the completed ones");
             assert!(result.best_score.is_finite(), "{backend}: no finite winner");
             assert!(result.trials.iter().any(|t| !t.pruned && t.score == result.best_score), "{backend}: the winner is not a completed trial");
         }
