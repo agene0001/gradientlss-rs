@@ -548,7 +548,7 @@ impl BackendModel for LightGBMModel {
         // training set every round.
         let need_train_metric = config.collect_train_metrics
             || config.verbose
-            || callbacks.is_some()
+            || callbacks.as_ref().is_some_and(|c| c.needs_train_metric())
             || !has_valid;
 
         let mut best_loss = f64::INFINITY;

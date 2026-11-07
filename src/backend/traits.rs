@@ -211,6 +211,14 @@ pub trait TrainingCallback: Send {
     /// * `stopped_early` - Whether training stopped early
     fn on_training_end(&mut self, _total_iterations: usize, _stopped_early: bool) {}
 
+    /// Whether this callback reads `train_loss`. The train metric is a full
+    /// loss pass over the training rows every round; a callback that only
+    /// watches the validation loss (the ASHA pruner) returns `false` so the
+    /// loop can skip it. Default `true`, the historical behaviour.
+    fn needs_train_metric(&self) -> bool {
+        true
+    }
+
     /// Get the name of this callback for logging purposes.
     fn name(&self) -> &str {
         "TrainingCallback"
