@@ -138,9 +138,11 @@ pub enum PruningStrategy {
 
 impl PruningStrategy {
     /// The measured default: rungs at effort 3 / 9 / 27, keep the best third,
-    /// a rung needs 3 observations before it prunes.
+    /// a rung needs 6 observations before it prunes. (With 3 the first live
+    /// run, 2026-11-07, had to beat the single best of three at every rung and
+    /// collapsed to a handful of completed trials: best CV 3.594 vs 3.576.)
     pub fn asha() -> Self {
-        PruningStrategy::Asha { rungs: vec![3.0, 9.0, 27.0], keep_one_in: 3, min_history: 3 }
+        PruningStrategy::Asha { rungs: vec![3.0, 9.0, 27.0], keep_one_in: 3, min_history: 6 }
     }
 }
 
@@ -187,8 +189,14 @@ impl PrunerState {
             return None;
         }
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let k = ((sorted.len() as f64) / keep_one_in.max(1) as f64).ceil() as usize;
-        Some(sorted[k.clamp(1, sorted.len()) - 1])
+        // The 1 / keep_one_in quantile with linear interpolation (numpy's
+        // default), so a short history is judged against a point BETWEEN its
+        // best entries rather than the best one outright.
+        let q = 1.0 / keep_one_in.max(1) as f64;
+        let pos = q * (sorted.len() - 1) as f64;
+        let lo = pos.floor() as usize;
+        let hi = (lo + 1).min(sorted.len() - 1);
+        Some(sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64))
     }
 
     /// Record an intermediate score for tracking
