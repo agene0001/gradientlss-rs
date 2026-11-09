@@ -53,7 +53,7 @@ tempfile = "3.25.0"
 # - cmake must be installed
 # - For XGBoost: xgboost native library
 # - For LightGBM: lightgbm native library
-xgb = { version = "3.0.5", optional = true }
+xgb = { version = "3.4.1", optional = true }
 lgbm = { version = "0.0.6", optional = true }
 
 # Plotting (optional)
