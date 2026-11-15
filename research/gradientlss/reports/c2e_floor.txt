@@ -1,0 +1,12 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+naval         studentt  damped      0    7758   154   -5.7798    0.0005  0.371  0.798  0.0759   0.0014      NaN     0   13.0
+naval         studentt  damped      1    7758    92   -5.8620    0.0005  0.375  0.799  0.0731   0.0013      NaN     0    3.6
+naval         studentt  damped      2    7758   120   -5.8786    0.0005  0.370  0.793  0.0787   0.0012      NaN     0    3.5
+naval         studentt  damped      3    7758   190   -5.9588    0.0004  0.372  0.795  0.0874   0.0011      NaN     0    4.3
+naval         studentt  damped      4    7758   145   -5.8517    0.0005  0.355  0.785  0.0945   0.0013      NaN     0    3.4
+gaussian_sim  studentt  damped      0    5950    50    2.1265    1.3843  0.424  0.877  0.0465   2.9056   2.0821     0    0.9
+gaussian_sim  studentt  damped      1    5950    58    2.1265    1.3863  0.427  0.871  0.0435   2.9102   2.0821     0    0.8
+gaussian_sim  studentt  damped      2    5950    39    2.1277    1.3864  0.420  0.885  0.0469   2.9045   2.0821     0    0.8
+gaussian_sim  studentt  damped      3    5950    42    2.1241    1.3868  0.437  0.889  0.0439   2.9109   2.0821     0    0.7
+gaussian_sim  studentt  damped      4    5950    60    2.1193    1.3835  0.424  0.871  0.0497   2.9076   2.0821     0    1.0
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

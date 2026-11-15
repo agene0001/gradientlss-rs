@@ -1,0 +1,20 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+protein       studentt  observed    0    7800    50    2.9656    2.7492  0.453  0.922  0.1312   4.9728      NaN     0    0.2
+protein       studentt  fisher      0    7800    50    2.9164    2.7480  0.528  0.940  0.0793   5.2687      NaN     0    0.2
+protein       studentt  damped      0    7800    50    2.9756    2.7639  0.496  0.932  0.1244   4.9609      NaN     0    0.2
+protein       studentt  observed    1    7800    50    2.9655    2.7545  0.439  0.927  0.1078   4.9789      NaN     0    0.2
+protein       studentt  fisher      1    7800    50    2.9233    2.7416  0.504  0.946  0.1004   5.2238      NaN     0    0.2
+protein       studentt  damped      1    7800    50    2.9782    2.7589  0.482  0.941  0.0985   4.9450      NaN     0    0.4
+power_plant   studentt  observed    0    6220    50    2.9486    2.6401  0.521  0.969  0.0630   4.8300      NaN     0    0.2
+power_plant   studentt  fisher      0    6220    50    2.8861    2.3251  0.586  0.991  0.0746   4.0449      NaN     0    0.2
+power_plant   studentt  damped      0    6220    50    3.1625    2.9001  0.770  0.998  0.1519   4.8223      NaN     0    0.2
+power_plant   studentt  observed    1    6220    50    2.9506    2.6523  0.528  0.964  0.0575   4.8576      NaN     0    0.4
+power_plant   studentt  fisher      1    6220    50    2.9077    2.3774  0.556  0.991  0.0641   4.1391      NaN     0    0.2
+power_plant   studentt  damped      1    6220    50    3.1599    2.9046  0.753  0.997  0.1428   4.8497      NaN     0    0.2
+kin8nm        studentt  observed    0    5326    50   -0.3234    0.1040  0.454  0.911  0.0597   0.1881      NaN     0    0.2
+kin8nm        studentt  fisher      0    5326    50   -0.3052    0.1043  0.493  0.933  0.0578   0.1878      NaN     0    0.2
+kin8nm        studentt  damped      0    5326    50   -0.2979    0.1046  0.507  0.940  0.0578   0.1881      NaN     0    0.4
+kin8nm        studentt  observed    1    5326    50   -0.2932    0.1064  0.447  0.903  0.0568   0.1916      NaN     0    0.2
+kin8nm        studentt  fisher      1    5326    50   -0.2899    0.1063  0.479  0.927  0.0485   0.1912      NaN     0    0.1
+kin8nm        studentt  damped      1    5326    50   -0.2844    0.1063  0.492  0.936  0.0514   0.1909      NaN     0    0.2
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

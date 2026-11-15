@@ -1,0 +1,22 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+kin8nm        gamma_ms  damped      0    5326  1079   -0.5197    0.0775  0.604  0.944  0.1250   0.1345      NaN     0    2.4
+kin8nm        gamma_ms  damped      1    5326  1132   -0.5530    0.0768  0.602  0.932  0.0946   0.1358      NaN     0    2.4
+kin8nm        gamma_ms  damped      2    5326  1383   -0.5246    0.0767  0.603  0.938  0.1116   0.1344      NaN     0    3.4
+kin8nm        gamma_ms  damped      3    5326  1258   -0.5281    0.0771  0.618  0.939  0.0931   0.1362      NaN     0    3.0
+kin8nm        gamma_ms  damped      4    5326  1379   -0.5441    0.0765  0.611  0.944  0.1085   0.1337      NaN     0    3.3
+synth_gamma   gamma_ms  damped      0    5200   175    2.6203    2.9754  0.677  0.954  0.1054   8.4377   2.3166     0    0.7
+synth_gamma   gamma_ms  damped      1    5200   169    2.5362    2.7700  0.676  0.963  0.1035   8.0478   2.2036     0    0.4
+synth_gamma   gamma_ms  damped      2    5200   196    2.5944    2.9212  0.667  0.944  0.1023   8.1137   2.2562     0    0.7
+synth_gamma   gamma_ms  damped      3    5200   181    2.6177    2.9836  0.676  0.950  0.1019   8.2373   2.3061     0    0.4
+synth_gamma   gamma_ms  damped      4    5200   162    2.6459    3.1175  0.660  0.947  0.0953   8.8350   2.3664     0    0.6
+power_plant   gamma_ms  damped      0    6220   974    2.6427    1.7886  0.691  0.964  0.1007   3.1980      NaN     0    2.2
+power_plant   gamma_ms  damped      1    6220   897    2.6554    1.8230  0.657  0.964  0.0896   3.2497      NaN     0    5.9
+power_plant   gamma_ms  damped      2    6220  1183    2.6846    1.8006  0.711  0.963  0.1092   3.5609      NaN     0    8.2
+power_plant   gamma_ms  damped      3    6220  1423    2.7149    1.8357  0.695  0.970  0.1126   3.5542      NaN     0    3.2
+power_plant   gamma_ms  damped      4    6220  1333    2.6432    1.7663  0.696  0.967  0.1117   3.1760      NaN     0    2.9
+naval         gamma_ms  damped      0    7758  1267   -4.7940    0.0009  0.989  0.999  0.3270   0.0009      NaN     0    3.1
+naval         gamma_ms  damped      1    7758  1240   -4.7975    0.0009  0.983  1.000  0.3280   0.0009      NaN     0    2.5
+naval         gamma_ms  damped      2    7758  1140   -4.8153    0.0009  0.986  1.000  0.3190   0.0009      NaN     0    2.8
+naval         gamma_ms  damped      3    7758  1261   -4.7858    0.0009  0.990  1.000  0.3309   0.0008      NaN     0    3.3
+naval         gamma_ms  damped      4    7758  1333   -4.8018    0.0009  0.986  1.000  0.3296   0.0008      NaN     0    3.4
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

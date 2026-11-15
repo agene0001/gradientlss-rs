@@ -1,0 +1,12 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+synth_nb_lo   nb_md     damped      0    5200    72    2.9631    4.0855  0.492  0.833  0.0870   9.6153   2.9328     0    1.0
+synth_nb_lo   nb_md     damped      1    5200    70    2.9056    3.9648  0.503  0.841  0.0932   9.7748   2.8891     0    0.7
+synth_nb_lo   nb_md     damped      2    5200    67    2.9520    3.9574  0.492  0.871  0.0744   9.2938   2.9311     0    2.3
+synth_nb_lo   nb_md     damped      3    5200    86    2.9166    3.9142  0.484  0.830  0.0983   9.8517   2.8935     0    2.7
+synth_nb_lo   nb_md     damped      4    5200    88    2.9491    4.1906  0.495  0.856  0.0728  10.3821   2.9132     0    2.7
+synth_nb_hi   nb_md     damped      0    5200   113    6.6750  200.7031  0.481  0.878  0.0238 545.5136   6.6175     0    8.2
+synth_nb_hi   nb_md     damped      1    5200   116    6.7070  202.3511  0.482  0.861  0.0282 534.7955   6.6299     0    7.7
+synth_nb_hi   nb_md     damped      2    5200   133    6.7523  209.3543  0.476  0.872  0.0261 648.5221   6.6697     0    6.5
+synth_nb_hi   nb_md     damped      3    5200   108    6.7421  213.0184  0.477  0.862  0.0279 578.6988   6.6693     0    2.7
+synth_nb_hi   nb_md     damped      4    5200   104    6.7323  205.3575  0.476  0.870  0.0372 550.4228   6.6340     0    2.1
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

@@ -1,0 +1,17 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+power_plant   gamma     observed    0    6220  2000    4.5217    0.0000  0.999  1.000  0.4153   3.2636      NaN     0    5.2
+power_plant   gamma     fisher      0    6220  2000    4.1119    0.0000  0.998  1.000  0.3826   3.1609      NaN     0   12.2
+power_plant   gamma     damped      0    6220  2000    4.1129    0.0000  0.997  1.000  0.3827   3.1632      NaN     0    5.5
+power_plant   gamma     observed    1    6220  2000    4.5217    0.0000  0.999  1.000  0.4153   3.1718      NaN     0    5.9
+power_plant   gamma     fisher      1    6220  2000    4.1118    0.0000  0.999  1.000  0.3833   3.1182      NaN     0    5.4
+power_plant   gamma     damped      1    6220  2000    4.1130    0.0000  0.998  1.000  0.3844   3.1512      NaN     0    6.4
+power_plant   gamma     observed    2    6220  2000    4.5219    0.0000  0.998  1.000  0.4158   3.5464      NaN     0    5.7
+power_plant   gamma     fisher      2    6220  2000    4.1136    0.0000  0.997  0.999  0.3848   3.4954      NaN     0    5.9
+power_plant   gamma     damped      2    6220  2000    4.1146    0.0000  0.997  0.999  0.3831   3.4854      NaN     0    5.8
+power_plant   gamma     observed    3    6220  2000    4.5220    0.0000  0.998  1.000  0.4175   3.5555      NaN     0    6.4
+power_plant   gamma     fisher      3    6220  2000    4.1140    0.0000  0.996  0.999  0.3850   3.4733      NaN     0    5.4
+power_plant   gamma     damped      3    6220  2000    4.1152    0.0000  0.996  0.999  0.3848   3.5069      NaN     0    5.3
+power_plant   gamma     observed    4    6220  2000    4.5213    0.0000  0.999  1.000  0.4143   3.2351      NaN     0    5.2
+power_plant   gamma     fisher      4    6220  2000    4.1124    0.0000  0.998  1.000  0.3802   3.1378      NaN     0    5.0
+power_plant   gamma     damped      4    6220  2000    4.1137    0.0000  0.998  1.000  0.3820   3.1809      NaN     0    5.2
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

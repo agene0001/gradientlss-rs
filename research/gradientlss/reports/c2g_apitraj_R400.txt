@@ -1,0 +1,6 @@
+dataset       family    mode     seed  ntrain iters       nll      crps  cov50  cov90  pit_ks     rmse   oracle  nonf   secs
+gaussian_sim  studentt  damped      0    5950    29    3.1144    1.4335  0.335  0.712  0.1086   2.9158   2.0821     0    4.5
+gaussian_sim  studentt  damped      1    5950    31    2.7757    1.4298  0.337  0.718  0.1119   2.9211   2.0821     0    4.4
+protein       studentt  damped      0    7800   115    3.5861    2.4093  0.376  0.809  0.0878   4.5407      NaN     0    4.5
+protein       studentt  damped      1    7800   190    3.2412    2.3311  0.383  0.825  0.0875   4.4308      NaN     0    4.5
+rows appended to /Volumes/Crucial X9/cs_projects/gradientlss-rs/research/gradientlss/experiments_v2.csv

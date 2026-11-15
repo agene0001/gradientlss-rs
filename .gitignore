@@ -1,1 +1,8 @@
 target/
+# benchmark data copies (sourced from ../ngboost and ../Lss-Models, see research/gradientlss/reports/001-protocol.md)
+research/gradientlss/data/
+# third-party datasets downloaded for the confirmation batches (198 MB); rebuilt by
+# research/gradientlss/prep_confirm_data*.py
+research/gradientlss/data_confirm/
+__pycache__/
+.DS_Store
