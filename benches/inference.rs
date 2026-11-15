@@ -80,6 +80,7 @@ mod xgboost_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -125,6 +126,7 @@ mod xgboost_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -175,6 +177,7 @@ mod xgboost_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -226,6 +229,7 @@ mod xgboost_inference {
                 early_stopping_rounds: None,
                 verbose: false,
                 collect_train_metrics: false,
+            param_freeze_rounds: None,
                 seed: 42,
             };
             model.train(&mut train_data, None, params, config).unwrap();
@@ -274,6 +278,7 @@ mod xgboost_inference {
                 early_stopping_rounds: None,
                 verbose: false,
                 collect_train_metrics: false,
+            param_freeze_rounds: None,
                 seed: 42,
             };
             model.train(&mut train_data, None, params, config).unwrap();
@@ -321,6 +326,7 @@ mod xgboost_inference {
                 early_stopping_rounds: None,
                 verbose: false,
                 collect_train_metrics: false,
+            param_freeze_rounds: None,
                 seed: 42,
             };
             model.train(&mut train_data, None, params, config).unwrap();
@@ -375,6 +381,7 @@ mod xgboost_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -448,6 +455,7 @@ mod lightgbm_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();
@@ -493,6 +501,7 @@ mod lightgbm_inference {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         model.train(&mut train_data, None, params, config).unwrap();

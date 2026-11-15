@@ -30,6 +30,16 @@ pub struct TrainConfig {
     /// it, regardless of this flag: no validation set (train loss drives early
     /// stopping), `verbose` logging, or registered callbacks.
     pub collect_train_metrics: bool,
+    /// Per-parameter stopping rounds (gamboostLSS's per-parameter `mstop`):
+    /// from round `rounds[j]` on, distribution parameter j's gradients and
+    /// Hessians are zeroed, so its trees stop while the others keep learning.
+    /// `None` entries (or `None` overall) never freeze. Measured: freezing the
+    /// Gaussian scale at 100–200 rounds improved held-out NLL by 0.10–0.16
+    /// nats on kin8nm/power_plant/protein (the location keeps training once
+    /// the scale's over-fit no longer triggers early stopping) and hurt where
+    /// σ(x) carries structure that is still being learned (naval); tune it on
+    /// validation NLL (`hyper_opt` axis `__freeze_<j>`).
+    pub param_freeze_rounds: Option<Vec<Option<usize>>>,
 }
 
 impl Default for TrainConfig {
@@ -39,6 +49,7 @@ impl Default for TrainConfig {
             early_stopping_rounds: Some(20),
             verbose: true,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 123,
         }
     }
@@ -217,6 +228,16 @@ pub trait TrainingCallback: Send {
     /// loop can skip it. Default `true`, the historical behaviour.
     fn needs_train_metric(&self) -> bool {
         true
+    }
+
+    /// Asked once per round, after `on_iteration_end` and before the built-in
+    /// `early_stopping_rounds` check. `true` resets that patience counter for
+    /// this round (the best iteration is unaffected): the round counts as
+    /// progress. Used by per-parameter early stopping so the global stop does
+    /// not end a fit while a parameter's learning rate is being cut. Default
+    /// `false`.
+    fn holds_early_stopping(&mut self) -> bool {
+        false
     }
 
     /// Get the name of this callback for logging purposes.
@@ -557,6 +578,11 @@ impl TrainingCallback for CallbackList {
         }
     }
 
+    fn holds_early_stopping(&mut self) -> bool {
+        // every callback is asked (no short-circuit): each may consume a flag
+        self.callbacks.iter_mut().fold(false, |acc, c| c.holds_early_stopping() | acc)
+    }
+
     fn name(&self) -> &str {
         "CallbackList"
     }
@@ -675,6 +701,10 @@ pub trait BackendParams: Default + Clone {
 
     /// Convert to a hashmap for the backend.
     fn to_map(&self) -> HashMap<String, ParamValue>;
+
+    /// Set the number of distribution parameters (boosting targets) these
+    /// params train: `num_target` (XGBoost) / `num_class` (LightGBM).
+    fn set_n_dist_params(&mut self, n: usize);
 }
 
 /// Parameter value types.
@@ -758,6 +788,11 @@ pub trait BackendDataset: Sized {
 
     /// Get the labels.
     fn get_labels(&self) -> Result<Array1<f64>>;
+
+    /// Get the feature matrix `(num_rows, n_features)` as f64 (a copy of the
+    /// backend's stored features). Used by the residual warm start to score
+    /// the stage-1 model on the training/validation rows.
+    fn get_features(&self) -> Result<Array2<f64>>;
 
     /// Get the per-sample training weights set via [`set_weights`], if any.
     ///
@@ -909,5 +944,10 @@ impl BackendParams for SimpleParams {
 
     fn to_map(&self) -> HashMap<String, ParamValue> {
         self.params.clone()
+    }
+
+    fn set_n_dist_params(&mut self, n: usize) {
+        self.params
+            .insert("n_dist_params".to_string(), ParamValue::Int(n as i64));
     }
 }

@@ -58,6 +58,10 @@ impl Default for XGBoostParams {
 }
 
 impl BackendParams for XGBoostParams {
+    fn set_n_dist_params(&mut self, n: usize) {
+        Self::set_n_dist_params(self, n)
+    }
+
     fn set(&mut self, key: &str, value: ParamValue) {
         // Normalize the alias so a caller-set "learning_rate" can never
         // coexist with the default "eta": params reach the booster via a
@@ -184,6 +188,15 @@ impl BackendDataset for XGBoostDataset {
 
     fn num_rows(&self) -> usize {
         self.n_rows
+    }
+
+    fn get_features(&self) -> Result<Array2<f64>> {
+        // row-major f32 → f64
+        Array2::from_shape_vec(
+            (self.n_rows, self.n_cols),
+            self.features.iter().map(|&v| v as f64).collect(),
+        )
+        .map_err(|e| crate::error::GradientLSSError::BackendError(e.to_string()))
     }
 
     fn get_labels(&self) -> Result<Array1<f64>> {
@@ -696,6 +709,9 @@ impl BackendModel for XGBoostModel {
                 if cb.on_iteration_end(round, tl, valid_loss) == CallbackAction::Stop {
                     stopped_early = true;
                     break;
+                }
+                if cb.holds_early_stopping() {
+                    rounds_without_improvement = 0;
                 }
             }
 
@@ -1286,6 +1302,7 @@ mod tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
         };
 
         XGBoostModel::train_with_objective_and_callbacks::<
@@ -1405,6 +1422,7 @@ mod tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
         };
 
         let (model, _) = XGBoostModel::train_with_objective_and_callbacks::<

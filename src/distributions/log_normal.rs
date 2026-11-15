@@ -1,6 +1,7 @@
 //! LogNormal distribution implementation.
 
-use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use super::base::{Distribution, DistributionParam, HessianMode, LossFn, Stabilization};
+use super::location_scale::{self, LocationScaleStart, LsFamily};
 use crate::constants::LOG_2PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
@@ -17,6 +18,14 @@ pub struct LogNormal {
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
+    /// Curvature handed to the booster. `Damped` by default; a model saved before the
+    /// field existed loads as `Observed`, what it was trained with.
+    #[serde(default = "crate::distributions::location_scale::legacy_hessian_mode")]
+    hessian_mode: HessianMode,
+    /// Start values used without `initialize`. `Location` by default; a model saved
+    /// before the field existed loads as `Raw`.
+    #[serde(default)]
+    start: LocationScaleStart,
 }
 
 impl LogNormal {
@@ -35,7 +44,34 @@ impl LogNormal {
             stabilization,
             loss_fn,
             initialize,
+            // Defaults since 2026-11-13 (research proposal 021, Felix's decision): the
+            // observed curvature and the raw 0.5 start stall on targets far from zero.
+            hessian_mode: HessianMode::Damped,
+            start: LocationScaleStart::Location,
         }
+    }
+
+    /// Curvature (default `Damped`; `Observed` restores the behaviour before 2026-11-13):
+    /// `Fisher` replaces the observed
+    /// second derivative with the expected information, `Damped` takes the row-wise maximum.
+    pub fn with_hessian_mode(mut self, mode: HessianMode) -> Self {
+        self.hessian_mode = mode;
+        self
+    }
+
+    pub fn hessian_mode(&self) -> HessianMode {
+        self.hessian_mode
+    }
+
+    /// Closed-form start values used without `initialize` (default `Location`; `Raw`
+    /// restores the behaviour before 2026-11-13; see [`LocationScaleStart`]).
+    pub fn with_start(mut self, start: LocationScaleStart) -> Self {
+        self.start = start;
+        self
+    }
+
+    pub fn start(&self) -> LocationScaleStart {
+        self.start
     }
 
     pub fn default() -> Self {
@@ -88,6 +124,10 @@ impl Distribution for LogNormal {
 
     fn should_initialize(&self) -> bool {
         self.initialize
+    }
+
+    fn default_start_values(&self, target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        location_scale::start_values(self.start, LsFamily::LogNormal, target, &self.params[1].response_fn)
     }
 
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
@@ -154,7 +194,8 @@ impl Distribution for LogNormal {
                 let yi = y[i];
 
                 if yi <= 0.0 {
-                    return (0.0, 0.0, 0.0, 0.0);
+                    // outside the support: no gradient, token curvature (as the serial branch)
+                    return (0.0, 1e-6, 0.0, 1e-6);
                 }
 
                 let d = (yi.ln() - loc) / scale;
@@ -219,6 +260,22 @@ impl Distribution for LogNormal {
             }
         }
 
+        location_scale::apply_hessian_mode(
+            self.hessian_mode,
+            LsFamily::LogNormal,
+            &mut hessians,
+            &predictions.column(1),
+            &transformed.column(1),
+            scale_response_fn,
+        );
+        // Rows outside the support (y <= 0) keep the token curvature whatever the mode:
+        // with a zero gradient, Fisher curvature there would only shrink the leaf steps.
+        for i in 0..n_samples {
+            if y[i] <= 0.0 {
+                hessians[[i, 0]] = 1e-6;
+                hessians[[i, 1]] = 1e-6;
+            }
+        }
         Some((gradients, hessians))
     }
 

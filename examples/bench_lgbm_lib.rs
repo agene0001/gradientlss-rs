@@ -56,6 +56,7 @@ fn main() {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
         let t = Instant::now();

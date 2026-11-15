@@ -1,6 +1,7 @@
 //! Cauchy distribution implementation.
 
-use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use super::base::{Distribution, DistributionParam, HessianMode, LossFn, Stabilization};
+use super::location_scale::{self, LocationScaleStart, LsFamily};
 use crate::constants::LOG_PI;
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
@@ -18,6 +19,14 @@ pub struct Cauchy {
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
+    /// Curvature handed to the booster. `Damped` by default; a model saved before the
+    /// field existed loads as `Observed`, what it was trained with.
+    #[serde(default = "crate::distributions::location_scale::legacy_hessian_mode")]
+    hessian_mode: HessianMode,
+    /// Start values used without `initialize`. `Location` by default; a model saved
+    /// before the field existed loads as `Raw`.
+    #[serde(default)]
+    start: LocationScaleStart,
 }
 
 impl Cauchy {
@@ -36,7 +45,34 @@ impl Cauchy {
             stabilization,
             loss_fn,
             initialize,
+            // Defaults since 2026-11-13 (research proposal 021, Felix's decision): the
+            // observed curvature and the raw 0.5 start stall on targets far from zero.
+            hessian_mode: HessianMode::Damped,
+            start: LocationScaleStart::Location,
         }
+    }
+
+    /// Curvature (default `Damped`; `Observed` restores the behaviour before 2026-11-13):
+    /// `Fisher` replaces the observed
+    /// second derivative with the expected information, `Damped` takes the row-wise maximum.
+    pub fn with_hessian_mode(mut self, mode: HessianMode) -> Self {
+        self.hessian_mode = mode;
+        self
+    }
+
+    pub fn hessian_mode(&self) -> HessianMode {
+        self.hessian_mode
+    }
+
+    /// Closed-form start values used without `initialize` (default `Location`; `Raw`
+    /// restores the behaviour before 2026-11-13; see [`LocationScaleStart`]).
+    pub fn with_start(mut self, start: LocationScaleStart) -> Self {
+        self.start = start;
+        self
+    }
+
+    pub fn start(&self) -> LocationScaleStart {
+        self.start
     }
 
     pub fn default() -> Self {
@@ -84,6 +120,10 @@ impl Distribution for Cauchy {
 
     fn should_initialize(&self) -> bool {
         self.initialize
+    }
+
+    fn default_start_values(&self, target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        location_scale::start_values(self.start, LsFamily::Cauchy, target, &self.params[1].response_fn)
     }
 
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
@@ -213,6 +253,14 @@ impl Distribution for Cauchy {
             }
         }
 
+        location_scale::apply_hessian_mode(
+            self.hessian_mode,
+            LsFamily::Cauchy,
+            &mut hessians,
+            &predictions.column(1),
+            &transformed.column(1),
+            scale_response_fn,
+        );
         Some((gradients, hessians))
     }
 
@@ -262,7 +310,9 @@ mod tests {
         use crate::types::ResponseData;
         use ndarray::array;
 
-        let dist = Cauchy::default();
+        // the observed second derivative is what the numerical path differentiates;
+        // the default (Damped) raises it to the Fisher value where it is smaller
+        let dist = Cauchy::default().with_hessian_mode(HessianMode::Observed);
         let predictions = array![[0.0, 0.0], [0.5, 0.3], [-0.2, 0.6]];
         let targets = array![1.0, 2.0, -1.5];
         let target = ResponseData::Univariate(&targets.view());

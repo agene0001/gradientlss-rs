@@ -4,6 +4,7 @@
 //! for finding optimal hyperparameters with optional trial pruning.
 
 use crate::backend::{Backend, BackendParams, ParamValue, TrainConfig};
+use crate::distributions::Distribution;
 use crate::model::GradientLSS;
 use ndarray::{Array1, Array2};
 // tpe 0.3 uses the same rand as the rest of the crate (the old rand_compat
@@ -149,6 +150,42 @@ impl PruningStrategy {
 impl Default for PruningStrategy {
     fn default() -> Self {
         PruningStrategy::Median { n_warmup_trials: 5 }
+    }
+}
+
+/// How each trial's parameters are proposed.
+///
+/// `Tpe` is the historical behaviour and the default. The other two exist so a
+/// search can be compared against a control (research/gradientlss, proposal
+/// 017): with one independent TPE per parameter and no start-up phase, trial 2
+/// is drawn next to trial 1 and trials 3–4 go to the ends of the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sampler {
+    /// One independent TPE per parameter, from the first trial.
+    #[default]
+    Tpe,
+    /// Independent uniform draws on each parameter's range (log-uniform on a
+    /// log axis, uniform over the choices of a categorical). The observations
+    /// are still told to the TPE optimizers, which are never asked.
+    Random,
+    /// Uniform draws for the first `n_startup` trials, TPE afterwards (the
+    /// shape of Optuna's `n_startup_trials`). Trials taken from
+    /// [`HyperOptConfig::initial_trials`] count towards `n_startup`.
+    TpeAfterRandom { n_startup: u32 },
+}
+
+/// The optimizer-space interval a parameter is drawn from: `ln` of the bounds
+/// on a log axis, `[0, n)` choice-index bins for a categorical.
+fn raw_bounds(param_type: &HyperParamType) -> (f64, f64) {
+    match param_type {
+        HyperParamType::Float { low, high, log } => {
+            if *log { (low.ln(), high.ln()) } else { (*low, *high) }
+        }
+        HyperParamType::Int { low, high, log } => {
+            let (l, h) = (*low as f64, *high as f64);
+            if *log { (l.ln(), h.ln()) } else { (l, h) }
+        }
+        HyperParamType::Categorical { choices } => (0.0, choices.len() as f64),
     }
 }
 
@@ -315,7 +352,36 @@ pub trait FoldTransform: Sync {
 /// and are NOT forwarded to the boosting backend. Use it for anything that
 /// parameterizes preprocessing (imputer rank, neighbour count, …) so a single
 /// TPE study can tune the pipeline and the model together.
+///
+/// Three reserved axes tune per-parameter early stopping on every fold model
+/// (on top of the model's own setting, see
+/// [`crate::model::ParamEarlyStopping::from_trial_params`]): `__pes_window`
+/// (`0` = off), `__pes_patience` and `__pes_anneal` (`0` = freeze). Apply the
+/// winning values to the final fit with the same helper.
 pub const TRANSFORM_PARAM_PREFIX: &str = "__";
+
+/// Per-trial DISTRIBUTION builder: given the model's base distribution and
+/// the trial's sampled parameters (including any `__`-prefixed, transform-only
+/// axes), returns the distribution the trial's fold models train with. Lets a
+/// single study tune distribution-side knobs — `HessianMode`, per-parameter
+/// shrinkage (`with_param_gradient_scales`), β-NLL, the StudentT start cap —
+/// alongside the booster's. When set, the per-fold start-value cache is
+/// disabled (start values may depend on the distribution). The caller applies
+/// the same builder to the winning params for the final fit.
+#[derive(Clone)]
+pub struct TrialDistFn(
+    pub std::sync::Arc<
+        dyn Fn(&dyn Distribution, &HashMap<String, Value>) -> std::sync::Arc<dyn Distribution>
+            + Send
+            + Sync,
+    >,
+);
+
+impl std::fmt::Debug for TrialDistFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrialDistFn(<fn>)")
+    }
+}
 
 /// Per-fold TRAIN-row weight generator: called with the fold's train length,
 /// returns that many sample weights applied to the fold's training dataset
@@ -371,6 +437,9 @@ impl std::fmt::Debug for FoldScoreFn {
 pub struct HyperOptConfig {
     /// Number of optimization trials
     pub n_trials: u32,
+    /// Build each trial's distribution from the sampled params (see
+    /// [`TrialDistFn`]). `None` = every trial uses the model's distribution.
+    pub trial_dist_fn: Option<TrialDistFn>,
     /// Score each fold with this instead of the model's loss (see
     /// [`FoldScoreFn`]). `None` (the default) scores by the configured loss.
     pub fold_score_fn: Option<FoldScoreFn>,
@@ -440,6 +509,21 @@ pub struct HyperOptConfig {
     /// ignored, and values outside a spec's range are clamped into it. `None`
     /// (the default) searches cold.
     pub warm_start: Option<(HashMap<String, Value>, f64)>,
+    /// How trial parameters are proposed (see [`Sampler`]). Default: `Tpe`,
+    /// the historical behaviour.
+    pub sampler: Sampler,
+    /// Configurations EVALUATED first, in order, before the sampler proposes
+    /// anything (Optuna's `enqueue_trial`): typically the model's untuned
+    /// defaults, so the search can never return something that scored worse
+    /// than them on its own folds.
+    ///
+    /// Unlike [`HyperOptConfig::warm_start`], which only tells the optimizers
+    /// a score from another run, these are scored on this run's folds and can
+    /// be returned as the result. Each one uses one of the `n_trials`. A
+    /// parameter a configuration does not name (or whose value cannot be
+    /// placed in the parameter's space) is drawn by the sampler; out-of-range
+    /// numbers are clamped into the range. Empty (the default) = none.
+    pub initial_trials: Vec<HashMap<String, Value>>,
     /// Whether to print progress
     pub verbose: bool,
 }
@@ -448,6 +532,7 @@ impl Default for HyperOptConfig {
     fn default() -> Self {
         Self {
             n_trials: 100,
+            trial_dist_fn: None,
             fold_score_fn: None,
             fold_weight_fn: None,
             fold_val_weight_fn: None,
@@ -461,6 +546,8 @@ impl Default for HyperOptConfig {
             max_minutes: None,
             plateau_patience: None,
             warm_start: None,
+            sampler: Sampler::Tpe,
+            initial_trials: Vec::new(),
             verbose: true,
         }
     }
@@ -738,9 +825,29 @@ fn search<B: Backend>(
         let mut sampled_params: HashMap<String, f64> = HashMap::new();
         let mut trial_params: HashMap<String, Value> = HashMap::new();
 
+        // A queued configuration fills this trial first; whatever it leaves
+        // open falls to the sampler.
+        let queued = config.initial_trials.get(trial as usize);
+        let uniform_draw = match config.sampler {
+            Sampler::Tpe => false,
+            Sampler::Random => true,
+            Sampler::TpeAfterRandom { n_startup } => trial < n_startup,
+        };
+
         for spec in &specs {
             if let Some(optimizer) = optimizers.get_mut(&spec.name) {
-                let raw_value = optimizer.ask(&mut rng)?;
+                let queued_raw = queued
+                    .and_then(|q| q.get(&spec.name))
+                    .and_then(|v| value_to_raw(&spec.param_type, v));
+                let raw_value = match queued_raw {
+                    Some(raw) => raw,
+                    None if uniform_draw => {
+                        use rand::RngExt;
+                        let (lo, hi) = raw_bounds(&spec.param_type);
+                        if hi > lo { rng.random_range(lo..hi) } else { lo }
+                    }
+                    None => optimizer.ask(&mut rng)?,
+                };
                 sampled_params.insert(spec.name.clone(), raw_value);
 
                 // Convert raw value to actual parameter value
@@ -787,12 +894,16 @@ fn search<B: Backend>(
             early_stopping_rounds: config.early_stopping_rounds,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: config.seed + trial as u64,
         };
 
         // A transform-only axis (imputer rank, ...) changes the features per trial.
+        // The `__pes_*` axes only configure training, so they keep the cache.
         let trial_reuses_fold_data = reuse_fold_data
-            && !trial_params.keys().any(|k| k.starts_with(TRANSFORM_PARAM_PREFIX));
+            && !trial_params
+                .keys()
+                .any(|k| k.starts_with(TRANSFORM_PARAM_PREFIX) && !k.starts_with("__pes_"));
 
         // The trial's learning rate, for ASHA's effort clock (rounds × lr).
         let trial_learning_rate = ["learning_rate", "eta"]
@@ -824,6 +935,7 @@ fn search<B: Backend>(
             config.fold_score_fn.as_ref(),
             config.fold_val_weight_fn.as_ref(),
             trial_learning_rate,
+            config.trial_dist_fn.as_ref(),
         );
         for (fold, rung, v) in rung_obs {
             pruner_state.record_rung(fold, rung, v);
@@ -1016,6 +1128,7 @@ fn cv_with_pruning<B: Backend>(
     fold_score_fn: Option<&FoldScoreFn>,
     fold_val_weight_fn: Option<&FoldValWeightFn>,
     trial_learning_rate: f64,
+    trial_dist_fn: Option<&TrialDistFn>,
 ) -> (f64, bool, Vec<f64>, Vec<usize>, Vec<(usize, usize, f64)>) {
     use crate::backend::BackendDataset;
     use ndarray::{Axis, s};
@@ -1182,11 +1295,33 @@ fn cv_with_pruning<B: Backend>(
             continue;
         };
 
-        let mut fold_model = GradientLSS::<B>::new(model.distribution().clone_arc());
+        let trial_dist = match trial_dist_fn {
+            Some(f) => (f.0)(model.distribution(), trial_params),
+            None => model.distribution().clone_arc(),
+        };
+        let mut fold_model = GradientLSS::<B>::new(trial_dist);
+        // Per-parameter early stopping: the model's setting, overridden by the
+        // `__pes_window` / `__pes_patience` / `__pes_anneal` axes.
+        fold_model.set_param_early_stopping_setting(model.param_early_stopping_setting().clone());
+        // Training-time settings that change the fit must reach the folds too,
+        // or a search tunes a different model from the one it will configure.
+        fold_model.set_hessian_normalization(model.hessian_normalization());
+        fold_model.set_stopping_row_cap(model.stopping_row_cap());
+        if ["__pes_window", "__pes_patience", "__pes_anneal"].iter().any(|k| trial_params.contains_key(*k)) {
+            let base = fold_model.effective_param_early_stopping();
+            let dflt = fold_model.distribution().default_param_early_stopping_params();
+            fold_model.set_param_early_stopping(crate::model::ParamEarlyStopping::from_trial_params(
+                base.as_ref(),
+                dflt,
+                trial_params,
+            ));
+        }
         // Reuse this fold's start values from an earlier trial when available —
         // they depend only on the fold's train labels, which are fixed for the
-        // whole search.
-        if let Some(sv) = fold_start_values.get(i).and_then(|s| s.as_ref()) {
+        // whole search. Not when the distribution itself varies per trial.
+        if trial_dist_fn.is_none()
+            && let Some(sv) = fold_start_values.get(i).and_then(|s| s.as_ref())
+        {
             fold_model.preset_start_values(sv.clone());
         }
         let mut asha = match pruning_strategy {
@@ -1239,10 +1374,11 @@ fn cv_with_pruning<B: Backend>(
             pruned = true;
             break;
         }
-        if let Some(slot) = fold_start_values.get_mut(i) {
-            if slot.is_none() {
-                *slot = fold_model.start_values().cloned();
-            }
+        if trial_dist_fn.is_none()
+            && let Some(slot) = fold_start_values.get_mut(i)
+            && slot.is_none()
+        {
+            *slot = fold_model.start_values().cloned();
         }
 
         // Rounds this fold's early stopping actually selected (argmin of its
@@ -1406,6 +1542,178 @@ fn json_to_param_value(value: &Value) -> ParamValue {
     }
 }
 
+/// Outcome of [`validation_guard`].
+#[derive(Debug, Clone)]
+pub struct ValidationGuardResult {
+    /// The configuration to use: the tuned one if it won, otherwise the baseline.
+    pub params: HashMap<String, Value>,
+    /// Whether the tuned configuration was kept.
+    pub kept_tuned: bool,
+    /// Validation loss of the tuned fit at its best round (`INFINITY` if it failed).
+    pub tuned_score: f64,
+    /// Validation loss of the baseline fit at its best round.
+    pub baseline_score: f64,
+    /// Number of boosting rounds of the kept fit at its best round.
+    pub opt_rounds: usize,
+}
+
+/// Check a tuned configuration against an untuned one on a validation set.
+///
+/// A search's CV score overstates what the chosen configuration gains: on 24
+/// (family, dataset) pairs the search believed it gained 0.05–0.08 NLL over
+/// the untuned defaults and kept 0.01–0.02, and with `min_child_weight` /
+/// `lambda` searches it was worse than the untuned defaults on 4 of 24 pairs
+/// (research proposals 017 and 022). This fits both configurations the way a
+/// final model is fitted (the training rows, early stopping on the validation
+/// rows) and returns the one with the lower validation loss. On those 24 pairs
+/// that removed every loss.
+///
+/// It is a check, not a guarantee. With a search over tree depth and
+/// subsampling as well, it kept a tuned Gaussian model that was worse on test
+/// on 2 of 14 unseen pairs (a heavy-tailed target; proposal 025). It can also
+/// give up gain when the family fits badly.
+///
+/// * `model` supplies the distribution and the training settings (per-parameter
+///   early stopping, Hessian normalisation, stopping row cap), as in a search.
+/// * `tuned_params` is usually `HyperOptResult::best_params`; `baseline_params`
+///   is the configuration you would use without tuning. Parameters the search
+///   held fixed must be in both. An empty map means the backend's defaults.
+/// * `config` supplies `num_boost_round`, `early_stopping_rounds`, `seed`,
+///   `trial_dist_fn` and `fold_score_fn`; the other fields are ignored.
+///
+/// The validation rows drive early stopping for both fits, so the comparison
+/// is between two equally optimistic numbers. A `FoldTransform` is not
+/// applied: transform the features before calling. Ties keep the baseline.
+pub fn validation_guard<B: Backend>(
+    model: &GradientLSS<B>,
+    train_features: &Array2<f64>,
+    train_labels: &Array1<f64>,
+    valid_features: &Array2<f64>,
+    valid_labels: &Array1<f64>,
+    tuned_params: &HashMap<String, Value>,
+    baseline_params: &HashMap<String, Value>,
+    config: &HyperOptConfig,
+) -> Result<ValidationGuardResult, Box<dyn std::error::Error>> {
+    let fit = |params: &HashMap<String, Value>| -> Result<(f64, usize), Box<dyn std::error::Error>> {
+        use crate::backend::BackendDataset;
+        let dist = match config.trial_dist_fn.as_ref() {
+            Some(f) => (f.0)(model.distribution(), params),
+            None => model.distribution().clone_arc(),
+        };
+        // the same model settings a fold model inherits in `cv_with_pruning`
+        let mut m = GradientLSS::<B>::new(dist);
+        m.set_param_early_stopping_setting(model.param_early_stopping_setting().clone());
+        m.set_hessian_normalization(model.hessian_normalization());
+        m.set_stopping_row_cap(model.stopping_row_cap());
+        if ["__pes_window", "__pes_patience", "__pes_anneal"].iter().any(|k| params.contains_key(*k)) {
+            let base = m.effective_param_early_stopping();
+            let dflt = m.distribution().default_param_early_stopping_params();
+            m.set_param_early_stopping(crate::model::ParamEarlyStopping::from_trial_params(base.as_ref(), dflt, params));
+        }
+        let mut backend_params = B::create_params(m.n_params());
+        for (key, value) in params {
+            if key.starts_with(TRANSFORM_PARAM_PREFIX) {
+                continue;
+            }
+            backend_params.set(key, json_to_param_value(value));
+        }
+        let mut train = B::Dataset::from_data(train_features.view(), train_labels.view())?;
+        let mut valid = B::Dataset::from_data(valid_features.view(), valid_labels.view())?;
+        let train_config = TrainConfig {
+            num_boost_round: config.num_boost_round,
+            early_stopping_rounds: config.early_stopping_rounds,
+            verbose: false,
+            collect_train_metrics: false,
+            param_freeze_rounds: None,
+            seed: config.seed,
+        };
+        let ((), result) = m.train_with_callbacks(
+            &mut train,
+            Some(&mut valid),
+            backend_params,
+            train_config,
+            None::<&mut crate::backend::HistoryCallback>,
+        )?;
+        let rounds = result.best_iteration.map(|b| b + 1).unwrap_or(result.n_iterations);
+        let preds = m.predict_transformed(&valid_features.view())?;
+        let score = match config.fold_score_fn.as_ref() {
+            Some(f) => (f.0)(&preds, valid_labels),
+            None => m.metric_on_transformed(&preds, valid_labels),
+        };
+        Ok((if score.is_nan() { f64::INFINITY } else { score }, rounds))
+    };
+
+    let (baseline_score, baseline_rounds) = fit(baseline_params)?;
+    // A tuned configuration that cannot be fitted loses to the baseline.
+    let (tuned_score, tuned_rounds) = fit(tuned_params).unwrap_or((f64::INFINITY, 0));
+    let kept_tuned = tuned_score < baseline_score;
+    Ok(ValidationGuardResult {
+        params: if kept_tuned { tuned_params.clone() } else { baseline_params.clone() },
+        kept_tuned,
+        tuned_score,
+        baseline_score,
+        opt_rounds: if kept_tuned { tuned_rounds } else { baseline_rounds },
+    })
+}
+
+/// The two regularisation axes every tested search space starts from:
+/// `min_child_weight` and `lambda`, log-uniform on [1e-3, 1e3].
+fn two_axis_space() -> HashMap<String, Value> {
+    let mut hp = HashMap::new();
+    for k in ["min_child_weight", "lambda"] {
+        hp.insert(k.to_string(), serde_json::json!({"low": 1e-3, "high": 1e3, "log": true}));
+    }
+    hp
+}
+
+/// Ready-made search space for the XGBoost backend: `min_child_weight`,
+/// `lambda` and leaf-wise growth with a leaf budget (`grow_policy =
+/// lossguide`, `max_depth = 0`, `max_leaves` 4–64 log-uniform).
+///
+/// Of the eleven further axes tested next to `min_child_weight` and `lambda`
+/// this is the one that passed the inclusion rule at 20 trials, on 36 (family,
+/// dataset) pairs and again on 12 others: with [`validation_guard`] it was
+/// worse than the untuned defaults on 0 of 48 pairs and better than the
+/// two-axis search on 46 (research proposals 035 and 039, README "Leaf-wise
+/// growth with a leaf budget").
+///
+/// The map is an ordinary `hp_dict`: add the parameters you hold fixed as
+/// single choices (the tests used `eta` 0.05), and pass the result of the
+/// search through [`validation_guard`]. Not tested together with
+/// `subsample` / `colsample_bytree` or with [`max_bin_search_space`], and not
+/// a LightGBM space (its `num_leaves` failed the rule by one pair, and
+/// searching `lambda` there needs care; see the README).
+///
+/// ```ignore
+/// let mut hp = gradientlss::hyper_opt::leaf_wise_search_space();
+/// hp.insert("eta".into(), serde_json::json!({"choices": [0.05]}));
+/// let result = hyper_opt_with_config(&mut model, &x, &y, &hp, config)?;
+/// ```
+pub fn leaf_wise_search_space() -> HashMap<String, Value> {
+    let mut hp = two_axis_space();
+    hp.insert("grow_policy".to_string(), serde_json::json!({"choices": ["lossguide"]}));
+    hp.insert("max_depth".to_string(), serde_json::json!({"choices": [0]}));
+    hp.insert("max_leaves".to_string(), serde_json::json!({"low": 4, "high": 64, "log": true, "type": "int"}));
+    hp
+}
+
+/// Ready-made search space for the XGBoost backend: `min_child_weight`,
+/// `lambda` and `max_bin` (16–1024, log-uniform). Give it at least 50 trials.
+///
+/// At 20 trials this space failed the inclusion rule; at 50 it passed on 36
+/// (family, dataset) pairs and was better than the two-axis search on 40 of
+/// 48 overall, with one pair (Gamma on a 768-row dataset, +0.029 NLL) where
+/// it was worse than the untuned defaults and [`validation_guard`] did not
+/// catch it (research proposals 033, 034 and 038, README "`max_bin` as a
+/// search axis"). `max_depth` is not set: the tests held it at 4, so add it
+/// as a single choice with the other parameters you hold fixed. Not tested
+/// together with [`leaf_wise_search_space`].
+pub fn max_bin_search_space() -> HashMap<String, Value> {
+    let mut hp = two_axis_space();
+    hp.insert("max_bin".to_string(), serde_json::json!({"low": 16, "high": 1024, "log": true, "type": "int"}));
+    hp
+}
+
 /// Convenience function for simple hyperparameter optimization.
 ///
 /// Uses default settings and a simple search space format.
@@ -1532,6 +1840,37 @@ mod tests {
     }
 
     #[test]
+    fn test_ready_made_search_spaces_parse() {
+        let leaf = leaf_wise_search_space();
+        let specs = parse_hp_specs(&leaf).unwrap();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["grow_policy", "lambda", "max_depth", "max_leaves", "min_child_weight"]);
+        for s in &specs {
+            match (s.name.as_str(), &s.param_type) {
+                ("max_leaves", HyperParamType::Int { low: 4, high: 64, log: true }) => {}
+                ("lambda" | "min_child_weight", HyperParamType::Float { low, high, log: true }) => {
+                    assert_eq!((*low, *high), (1e-3, 1e3));
+                }
+                ("grow_policy", HyperParamType::Categorical { choices }) => {
+                    assert_eq!(choices, &vec![serde_json::json!("lossguide")]);
+                    assert!(matches!(json_to_param_value(&choices[0]), ParamValue::String(ref g) if g == "lossguide"));
+                }
+                ("max_depth", HyperParamType::Categorical { choices }) => {
+                    assert!(matches!(json_to_param_value(&choices[0]), ParamValue::Int(0)));
+                }
+                (n, t) => panic!("unexpected spec {n}: {t:?}"),
+            }
+        }
+
+        let bins = max_bin_search_space();
+        let specs = parse_hp_specs(&bins).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert!(specs.iter().any(|s| s.name == "max_bin"
+            && matches!(s.param_type, HyperParamType::Int { low: 16, high: 1024, log: true })));
+        assert!(!bins.contains_key("max_depth"));
+    }
+
+    #[test]
     fn test_json_to_param_value() {
         assert!(matches!(
             json_to_param_value(&serde_json::json!(42)),
@@ -1629,6 +1968,7 @@ mod xgboost_hyper_opt_tests {
     }
 
     #[test]
+    #[cfg(feature = "lightgbm")]
     fn fold_reuse_is_bit_identical_on_lightgbm() {
         assert_fold_reuse_is_identical::<crate::backend::LightGBMBackend>();
     }
@@ -1657,12 +1997,133 @@ mod xgboost_hyper_opt_tests {
         search(&mut model, &features, &labels, &hp_dict, config, None, reuse_fold_data).unwrap()
     }
 
+    fn run_sampler_search(sampler: Sampler, initial: Vec<HashMap<String, Value>>) -> HyperOptResult {
+        let (features, labels) = noisy_dataset();
+        let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+        let mut hp_dict = HashMap::new();
+        hp_dict.insert("eta".to_string(), serde_json::json!({"low": 0.01, "high": 0.5, "log": true}));
+        hp_dict.insert("max_depth".to_string(), serde_json::json!({"low": 2.0, "high": 6.0, "type": "int"}));
+        hp_dict.insert("subsample".to_string(), serde_json::json!({"choices": [0.6, 0.8, 1.0]}));
+        let config = HyperOptConfig {
+            n_trials: 6,
+            n_folds: 2,
+            seed: 7,
+            num_boost_round: 40,
+            early_stopping_rounds: Some(5),
+            sampler,
+            initial_trials: initial,
+            verbose: false,
+            ..Default::default()
+        };
+        search(&mut model, &features, &labels, &hp_dict, config, None, true).unwrap()
+    }
+
+    /// The guard keeps whichever configuration has the lower validation loss:
+    /// a deliberately crushing regularisation loses to the defaults, a sane
+    /// configuration compared with a crushed baseline wins, and the scores it
+    /// reports are the ones a direct fit gives.
+    #[test]
+    fn validation_guard_keeps_the_better_configuration() {
+        let (features, labels) = noisy_dataset();
+        let n = labels.len();
+        let cut = n * 3 / 4;
+        let (xtr, xva) = (features.slice(ndarray::s![..cut, ..]).to_owned(), features.slice(ndarray::s![cut.., ..]).to_owned());
+        let (ytr, yva) = (labels.slice(ndarray::s![..cut]).to_owned(), labels.slice(ndarray::s![cut..]).to_owned());
+        let model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+        let config = HyperOptConfig { num_boost_round: 60, early_stopping_rounds: Some(10), seed: 3, verbose: false, ..Default::default() };
+        let sane: HashMap<String, Value> =
+            [("eta".to_string(), serde_json::json!(0.1)), ("max_depth".to_string(), serde_json::json!(3))].into_iter().collect();
+        let crushed: HashMap<String, Value> = [
+            ("eta".to_string(), serde_json::json!(0.1)),
+            ("max_depth".to_string(), serde_json::json!(3)),
+            ("min_child_weight".to_string(), serde_json::json!(1e9)),
+        ]
+        .into_iter()
+        .collect();
+
+        // a bad "tuned" configuration is rejected
+        let r = validation_guard(&model, &xtr, &ytr, &xva, &yva, &crushed, &sane, &config).unwrap();
+        assert!(!r.kept_tuned, "crushed {} vs sane {}", r.tuned_score, r.baseline_score);
+        assert_eq!(r.params, sane);
+        assert!(r.baseline_score.is_finite() && r.tuned_score > r.baseline_score);
+        assert!(r.opt_rounds >= 1);
+
+        // the same two the other way round: the better one is kept, with the same scores
+        let r2 = validation_guard(&model, &xtr, &ytr, &xva, &yva, &sane, &crushed, &config).unwrap();
+        assert!(r2.kept_tuned);
+        assert_eq!(r2.params, sane);
+        assert_eq!(r2.tuned_score.to_bits(), r.baseline_score.to_bits());
+        assert_eq!(r2.baseline_score.to_bits(), r.tuned_score.to_bits());
+
+        // a tie keeps the baseline
+        let r3 = validation_guard(&model, &xtr, &ytr, &xva, &yva, &sane, &sane, &config).unwrap();
+        assert!(!r3.kept_tuned);
+        assert_eq!(r3.tuned_score.to_bits(), r3.baseline_score.to_bits());
+    }
+
+    /// A queued configuration is the first trial, is scored on this run's
+    /// folds like any other, and does not disturb the trials that follow a
+    /// plain search's RNG stream more than by taking its slot.
+    #[test]
+    fn initial_trials_are_evaluated_first() {
+        let queued: HashMap<String, Value> = [
+            ("eta".to_string(), serde_json::json!(0.1)),
+            ("max_depth".to_string(), serde_json::json!(3)),
+            ("subsample".to_string(), serde_json::json!(0.8)),
+        ]
+        .into_iter()
+        .collect();
+        let r = run_sampler_search(Sampler::Tpe, vec![queued.clone()]);
+        assert_eq!(r.trials.len(), 6);
+        let first = &r.trials[0].params;
+        assert!((first["eta"].as_f64().unwrap() - 0.1).abs() < 1e-12);
+        assert_eq!(first["max_depth"].as_i64().unwrap(), 3);
+        assert_eq!(first["subsample"].as_f64().unwrap(), 0.8);
+        assert!(r.trials[0].score.is_finite());
+        // The result can never be worse than the queued configuration's own score.
+        assert!(r.best_score <= r.trials[0].score);
+
+        // A partial configuration: the unnamed axes are drawn, the named one is kept.
+        let partial: HashMap<String, Value> = [("max_depth".to_string(), serde_json::json!(5))].into_iter().collect();
+        let r = run_sampler_search(Sampler::Random, vec![partial]);
+        assert_eq!(r.trials[0].params["max_depth"].as_i64().unwrap(), 5);
+        let eta = r.trials[0].params["eta"].as_f64().unwrap();
+        assert!((0.01..=0.5).contains(&eta));
+    }
+
+    /// The uniform sampler stays inside every range, is reproducible, and the
+    /// start-up variant draws exactly its values until TPE takes over.
+    #[test]
+    fn random_and_startup_samplers() {
+        let random = run_sampler_search(Sampler::Random, vec![]);
+        let again = run_sampler_search(Sampler::Random, vec![]);
+        let startup = run_sampler_search(Sampler::TpeAfterRandom { n_startup: 3 }, vec![]);
+        let tpe = run_sampler_search(Sampler::Tpe, vec![]);
+        for t in &random.trials {
+            let eta = t.params["eta"].as_f64().unwrap();
+            assert!((0.01..=0.5).contains(&eta), "eta {eta}");
+            assert!((2..=6).contains(&t.params["max_depth"].as_i64().unwrap()));
+            assert!([0.6, 0.8, 1.0].contains(&t.params["subsample"].as_f64().unwrap()));
+        }
+        for (a, b) in random.trials.iter().zip(&again.trials) {
+            assert_eq!(a.params, b.params);
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+        }
+        for i in 0..3 {
+            assert_eq!(random.trials[i].params, startup.trials[i].params, "start-up trial {i}");
+        }
+        assert_ne!(random.trials[5].params, startup.trials[5].params);
+        assert_ne!(random.trials[0].params, tpe.trials[0].params);
+    }
+
     /// ASHA runs end to end on both backends: some trials stop at a rung and
     /// score infinite, the winner is finite and completed, and every rung
     /// a fit reached is on record for the next trials.
     #[test]
     fn asha_prunes_inside_the_fit_and_still_finds_a_winner() {
-        for backend in ["xgboost", "lightgbm"] {
+        let backends: &[&str] =
+            if cfg!(feature = "lightgbm") { &["xgboost", "lightgbm"] } else { &["xgboost"] };
+        for &backend in backends {
             let (features, labels) = noisy_dataset();
             let mut hp_dict = HashMap::new();
             hp_dict.insert("learning_rate".to_string(), serde_json::json!({"low": 0.05, "high": 0.5, "log": true}));
@@ -1681,8 +2142,13 @@ mod xgboost_hyper_opt_tests {
                 let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
                 search(&mut model, &features, &labels, &hp_dict, config, None, true).unwrap()
             } else {
-                let mut model = GradientLSS::<crate::backend::LightGBMBackend>::new(Arc::new(Gaussian::default()));
-                search(&mut model, &features, &labels, &hp_dict, config, None, true).unwrap()
+                #[cfg(feature = "lightgbm")]
+                {
+                    let mut model = GradientLSS::<crate::backend::LightGBMBackend>::new(Arc::new(Gaussian::default()));
+                    search(&mut model, &features, &labels, &hp_dict, config, None, true).unwrap()
+                }
+                #[cfg(not(feature = "lightgbm"))]
+                unreachable!("lightgbm backend not compiled in")
             };
             let pruned = result.trials.iter().filter(|t| t.pruned).count();
             assert!(pruned >= 1, "{backend}: nothing pruned");
@@ -1763,6 +2229,7 @@ mod xgboost_hyper_opt_tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
         };
         let pruner_state = PrunerState::new();
 
@@ -1790,7 +2257,8 @@ mod xgboost_hyper_opt_tests {
                     None,
                     None,
                     0.1,
-                );
+                
+                    None,);
                 assert!(score.is_finite());
             }
             t.elapsed()
@@ -1895,5 +2363,115 @@ mod warm_start_tests {
     fn int_accepts_a_json_float() {
         let pt = HyperParamType::Int { low: 1, high: 10, log: false };
         assert_eq!(value_to_raw(&pt, &Value::from(8.0)), Some(8.0));
+    }
+}
+
+#[cfg(all(test, feature = "xgboost"))]
+mod trial_dist_fn_tests {
+    use super::*;
+    use crate::backend::XGBoostBackend;
+    use crate::distributions::Gaussian;
+    use crate::utils::ResponseFn;
+    use std::sync::Arc;
+
+    /// A `__`-prefixed axis reaches the trial distribution builder and never
+    /// the booster; the study runs and reports the axis in its best params.
+    /// `__pes_window` reaches the fold models: window 0 reproduces a model
+    /// with per-parameter early stopping off, window 3 changes the CV score.
+    #[test]
+    fn pes_axes_reach_the_fold_models() {
+        let n = 600;
+        let features = Array2::from_shape_fn((n, 2), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0);
+        let labels = Array1::from_shape_fn(n, |i| 1.0 + 2.0 * features[[i, 0]] + (((i * 31) % 17) as f64 / 8.0 - 1.0));
+        let run = |axis: Option<i64>, off: bool| {
+            let mut hp = HashMap::new();
+            hp.insert("max_depth".to_string(), serde_json::json!({"choices": [6]}));
+            hp.insert("learning_rate".to_string(), serde_json::json!({"choices": [0.3]}));
+            if let Some(w) = axis {
+                hp.insert("__pes_window".to_string(), serde_json::json!({"choices": [w]}));
+            }
+            let config = HyperOptConfig {
+                n_trials: 1, n_folds: 2, seed: 3, num_boost_round: 60,
+                early_stopping_rounds: None, verbose: false, ..Default::default()
+            };
+            let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+            if off {
+                model = model.without_param_early_stopping();
+            }
+            hyper_opt_with_config(&mut model, &features, &labels, &hp, config).unwrap().best_score
+        };
+        let off = run(None, true);
+        assert_eq!(run(Some(0), false), off);
+        let on = run(Some(3), true);
+        assert!(on.is_finite() && (on - off).abs() > 1e-9, "on {on} off {off}");
+    }
+
+    /// The model's Hessian normalisation reaches the fold models: with the
+    /// labels in units where the location Hessian is far from 1 per row, the
+    /// same `min_child_weight`/`lambda` give a different CV score.
+    #[test]
+    fn hessian_normalization_reaches_the_fold_models() {
+        use crate::model::HessianNormalization;
+        let n = 600;
+        let features = Array2::from_shape_fn((n, 2), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0);
+        let labels = Array1::from_shape_fn(n, |i| 100.0 * (1.0 + 2.0 * features[[i, 0]] + (((i * 31) % 17) as f64 / 8.0 - 1.0)));
+        let run = |mode: HessianNormalization| {
+            let mut hp = HashMap::new();
+            hp.insert("max_depth".to_string(), serde_json::json!({"choices": [4]}));
+            hp.insert("min_child_weight".to_string(), serde_json::json!({"choices": [5.0]}));
+            hp.insert("lambda".to_string(), serde_json::json!({"choices": [5.0]}));
+            let config = HyperOptConfig {
+                n_trials: 1, n_folds: 2, seed: 3, num_boost_round: 60,
+                early_stopping_rounds: None, verbose: false, ..Default::default()
+            };
+            let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()))
+                .with_hessian_normalization(mode);
+            hyper_opt_with_config(&mut model, &features, &labels, &hp, config).unwrap().best_score
+        };
+        let off = run(HessianNormalization::Off);
+        let marg = run(HessianNormalization::Marginal);
+        assert!(off.is_finite() && marg.is_finite());
+        assert!((off - marg).abs() > 1e-6, "off {off} marginal {marg}");
+    }
+
+    #[test]
+    fn scale_shrink_axis_is_tuned_through_the_distribution_builder() {
+        let n = 600;
+        let features = Array2::from_shape_fn((n, 2), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0);
+        let labels = Array1::from_shape_fn(n, |i| {
+            1.0 + 2.0 * features[[i, 0]] + (0.2 + features[[i, 1]]) * (((i * 31) % 17) as f64 / 8.0 - 1.0)
+        });
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let seen2 = Arc::clone(&seen);
+        let builder = TrialDistFn(Arc::new(move |base: &dyn Distribution, params: &HashMap<String, Value>| {
+            let c = params.get("__scale_shrink").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            seen2.lock().unwrap().push(c);
+            // base is a Gaussian here; rebuild it with the trial's scale multiplier
+            Arc::new(
+                Gaussian::new(base.stabilization(), ResponseFn::Exp, base.loss_fn(), false)
+                    .with_param_gradient_scales([1.0, c]),
+            ) as Arc<dyn Distribution>
+        }));
+        let mut hp_dict = HashMap::new();
+        hp_dict.insert("__scale_shrink".to_string(), serde_json::json!({"choices": [1.0, 0.25]}));
+        hp_dict.insert("learning_rate".to_string(), serde_json::json!({"low": 0.05, "high": 0.3, "log": true}));
+        let config = HyperOptConfig {
+            n_trials: 6,
+            n_folds: 2,
+            seed: 3,
+            num_boost_round: 40,
+            early_stopping_rounds: Some(10),
+            verbose: false,
+            trial_dist_fn: Some(builder),
+            ..Default::default()
+        };
+        let mut model = GradientLSS::<XGBoostBackend>::new(Arc::new(Gaussian::default()));
+        let result = hyper_opt_with_config(&mut model, &features, &labels, &hp_dict, config).unwrap();
+        assert_eq!(result.trials.len(), 6);
+        assert!(result.best_params.contains_key("__scale_shrink"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 12, "builder called once per (trial, fold)");
+        assert!(seen.iter().any(|&c| c == 0.25) && seen.iter().any(|&c| c == 1.0));
+        assert!(result.best_score.is_finite());
     }
 }

@@ -53,6 +53,10 @@ impl Default for LightGBMParams {
 }
 
 impl BackendParams for LightGBMParams {
+    fn set_n_dist_params(&mut self, n: usize) {
+        Self::set_n_dist_params(self, n)
+    }
+
     fn set(&mut self, key: &str, value: ParamValue) {
         let str_value = match &value {
             ParamValue::Int(v) => v.to_string(),
@@ -185,6 +189,15 @@ impl BackendDataset for LightGBMDataset {
 
     fn num_rows(&self) -> usize {
         self.n_rows
+    }
+
+    fn get_features(&self) -> Result<Array2<f64>> {
+        // row-major f32 → f64
+        Array2::from_shape_vec(
+            (self.n_rows, self.n_cols),
+            self.features.iter().map(|&v| v as f64).collect(),
+        )
+        .map_err(|e| crate::error::GradientLSSError::BackendError(e.to_string()))
     }
 
     fn get_labels(&self) -> Result<Array1<f64>> {
@@ -694,6 +707,9 @@ impl BackendModel for LightGBMModel {
                     stopped_early = true;
                     break;
                 }
+                if cb.holds_early_stopping() {
+                    rounds_without_improvement = 0;
+                }
             }
 
             if let Some(early_stopping) = config.early_stopping_rounds {
@@ -1199,6 +1215,7 @@ mod tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: true,
+            param_freeze_rounds: None,
         };
         let start = Array1::from(vec![0.5, -0.25]);
         let target = |y: f64, j: usize| if j == 0 { y } else { 2.0 * y };
@@ -1268,6 +1285,7 @@ mod tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
         };
 
         LightGBMModel::train_with_objective_and_callbacks::<
@@ -1377,6 +1395,7 @@ mod tests {
             verbose: false,
             seed: 7,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
         };
 
         let (model, _) = LightGBMModel::train_with_objective_and_callbacks::<

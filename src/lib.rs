@@ -50,7 +50,8 @@ pub mod prelude {
     pub use crate::dist_select::{DistSelectResult, dist_select, dist_select_with_params};
     pub use crate::distributions::{Distribution, LossFn, Stabilization};
     pub use crate::error::{GradientLSSError, Result};
-    pub use crate::hyper_opt::{HyperOptConfig, HyperOptResult, PruningStrategy};
+    pub use crate::hyper_opt::{HyperOptConfig, HyperOptResult, PruningStrategy, ValidationGuardResult, validation_guard};
+    pub use crate::hyper_opt::{leaf_wise_search_space, max_bin_search_space};
     pub use crate::interpretability::{IcePlot, PartialDependence, ShapExportData};
     pub use crate::model::{GradientLSS, PredType};
     pub use crate::utils::ResponseFn;

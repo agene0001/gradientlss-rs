@@ -1,6 +1,6 @@
 //! NegativeBinomial distribution implementation.
 
-use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use super::base::{Distribution, DistributionParam, HessianMode, LossFn, Stabilization};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -91,20 +91,48 @@ pub(crate) fn nb_lgamma_ratio(r: f64, k: f64) -> Option<f64> {
 /// (`python_tests/nba_lit_width_experiments.py`, EXP=nbsched). The transformed
 /// / predicted parameters are STILL reported as `(total_count, probs)` — every
 /// consumer of the (n, p) convention is untouched; only the boosting
-/// coordinates differ. NLL only: the closed-form CRPS path chains through
-/// per-parameter response derivatives, which the joint transform has not.
-/// Old model files deserialize to `TotalCountProbs`.
+/// coordinates differ. Old model files deserialize to `TotalCountProbs`.
+///
+/// The CRPS loss uses these coordinates too since 2026-11-14 (research
+/// proposals 029, 031): its gradient is the chain rule through
+/// (r, probs) = (θ, µ/(µ+θ)) and its Hessian the expected CRPS curvature
+/// 2 Σ_k (∂F(k)/∂η)² for every row. Against (total_count, probs) the test
+/// CRPS was 2 % to 25 % lower on five datasets (25 of 25 fits).
+///
+/// Default since 2026-11-10 for `NegativeBinomial::new` / `default()` with the
+/// NLL loss (measured: −0.07 nats on µ ∈ [1.5, 60], −0.86 on µ ∈ [100, 4000]
+/// against `TotalCountProbs`, oracle-known Gamma–Poisson counts), and since
+/// 2026-11-14 with the CRPS loss. Opt out with
+/// `.with_parameterization(NbParameterization::TotalCountProbs)`, which
+/// restores the response functions passed to `new`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NbParameterization {
-    #[default]
     TotalCountProbs,
+    #[default]
     MeanDispersion,
+}
+
+impl NbParameterization {
+    /// The serde default for files written before the field existed.
+    fn legacy() -> Self {
+        NbParameterization::TotalCountProbs
+    }
 }
 
 /// Floor on the log-θ observed information in `MeanDispersion` mode.
 pub const NB_THETA_HESS_FLOOR: f64 = 1e-2;
 /// Floor on the log-µ Fisher information in `MeanDispersion` mode.
 pub const NB_MU_HESS_FLOOR: f64 = 1e-6;
+/// Raw-coordinate clamps of `MeanDispersion`: log µ ∈ [−10, 15] (µ up to
+/// 3.3e6), log θ ∈ [−6, 12] (θ up to 1.6e5). Widened 2026-11-09 from
+/// [−10, 6] / [−6, 8]: the old µ ≤ e⁶ ≈ 403 cap silently truncated every count
+/// target with a conditional mean above 403 (measured: synth µ ∈ [100, 4000],
+/// MeanDispersion RMSE 1432 vs 656 for the default head). Outside the clamp
+/// a coordinate's gradient is zeroed — the margin no longer affects the fit,
+/// so pushing it further is meaningless.
+pub const NB_LOG_MU_CLAMP: (f64, f64) = (-10.0, 15.0);
+pub const NB_LOG_THETA_CLAMP: (f64, f64) = (-6.0, 12.0);
+
 /// θ start value clip (method of moments can explode on under-dispersed data).
 pub const NB_THETA_START_CLIP: (f64, f64) = (0.2, 50.0);
 
@@ -114,11 +142,69 @@ pub struct NegativeBinomial {
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
-    #[serde(default)]
+    #[serde(default = "NbParameterization::legacy")]
     parameterization: NbParameterization,
+    /// log-θ curvature of the `MeanDispersion` head (log µ always uses its
+    /// closed-form Fisher information). `Observed` = the observed information
+    /// floored at `NB_THETA_HESS_FLOOR` (the behaviour before this field
+    /// existed, kept for files saved without it); constructors default to
+    /// `Damped` (2026-11-10: better or neutral on three synthetic NB DGPs and
+    /// two real count targets — see `nb_log_theta_fisher`).
+    #[serde(default = "NegativeBinomial::legacy_hessian_mode")]
+    hessian_mode: HessianMode,
+    /// MeanDispersion without `initialize`: start log µ at ln ȳ (log θ stays
+    /// at the raw 0.5). Default `true` since 2026-11-10: from the raw 0.5
+    /// start (µ ≈ 1.65) the fit was far worse on counts with a large mean —
+    /// bike_cnt −0.18, bike_casual −0.08, synthetic µ 100–4000 −1.45 nats with
+    /// the location start, which ties the fitted `initialize` start and fits
+    /// ~2× faster. Old files load with `false`; only affects training.
+    #[serde(default)]
+    location_start: bool,
+}
+
+/// Expected (Fisher) information of log θ under NB2(µ, θ):
+///   I = θ² E[ψ′(θ) − ψ′(Y + θ)] − θµ/(µ + θ)
+/// (no closed form; limits θ²ψ′(θ) − θ as µ → ∞ and µ²/(2(µ + θ)²) as
+/// θ/µ → ∞). With ψ′(θ) − ψ′(θ + y) = ∫ t e^{−θt}(1 − e^{−yt})/(1 − e^{−t}) dt,
+/// the NB probability generating function E[e^{−Yt}] = (θ/(θ + µ(1 − e^{−t})))^θ
+/// and θµ/(µ+θ) = θ² ∫ e^{−θt}(1 − e^{−µt}) dt, this is the µ-independent-cost
+/// integral (u = θt)
+///   I = θ ∫₀^∞ e^{−u} [ t/(1 − e^{−t}) · (1 − PGF(t)) − (1 − e^{−µt}) ] du,  t = u/θ,
+/// evaluated with a 25-node exp-sinh rule (h = 1/4, |x| ≤ 3). Accuracy over
+/// log µ ∈ [−10, 15], log θ ∈ [−6, 12] against a 640-node reference: 99th
+/// percentile relative error 3e-3, worst 4 % only where I < 1e-15.
+pub fn nb_log_theta_fisher(mu: f64, theta: f64) -> f64 {
+    use std::sync::OnceLock;
+    static NODES: OnceLock<[(f64, f64); 25]> = OnceLock::new();
+    if !(mu > 0.0 && theta > 0.0 && mu.is_finite() && theta.is_finite()) {
+        return 0.0;
+    }
+    let nodes = NODES.get_or_init(|| {
+        let h = 0.25f64;
+        let mut out = [(0.0, 0.0); 25];
+        for (k, o) in out.iter_mut().enumerate() {
+            let x = -3.0 + h * k as f64;
+            let u = (std::f64::consts::FRAC_PI_2 * x.sinh()).exp();
+            *o = (u, u * std::f64::consts::FRAC_PI_2 * x.cosh() * h);
+        }
+        out
+    });
+    let mut acc = 0.0;
+    for &(u, w) in nodes.iter() {
+        let t = u / theta;
+        let om = -(-t).exp_m1(); // 1 − e^{−t}
+        let one_m_pgf = -(-theta * (mu * om / theta).ln_1p()).exp_m1();
+        let f = (-u).exp() * (t / om * one_m_pgf + (-mu * t).exp_m1());
+        acc += w * f;
+    }
+    (theta * acc).max(0.0)
 }
 
 impl NegativeBinomial {
+    /// `MeanDispersion` coordinates (the default, see [`NbParameterization`])
+    /// for both losses; the response functions are kept and used only by the
+    /// `TotalCountProbs` head (after
+    /// `.with_parameterization(NbParameterization::TotalCountProbs)`).
     pub fn new(
         stabilization: Stabilization,
         total_count_response_fn: ResponseFn,
@@ -135,22 +221,41 @@ impl NegativeBinomial {
             stabilization,
             loss_fn,
             initialize,
-            parameterization: NbParameterization::TotalCountProbs,
+            hessian_mode: Self::default_hessian_mode(),
+            parameterization: NbParameterization::default(),
+            location_start: true,
         }
+    }
+
+    /// Whether training fits the start values (`initialize`).
+    pub fn with_initialize(mut self, on: bool) -> Self {
+        self.initialize = on;
+        self
+    }
+
+    /// See the `location_start` field.
+    pub fn with_location_start(mut self, on: bool) -> Self {
+        self.location_start = on;
+        self
+    }
+
+    pub fn location_start(&self) -> bool {
+        self.location_start
+    }
+
+    /// Choose the boosting coordinates, for either loss. `MeanDispersion`
+    /// never reads the per-parameter response functions, so switching back to
+    /// `TotalCountProbs` restores the ones passed to `new`.
+    pub fn with_parameterization(mut self, parameterization: NbParameterization) -> Self {
+        self.parameterization = parameterization;
+        self
     }
 
     /// The `MeanDispersion` head (see [`NbParameterization`]): boosting in
     /// (log µ, log θ) with `Exp` responses, moments start values, outputs
-    /// reported as (total_count, probs). `LossFn::Crps` is not supported in
-    /// this mode and falls back to the legacy parameterization with a warning.
+    /// reported as (total_count, probs). Both losses (since 2026-11-14 the
+    /// CRPS too: research proposals 029, 031).
     pub fn new_mean_dispersion(stabilization: Stabilization, loss_fn: LossFn) -> Self {
-        if loss_fn == LossFn::Crps {
-            eprintln!(
-                "gradientlss: NegativeBinomial MeanDispersion supports NLL only — \
-                 using the total_count/probs parameterization for the CRPS loss"
-            );
-            return Self::new(stabilization, ResponseFn::Softplus, ResponseFn::Sigmoid, loss_fn, true);
-        }
         let params = vec![
             // The NAMES stay the output convention: column 0 is reported as
             // total_count (= θ), column 1 as probs (= µ/(µ+θ)); the response
@@ -165,7 +270,29 @@ impl NegativeBinomial {
             loss_fn,
             initialize: true,
             parameterization: NbParameterization::MeanDispersion,
+            hessian_mode: Self::default_hessian_mode(),
+            location_start: true,
         }
+    }
+
+    fn default_hessian_mode() -> HessianMode {
+        HessianMode::Damped
+    }
+
+    fn legacy_hessian_mode() -> HessianMode {
+        HessianMode::Observed
+    }
+
+    /// log-θ curvature of the `MeanDispersion` head (no effect on the
+    /// `TotalCountProbs` head). `Fisher` / `Damped` evaluate
+    /// [`nb_log_theta_fisher`] (25-node quadrature) per row and drop the 0.01 floor (to 1e-8).
+    pub fn with_hessian_mode(mut self, mode: HessianMode) -> Self {
+        self.hessian_mode = mode;
+        self
+    }
+
+    pub fn hessian_mode(&self) -> HessianMode {
+        self.hessian_mode
     }
 
     pub fn parameterization(&self) -> NbParameterization {
@@ -174,8 +301,8 @@ impl NegativeBinomial {
 
     /// `MeanDispersion`: raw (f, g) = (log µ, log θ) → (r, probs) = (θ, µ/(µ+θ)).
     fn mean_dispersion_to_r_probs(f: f64, g: f64) -> (f64, f64) {
-        let mu = f.clamp(-10.0, 6.0).exp();
-        let theta = g.clamp(-6.0, 8.0).exp();
+        let mu = f.clamp(NB_LOG_MU_CLAMP.0, NB_LOG_MU_CLAMP.1).exp();
+        let theta = g.clamp(NB_LOG_THETA_CLAMP.0, NB_LOG_THETA_CLAMP.1).exp();
         (theta, (mu / (mu + theta)).clamp(1e-6, 1.0 - 1e-6))
     }
 
@@ -219,6 +346,53 @@ impl NegativeBinomial {
     }
 }
 
+/// First index of a CRPS table for NB(r, probs): 0, or `mean - 10 sd - 10`
+/// when pmf(0) = (1 - probs)^r would underflow.
+#[inline]
+fn nb_window_start(r: f64, ln_1mp: f64, mean: f64, sd: f64) -> usize {
+    if r * -ln_1mp < 600.0 { 0 } else { (mean - 10.0 * sd - 10.0).floor().max(0.0) as usize }
+}
+
+/// pmf(k) in the convention of the CRPS recurrences: pmf(0) = (1 - probs)^r,
+/// pmf(k) / pmf(k-1) = probs (r + k - 1) / k.
+#[inline]
+fn nb_pmf_at(r: f64, probs: f64, ln_1mp: f64, k: usize) -> f64 {
+    if k == 0 {
+        (r * ln_1mp).exp()
+    } else {
+        let kf = k as f64;
+        (ln_gamma(r + kf) - ln_gamma(r) - ln_gamma(kf + 1.0) + r * ln_1mp + kf * probs.ln()).exp()
+    }
+}
+
+/// The CDF-sum CRPS over `[lo, hi]` for rows whose sum needs more than the
+/// 150 terms of the original loop. Below the table F = 0 and the term is
+/// 1{k >= y}; above it F = 1 and the term is 1{k < y}.
+fn nb_crps_windowed(r: f64, probs: f64, mean: f64, sd: f64, y_int: usize, max_k: usize) -> f64 {
+    let ln_1mp = (-probs).ln_1p();
+    let lo = nb_window_start(r, ln_1mp, mean, sd);
+    let mut hi = max_k.max(lo);
+    if hi - lo + 1 > super::util::CRPS_MAX_TERMS {
+        super::util::warn_crps_truncated("NegativeBinomial", mean);
+        hi = lo + super::util::CRPS_MAX_TERMS - 1;
+    }
+    let mut pmf = nb_pmf_at(r, probs, ln_1mp, lo);
+    let mut cdf = 0.0;
+    let mut crps = lo.saturating_sub(y_int) as f64;
+    for k in lo..=hi {
+        if k > lo {
+            pmf *= probs * (r + k as f64 - 1.0) / k as f64;
+        }
+        cdf += pmf;
+        let d = cdf.min(1.0) - if k >= y_int { 1.0 } else { 0.0 };
+        crps += d * d;
+        if k >= y_int && 1.0 - cdf < 1e-9 {
+            break;
+        }
+    }
+    crps + y_int.saturating_sub(hi + 1) as f64
+}
+
 /// Scratch for one row of the NB CRPS closed-form pass — pmf/cdf tables and
 /// the per-parameter dF/dtheta prefix tables, reused across rows.
 #[derive(Default)]
@@ -244,23 +418,29 @@ impl NegativeBinomial {
     ///
     /// With CRPS(theta) = sum_k (F(k) - 1{k>=y})^2 and Ftheta(k) = dF(k)/dtheta:
     ///
-    ///     dCRPS/dtheta = 2 [ sum_k F(k) Ftheta(k)  -  sum_{k>=y} Ftheta(k) ]
-    ///                  = 2 [ A - S(y) ]
+    /// ```text
+    ///  dCRPS/dtheta = 2 [ sum_k F(k) Ftheta(k)  -  sum_{k>=y} Ftheta(k) ]
+    ///               = 2 [ A - S(y) ]
+    /// ```
     ///
     /// so ONE set of prefix/suffix tables serves every y — both the observed
     /// gradient (y = y_obs) and the metric expectation over hypothetical y.
     /// The per-parameter pmf derivatives need no special functions:
     ///
-    ///     dpmf(i)/dprobs = pmf(i) * (i/probs - r/(1-probs))
-    ///     dpmf(i)/dr     = pmf(i) * (H_i + ln(1-probs)),
-    ///         H_i = psi(r+i) - psi(r) = sum_{t<i} 1/(r+t)   (telescoped —
-    ///         the digamma difference is a plain running sum).
+    /// ```text
+    ///  dpmf(i)/dprobs = pmf(i) * (i/probs - r/(1-probs))
+    ///  dpmf(i)/dr     = pmf(i) * (H_i + ln(1-probs)),
+    ///      H_i = psi(r+i) - psi(r) = sum_{t<i} 1/(r+t)   (telescoped —
+    ///      the digamma difference is a plain running sum).
+    /// ```
     ///
     /// # The hessian
     ///
     /// NGBoost's CRPS metric, diagonal per parameter in MARGIN space:
     ///
-    ///     M_jj = E_{y~NB(theta)} [ ( dCRPS/dtheta_j * dtheta_j/dm_j )^2 ]
+    /// ```text
+    ///  M_jj = E_{y~NB(theta)} [ ( dCRPS/dtheta_j * dtheta_j/dm_j )^2 ]
+    /// ```
     ///
     /// positive by construction (a Riemannian metric, not a curvature), same
     /// floor rationale as the Poisson port: XGBoost leaf values are ~ g/h
@@ -295,11 +475,20 @@ impl NegativeBinomial {
         let t_probs = transformed.column(1);
         let p_r = predictions.column(0);
         let p_probs = predictions.column(1);
-        let (rd_r, _) = r_response_fn.derivative_batches_from_transformed(&p_r, &t_r);
-        let (rd_p, _) = probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs);
+        // MeanDispersion: the raw scores are (log µ, log θ) and `transformed` comes from the
+        // joint map, so the per-parameter response derivatives are not used.
+        let md = self.parameterization == NbParameterization::MeanDispersion;
+        let (rd_r, rd_p) = if md {
+            (ndarray::Array1::ones(n_samples), ndarray::Array1::ones(n_samples))
+        } else {
+            (
+                r_response_fn.derivative_batches_from_transformed(&p_r, &t_r).0,
+                probs_response_fn.derivative_batches_from_transformed(&p_probs, &t_probs).0,
+            )
+        };
 
         const CRPS_MIN_METRIC: f64 = 0.05;
-        const CAP: usize = 220;
+        const LEGACY_CAP: usize = 220;
         let unit_hess = std::env::var("GRADIENTLSS_CRPS_HESS")
             .map(|v| v.trim().eq_ignore_ascii_case("unit"))
             .unwrap_or(false);
@@ -325,24 +514,40 @@ impl NegativeBinomial {
             let sd = var.sqrt();
             let y_int = yi.round().max(0.0) as usize;
             // Table long enough for BOTH the observed-y gradient and the
-            // metric expectation over hypothetical y (mean + 8 sigma).
-            let y_hyp_max = (((mean + 8.0 * sd).ceil() as usize).max(5)).min(CAP - 11);
-            let k_total = (((yi.max(mean) + 6.0 * sd).ceil() as usize).max(y_hyp_max + 10)).min(CAP);
-            let len = k_total + 1;
+            // metric expectation over hypothetical y (mean + 8 sigma). Until
+            // 2026-11-13 both were cut at 220 terms, which left a row with a
+            // mean above ~100 a gradient from a CDF that had not reached 1
+            // (research proposal 023). A row that fits under the old cap
+            // builds exactly the table it always did.
+            let mut y_hyp_max = ((mean + 8.0 * sd).ceil() as usize).max(5);
+            let mut k_total = ((yi.max(mean) + 6.0 * sd).ceil() as usize).max(y_hyp_max + 10);
+            // a row the original 220-entry table could hold
+            let legacy_row = y_hyp_max <= LEGACY_CAP - 11 && k_total <= LEGACY_CAP;
+            let ln_1mp = (-probs).ln_1p(); // ln(1 - probs)
+            // The table starts at 0 unless pmf(0) = (1 - probs)^r would underflow
+            // (large r with a large mean); then at mean - 10 sd, below which the
+            // pmf and its parameter derivatives vanish.
+            let lo = nb_window_start(r, ln_1mp, mean, sd);
+            if k_total - lo + 1 > super::util::CRPS_MAX_TERMS {
+                super::util::warn_crps_truncated("NegativeBinomial", mean);
+                k_total = lo + super::util::CRPS_MAX_TERMS - 1;
+                y_hyp_max = y_hyp_max.min(k_total - 10);
+            }
+            let len = k_total - lo + 1;
 
             // ---- one pass: pmf, cdf, and the two dF/dtheta prefixes -------
             sc.pmf.clear();
             sc.cdf.clear();
             sc.fr.clear();
             sc.fp_.clear();
-            let ln_1mp = (-probs).ln_1p(); // ln(1 - probs)
-            let mut pmf = (r * ln_1mp).exp();
+            let mut pmf = nb_pmf_at(r, probs, ln_1mp, lo);
             let mut cdf = 0.0;
-            let mut h_i = 0.0; // psi(r+i) - psi(r), telescoped
+            // psi(r+i) - psi(r), telescoped
+            let mut h_i = if lo == 0 { 0.0 } else { digamma(r + lo as f64) - digamma(r) };
             let mut acc_r = 0.0;
             let mut acc_p = 0.0;
-            for k in 0..len {
-                if k > 0 {
+            for k in lo..=k_total {
+                if k > lo {
                     pmf *= probs * (r + k as f64 - 1.0) / k as f64;
                     h_i += 1.0 / (r + k as f64 - 1.0);
                 }
@@ -372,17 +577,62 @@ impl NegativeBinomial {
             }
 
             // ---- observed gradient: g_j = 2 (A_j - S_j(y_obs)) ------------
-            let yo = y_int.min(len - 1);
+            let yo = y_int.clamp(lo, k_total) - lo;
             let g_r = 2.0 * (a_r - sc.suf_r[yo]);
             let g_p = 2.0 * (a_p - sc.suf_p[yo]);
+
+            // ---- (log µ, log θ) coordinates (the default; proposal 029) ----
+            // r = θ, probs = µ/(µ+θ):  ∂probs/∂f = c, ∂probs/∂g = −c, ∂r/∂g = r,
+            // with c = probs (1 − probs). So ∂F/∂f = c F_p and ∂F/∂g = r F_r − c F_p,
+            // and the same for the gradient. Curvature: expected, for every row.
+            if md {
+                let c = probs * (1.0 - probs);
+                let inside = |v: f64, (lo, hi): (f64, f64)| v.is_finite() && v > lo && v < hi;
+                // a clamped coordinate has no gradient there (as in the NLL head)
+                gc[0] = if inside(p_r[i], NB_LOG_MU_CLAMP) { c * g_p } else { 0.0 };
+                gc[1] = if inside(p_probs[i], NB_LOG_THETA_CLAMP) { r * g_r - c * g_p } else { 0.0 };
+                if !unit_hess {
+                    let mut e_f = 0.0;
+                    let mut e_g = 0.0;
+                    for k in 0..len {
+                        let df = c * sc.fp_[k];
+                        let dg = r * sc.fr[k] - df;
+                        e_f += df * df;
+                        e_g += dg * dg;
+                    }
+                    hc[0] = (2.0 * e_f).max(CRPS_MIN_METRIC);
+                    hc[1] = (2.0 * e_g).max(CRPS_MIN_METRIC);
+                }
+                return;
+            }
             gc[0] = g_r * rd_r[i];
             gc[1] = g_p * rd_p[i];
+
+            // ---- large counts: expected CRPS curvature ---------------------
+            // H_jj = d2/dtheta_j'2 E_y[CRPS(theta', y)] at theta' = theta
+            //      = 2 sum_k (dF(k)/dtheta_j)^2,
+            // the CRPS counterpart of the Fisher information. The metric below
+            // is in units of CRPS^2 and outgrows the curvature as the counts
+            // grow (see the Poisson counterpart), which shrinks every step.
+            if !unit_hess && !legacy_row {
+                let mut e_r = 0.0;
+                let mut e_p = 0.0;
+                for k in 0..len {
+                    e_r += sc.fr[k] * sc.fr[k];
+                    e_p += sc.fp_[k] * sc.fp_[k];
+                }
+                let dr = rd_r[i];
+                let dp = rd_p[i];
+                hc[0] = (2.0 * e_r * dr * dr).max(CRPS_MIN_METRIC);
+                hc[1] = (2.0 * e_p * dp * dp).max(CRPS_MIN_METRIC);
+                return;
+            }
 
             // ---- metric hessians: M_jj = E_y[(g_j(y) * dtheta/dm)^2] ------
             if !unit_hess {
                 let mut m_r = 0.0;
                 let mut m_p = 0.0;
-                for yh in 0..=y_hyp_max {
+                for yh in 0..=(y_hyp_max - lo) {
                     let py = sc.pmf[yh];
                     if py < 1e-300 {
                         continue;
@@ -451,6 +701,7 @@ impl NegativeBinomial {
         let n_samples = predictions.nrows();
         let f_col = predictions.column(0);
         let g_col = predictions.column(1);
+        let mode = self.hessian_mode;
         let compute = |i: usize| -> (f64, f64, f64, f64) {
             let k = y[i];
             if !k.is_finite() || k < 0.0 {
@@ -458,8 +709,10 @@ impl NegativeBinomial {
             }
             let f = if f_col[i].is_finite() { f_col[i] } else { 0.0 };
             let g = if g_col[i].is_finite() { g_col[i] } else { 0.0 };
-            let mu = f.clamp(-10.0, 6.0).exp();
-            let th = g.clamp(-6.0, 8.0).exp();
+            let f_c = f.clamp(NB_LOG_MU_CLAMP.0, NB_LOG_MU_CLAMP.1);
+            let g_c = g.clamp(NB_LOG_THETA_CLAMP.0, NB_LOG_THETA_CLAMP.1);
+            let mu = f_c.exp();
+            let th = g_c.exp();
             let s = mu + th;
             // log mu
             let grad_f = (mu - k) * th / s;
@@ -473,7 +726,14 @@ impl NegativeBinomial {
             let dl_dg = th * a;
             let d2 = th * a + th * th * (dtri + 1.0 / th - 1.0 / s - (mu - k) / (s * s));
             let grad_g = -dl_dg;
-            let hess_g = (-d2).max(NB_THETA_HESS_FLOOR);
+            let hess_g = match mode {
+                HessianMode::Observed => (-d2).max(NB_THETA_HESS_FLOOR),
+                HessianMode::Fisher => nb_log_theta_fisher(mu, th).max(1e-8),
+                HessianMode::Damped => (-d2).max(nb_log_theta_fisher(mu, th)).max(1e-8),
+            };
+            // a clamped coordinate has no gradient there
+            let grad_f = if f_c != f { 0.0 } else { grad_f };
+            let grad_g = if g_c != g { 0.0 } else { grad_g };
             (grad_f, hess_f, grad_g, hess_g)
         };
         let mut gradients = Array2::zeros((n_samples, 2));
@@ -578,15 +838,44 @@ impl Distribution for NegativeBinomial {
         self.stabilization
     }
 
+    /// Measured recipe (research cycles 5–6): watch log θ of the
+    /// MeanDispersion head; the legacy (total_count, probs) head gets none.
+    /// The mean stays under the global early stopping. NLL loss only.
+    fn default_param_early_stopping_params(&self) -> Option<Vec<usize>> {
+        (self.parameterization == NbParameterization::MeanDispersion && self.loss_fn() == LossFn::Nll).then(|| vec![1])
+    }
+
     fn should_initialize(&self) -> bool {
         self.initialize
+    }
+
+    /// The mean coordinate of the orthogonal head (none for the legacy head).
+    fn location_param_index(&self) -> Option<usize> {
+        (self.parameterization == NbParameterization::MeanDispersion).then_some(0)
+    }
+
+    fn default_start_values(&self, target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        if !self.location_start || self.parameterization != NbParameterization::MeanDispersion {
+            return None;
+        }
+        let ResponseData::Univariate(y) = target else { return None };
+        let v: Vec<f64> = y.iter().copied().filter(|t| t.is_finite() && *t >= 0.0).collect();
+        if v.is_empty() {
+            return None;
+        }
+        let mean = (v.iter().sum::<f64>() / v.len() as f64).max(1e-4);
+        Some(ndarray::Array1::from_vec(vec![
+            mean.ln().clamp(NB_LOG_MU_CLAMP.0, NB_LOG_MU_CLAMP.1),
+            0.5,
+        ]))
     }
 
     /// Sampling uses a discrete Gamma–Poisson draw, which is not a
     /// smooth function of the parameters under a fixed seed — CRPS finite
     /// differences through it are meaningless (torch has no rsample here either).
     /// Truncated CDF-sum CRPS, mirroring the consumer's NB eval kernel:
-    /// K = max(y, mean) + 4*sqrt(var), capped at 150. Params are the torch
+    /// K = max(y, mean) + 4*sqrt(var) (until 2026-11-13 capped at 150, which
+    /// cut the sum short for larger counts). Params are the torch
     /// convention `(r, probs)` used everywhere in this file (mean =
     /// r*probs/(1-probs)); the pmf comes from `log_prob_scalar`, so the CRPS
     /// is by construction consistent with the NLL this distribution trains
@@ -601,14 +890,18 @@ impl Distribution for NegativeBinomial {
         let mean = r * probs / (1.0 - probs);
         let var = mean / (1.0 - probs);
         let y_int = y.round().max(0.0) as usize;
-        let max_k = ((y.max(mean) + 4.0 * var.sqrt()).ceil() as usize).min(150);
+        let max_k = (y.max(mean) + 4.0 * var.sqrt()).ceil() as usize;
+        if max_k > 150 {
+            // more than the original loop's 150 terms: do not stop short
+            return Some(nb_crps_windowed(r, probs, mean, var.sqrt(), y_int, max_k));
+        }
         // pmf recurrence — one multiply per term instead of a full
         // ln_gamma + exp per term (see the Poisson counterpart; the FD
         // gradient path evaluates this 4x per sample per round for the two
         // params, so the per-term cost is the whole ballgame). pmf(0) =
         // (1 - probs)^r in the torch parameterization; pmf(k)/pmf(k-1) =
-        // probs * (r + k - 1) / k. Underflow at extreme means is benign under
-        // the k <= 150 cap, as in the Poisson case.
+        // probs * (r + k - 1) / k. No underflow here: this branch has a mean
+        // below 150.
         let mut pmf = (r * (-probs).ln_1p()).exp();
         let mut cdf = 0.0;
         let mut crps = 0.0;
@@ -843,7 +1136,9 @@ mod tests {
             ResponseFn::Sigmoid,
             LossFn::Crps,
             false,
-        );
+        )
+        // the (total_count, probs) head: the CRPS default until 2026-11-14
+        .with_parameterization(NbParameterization::TotalCountProbs);
         // raw margins; softplus/sigmoid map them to (r, probs)
         let predictions = array![[2.0_f64, 0.3], [4.0, -0.5], [1.0, 0.8], [3.0, 0.0]];
         let transformed = {
@@ -881,6 +1176,99 @@ mod tests {
         }
     }
 
+    /// Counts above the old 150 / 220-term caps (research proposals 023, 026):
+    /// the loss equals a brute-force sum, the gradients its finite difference,
+    /// and neither vanishes.
+    #[test]
+    fn crps_is_exact_for_counts_above_the_old_caps() {
+        use crate::types::ResponseData;
+        use approx::assert_relative_eq;
+        use ndarray::array;
+        let d = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Crps, false)
+            .with_parameterization(NbParameterization::TotalCountProbs);
+        // (r, mean, y)
+        let cases = [(2.0_f64, 700.0_f64, 650.0_f64), (1.5, 190.0, 420.0), (8.0, 400.0, 30.0), (40.0, 5000.0, 5200.0), (3.0, 120.0, 0.0)];
+        for (r, mean, y) in cases {
+            let probs = mean / (mean + r);
+            let var = mean / (1.0 - probs);
+            let got = d.analytic_crps(&[r, probs], &[y]).unwrap();
+            let top = (y.max(mean) + 4.0 * var.sqrt()).ceil() as usize;
+            let y_int = y.round() as usize;
+            let (mut cdf, mut want) = (0.0, 0.0);
+            for k in 0..=top {
+                cdf += d.log_prob_scalar(&[r, probs], k as f64).exp();
+                let ind = if k >= y_int { 1.0 } else { 0.0 };
+                want += (cdf.min(1.0) - ind).powi(2);
+            }
+            assert_relative_eq!(got, want, max_relative = 1e-7);
+        }
+        // margins for (softplus, sigmoid) giving those (r, probs)
+        let inv_softplus = |v: f64| (v.exp() - 1.0).ln();
+        let logit = |p: f64| (p / (1.0 - p)).ln();
+        let mut predictions = ndarray::Array2::zeros((cases.len(), 2));
+        let mut transformed = predictions.clone();
+        let mut y = ndarray::Array1::zeros(cases.len());
+        for (i, (r, mean, yi)) in cases.iter().enumerate() {
+            let probs = mean / (mean + r);
+            predictions[[i, 0]] = inv_softplus(*r);
+            predictions[[i, 1]] = logit(probs);
+            transformed[[i, 0]] = *r;
+            transformed[[i, 1]] = probs;
+            y[i] = *yi;
+        }
+        let yv = y.view();
+        let target = ResponseData::Univariate(&yv);
+        let (g_an, h_an) = d.analytical_crps_gradients(&predictions.view(), &transformed.view(), &target).unwrap();
+        let (g_fd, _) = d.numerical_gradients_hessians(&predictions.view(), &transformed.view(), &target).unwrap();
+        for i in 0..cases.len() {
+            for j in 0..2 {
+                let (a, f) = (g_an[[i, j]], g_fd[[i, j]]);
+                // the loss stops at 4 sd and the gradient table at 6 sd; with r = 2 the
+                // tail between them is worth ~0.6 % of the FD gradient
+                assert!((a - f).abs() <= 2e-2 * f.abs().max(1e-2), "row {i} param {j}: analytic {a} vs fd {f}");
+                assert!(h_an[[i, j]].is_finite() && h_an[[i, j]] >= 0.05, "row {i} param {j}: metric {}", h_an[[i, j]]);
+            }
+            assert!(g_an[[i, 1]].abs() > 1e-2, "row {i}: probs gradient vanished ({})", g_an[[i, 1]]);
+        }
+        // large-count rows carry the expected curvature 2 sum_k (dF(k)/dm)^2; recompute it
+        // from finite differences of the CDF in the probs margin (row 1: r = 1.5, mean 190).
+        // (E_y[(F'(k) - 1{k>=y})^2] = (F'(k) - F(k))^2 + F(k)(1 - F(k)), so the second
+        // derivative of the expected CRPS at F' = F is 2 sum_k (dF/dm)^2.)
+        {
+            let (r, mean) = (1.5_f64, 190.0_f64);
+            let m1 = logit(mean / (mean + r));
+            let eps = 1e-5;
+            let sig = |m: f64| 1.0 / (1.0 + (-m).exp());
+            let cdf = |m: f64| -> Vec<f64> {
+                let mut acc = 0.0;
+                (0..4000usize)
+                    .map(|k| {
+                        acc += d.log_prob_scalar(&[r, sig(m)], k as f64).exp();
+                        acc
+                    })
+                    .collect()
+            };
+            let (up, dn) = (cdf(m1 + eps), cdf(m1 - eps));
+            let want: f64 = up.iter().zip(&dn).map(|(a, b)| 2.0 * ((a - b) / (2.0 * eps)).powi(2)).sum();
+            assert!((h_an[[1, 1]] / want - 1.0).abs() < 0.01, "expected curvature {} vs {want}", h_an[[1, 1]]);
+        }
+        let _ = array![0.0];
+        // a table that starts above 0 (pmf(0) underflows) agrees with the brute-force loss
+        let (r, mean, yv) = (4000.0_f64, 5000.0_f64, 5100.0_f64);
+        let probs = mean / (mean + r);
+        assert!(r * -(-probs).ln_1p() > 600.0);
+        let got = d.analytic_crps(&[r, probs], &[yv]).unwrap();
+        let var = mean / (1.0 - probs);
+        let top = (yv.max(mean) + 4.0 * var.sqrt()).ceil() as usize;
+        let (mut cdf, mut want) = (0.0, 0.0);
+        for k in 0..=top {
+            cdf += d.log_prob_scalar(&[r, probs], k as f64).exp();
+            let ind = if k as f64 >= yv { 1.0 } else { 0.0 };
+            want += (cdf.min(1.0) - ind).powi(2);
+        }
+        assert_relative_eq!(got, want, max_relative = 1e-6);
+    }
+
     #[test]
     fn analytic_crps_matches_brute_force_nb() {
         use approx::assert_relative_eq;
@@ -890,7 +1278,9 @@ mod tests {
             ResponseFn::Sigmoid,
             LossFn::Crps,
             false,
-        );
+        )
+        // the (total_count, probs) head: the CRPS default until 2026-11-14
+        .with_parameterization(NbParameterization::TotalCountProbs);
         for (r, probs, y) in [(4.0_f64, 0.5_f64, 3.0_f64), (2.5, 0.7, 8.0), (10.0, 0.3, 1.0)] {
             let got = d.analytic_crps(&[r, probs], &[y]).expect("nb has analytic crps");
             let mean = r * probs / (1.0 - probs);
@@ -920,7 +1310,9 @@ mod tests {
             ResponseFn::Sigmoid,
             LossFn::Crps,
             false,
-        );
+        )
+        // the (total_count, probs) head: the CRPS default until 2026-11-14
+        .with_parameterization(NbParameterization::TotalCountProbs);
         let transformed = array![[4.0_f64, 0.5], [2.5, 0.6]];
         // raw = inverse of the response fns; for the gradient smoke it is fine
         // to reuse transformed as raw when responses are monotone — the FD
@@ -998,7 +1390,8 @@ mod tests {
         assert!((sv[0] - mean.ln()).abs() < 1e-12);
         assert!((sv[1] - (mean * mean / (var - mean)).clamp(NB_THETA_START_CLIP.0, NB_THETA_START_CLIP.1).ln()).abs() < 1e-12);
         // legacy mode still answers through the L-BFGS default
-        let legacy = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true);
+        let legacy = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true)
+            .with_parameterization(NbParameterization::TotalCountProbs);
         assert_eq!(legacy.parameterization(), NbParameterization::TotalCountProbs);
         let (_, sv2) = legacy.calculate_start_values(&ResponseData::Univariate(&yv), 10).unwrap();
         assert_eq!(sv2.len(), 2);
@@ -1014,6 +1407,43 @@ mod tests {
         let md = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
         let back: NegativeBinomial = serde_json::from_str(&serde_json::to_string(&md).unwrap()).unwrap();
         assert_eq!(back.parameterization(), NbParameterization::MeanDispersion);
+    }
+
+    /// 2026-11-10 default: `new`/`default()` with NLL build the MeanDispersion
+    /// head and KEEP the caller's response functions, so opting out restores
+    /// the exact legacy head; the CRPS loss follows the same rule.
+    #[test]
+    fn mean_dispersion_is_the_nll_default_and_opt_out_is_exact() {
+        let d = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true);
+        assert_eq!(d.parameterization(), NbParameterization::MeanDispersion);
+        assert_eq!(NegativeBinomial::default().parameterization(), NbParameterization::MeanDispersion);
+        // 2026-11-14 (proposal 031): the CRPS loss uses the same head, and opts out the same way.
+        let crps = NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Crps, true);
+        assert_eq!(crps.parameterization(), NbParameterization::MeanDispersion);
+        assert_eq!(NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Crps).parameterization(), NbParameterization::MeanDispersion);
+        let crps_legacy = crps.clone().with_parameterization(NbParameterization::TotalCountProbs);
+        assert_eq!(crps_legacy.parameterization(), NbParameterization::TotalCountProbs);
+        assert_eq!(crps_legacy.params()[0].response_fn, ResponseFn::Softplus);
+        assert_eq!(crps_legacy.params()[1].response_fn, ResponseFn::Sigmoid);
+        // a CRPS model saved before the change carries its coordinates and loads with them
+        let saved: NegativeBinomial = serde_json::from_value(serde_json::to_value(&crps_legacy).unwrap()).unwrap();
+        assert_eq!(saved.parameterization(), NbParameterization::TotalCountProbs);
+        // Default MD == the dedicated constructor on transforms / gradients.
+        let md = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
+        let preds = array![[2.0, 0.3], [5.0, -1.0], [0.1, 2.0]];
+        let y = array![6.0, 140.0, 0.0];
+        let target = ResponseData::Univariate(&y.view());
+        let (t_d, t_md) = (d.transform_params(&preds.view()), md.transform_params(&preds.view()));
+        assert_eq!(t_d, t_md);
+        assert_eq!(
+            d.analytical_gradients(&preds.view(), &t_d.view(), &target),
+            md.analytical_gradients(&preds.view(), &t_md.view(), &target)
+        );
+        // Opt-out == a head built the legacy way (response fns preserved).
+        let legacy = d.with_parameterization(NbParameterization::TotalCountProbs);
+        let t_l = legacy.transform_params(&preds.view());
+        assert!((t_l[[0, 0]] - ResponseFn::Softplus.apply_scalar(2.0)).abs() < 1e-12);
+        assert!((t_l[[0, 1]] - ResponseFn::Sigmoid.apply_scalar(0.3)).abs() < 1e-12);
     }
 
     /// θ RECOVERY on synthetic NB2 data (the measured failure: the legacy head
@@ -1046,7 +1476,8 @@ mod tests {
             let mut params = XGBoostBackend::create_params(model.n_params());
             params.set("eta", ParamValue::Float(0.05));
             params.set("max_depth", ParamValue::Int(3));
-            let cfg = TrainConfig { num_boost_round: 300, early_stopping_rounds: None, verbose: false, collect_train_metrics: false, seed: 3 };
+            let cfg = TrainConfig { num_boost_round: 300, early_stopping_rounds: None, verbose: false, collect_train_metrics: false,
+            param_freeze_rounds: None, seed: 3 };
             model.train(&mut ds, None, params, cfg).unwrap();
             let out = match model.predict(&x.view(), PredType::Parameters, 0, &[], 1).unwrap() {
                 PredictionOutput::Parameters(p) => p,
@@ -1063,7 +1494,7 @@ mod tests {
             (med_theta, mean_abs_mu_err)
         };
         let (th_md, mu_err_md) = fit(NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll));
-        let (th_legacy, mu_err_legacy) = fit(NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true));
+        let (th_legacy, mu_err_legacy) = fit(NegativeBinomial::new(Stabilization::None, ResponseFn::Softplus, ResponseFn::Sigmoid, LossFn::Nll, true).with_parameterization(NbParameterization::TotalCountProbs));
         eprintln!("theta: mean-dispersion {th_md:.2} legacy {th_legacy:.2} (true {theta_true}); mean |mu err| {mu_err_md:.3} vs {mu_err_legacy:.3}");
         assert!((th_md - theta_true).abs() / theta_true < 0.25, "mean-dispersion theta {th_md} vs true {theta_true}");
         assert!((th_md - theta_true).abs() <= (th_legacy - theta_true).abs() + 0.25, "legacy {th_legacy} closer than mean-dispersion {th_md}");
@@ -1098,7 +1529,8 @@ mod tests {
             ResponseFn::Sigmoid,
             LossFn::Nll,
             false,
-        );
+        )
+        .with_parameterization(NbParameterization::TotalCountProbs);
         let predictions = array![[0.5, 0.0], [0.8, -0.5], [1.0, 0.5]];
         let targets = array![3.0, 1.0, 5.0];
         let target = ResponseData::Univariate(&targets.view());
@@ -1174,7 +1606,9 @@ mod crps_par_tests {
             ResponseFn::Sigmoid,
             LossFn::Crps,
             false,
-        );
+        )
+        // the (total_count, probs) head: the CRPS default until 2026-11-14
+        .with_parameterization(NbParameterization::TotalCountProbs);
         let n = 3_000usize;
         let mut state = 11u64;
         let mut next = move || {
@@ -1202,3 +1636,240 @@ mod crps_par_tests {
     }
 }
 
+
+#[cfg(test)]
+mod mean_dispersion_clamp_tests {
+    use super::*;
+    use crate::types::ResponseData;
+    use ndarray::Array1;
+
+    /// Means far above the old e⁶ ≈ 403 cap are representable, the gradients
+    /// at such means match finite differences of the NLL, and a margin beyond
+    /// the clamp gets zero gradient.
+    #[test]
+    fn large_means_are_representable_and_clamped_margins_are_inert() {
+        let d = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll);
+        let (mu, th) = (3000.0f64, 25.0f64);
+        let preds = Array2::from_shape_vec((1, 2), vec![mu.ln(), th.ln()]).unwrap();
+        let t = d.transform_params(&preds.view());
+        let mean = t[[0, 0]] * t[[0, 1]] / (1.0 - t[[0, 1]]);
+        assert!((mean / mu - 1.0).abs() < 1e-9, "reported mean {mean} vs {mu}");
+        let y = Array1::from_vec(vec![2500.0]);
+        let (g, _) = d
+            .analytical_gradients(&preds.view(), &t.view(), &ResponseData::Univariate(&y.view()))
+            .unwrap();
+        let nll = |f: f64, gg: f64| {
+            let p = Array2::from_shape_vec((1, 2), vec![f, gg]).unwrap();
+            let tt = d.transform_params(&p.view());
+            -d.log_prob(&[tt[[0, 0]], tt[[0, 1]]], &[2500.0])
+        };
+        let e = 1e-5;
+        let df = (nll(mu.ln() + e, th.ln()) - nll(mu.ln() - e, th.ln())) / (2.0 * e);
+        let dg = (nll(mu.ln(), th.ln() + e) - nll(mu.ln(), th.ln() - e)) / (2.0 * e);
+        assert!((g[[0, 0]] - df).abs() < 1e-3 * df.abs().max(1.0), "{} vs {df}", g[[0, 0]]);
+        assert!((g[[0, 1]] - dg).abs() < 1e-3 * dg.abs().max(1.0), "{} vs {dg}", g[[0, 1]]);
+        // beyond the clamp: zero gradient for that coordinate
+        let far = Array2::from_shape_vec((1, 2), vec![20.0, 15.0]).unwrap();
+        let tf = d.transform_params(&far.view());
+        let (gf, _) = d
+            .analytical_gradients(&far.view(), &tf.view(), &ResponseData::Univariate(&y.view()))
+            .unwrap();
+        assert_eq!(gf[[0, 0]], 0.0);
+        assert_eq!(gf[[0, 1]], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod log_theta_fisher_tests {
+    use super::*;
+    use crate::types::ResponseData;
+    use ndarray::Array1;
+
+    /// The exact-sum Fisher information equals the Monte-Carlo mean of the
+    /// observed information, matches both limits, and `Damped` ≥ both pieces.
+    #[test]
+    fn fisher_matches_monte_carlo_and_limits() {
+        let mut rng = ChaCha8Rng::seed_from_u64(17);
+        for &(mu, th) in &[(3.0f64, 1.0f64), (40.0, 4.0), (5.0, 60.0), (800.0, 20.0)] {
+            let n = 200_000;
+            let y: Array1<f64> = Array1::from_iter((0..n).map(|_| {
+                let lam = RandGamma::new(th, mu / th).unwrap().sample(&mut rng);
+                RandPoisson::new(lam).unwrap().sample(&mut rng)
+            }));
+            let preds = Array2::from_shape_fn((n, 2), |(_, j)| if j == 0 { mu.ln() } else { th.ln() });
+            let target = ResponseData::Univariate(&y.view());
+            let mk = |m| NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll).with_hessian_mode(m);
+            // Observed with the floor removed is not exposed; use Fisher/Damped/Observed relations.
+            let tr = mk(HessianMode::Fisher).transform_params(&preds.view());
+            let (g_f, h_f) = mk(HessianMode::Fisher).analytical_gradients(&preds.view(), &tr.view(), &target).unwrap();
+            let (g_o, h_o) = mk(HessianMode::Observed).analytical_gradients(&preds.view(), &tr.view(), &target).unwrap();
+            let (g_d, h_d) = mk(HessianMode::Damped).analytical_gradients(&preds.view(), &tr.view(), &target).unwrap();
+            assert_eq!(g_f, g_o);
+            assert_eq!(g_f, g_d);
+            let fis = nb_log_theta_fisher(mu, th);
+            assert!((h_f[[0, 1]] / fis.max(1e-8) - 1.0).abs() < 1e-9, "{} vs {fis}", h_f[[0, 1]]);
+            // E[score²] = Fisher (the score has no floor, unlike the observed Hessian).
+            let e_s2 = g_f.column(1).iter().map(|v| v * v).sum::<f64>() / n as f64;
+            assert!((e_s2 - fis).abs() / fis < 0.05, "µ={mu} θ={th}: E[s²]={e_s2} Fisher={fis}");
+            for i in 0..n {
+                assert!(h_d[[i, 1]] >= h_f[[i, 1]] - 1e-15);
+                assert!(h_d[[i, 1]] + 1e-12 >= h_o[[i, 1]].min(h_d[[i, 1]]));
+            }
+        }
+        // limits
+        let glim = |th: f64| th * th * trigamma(th) - th;
+        assert!((nb_log_theta_fisher(1e5, 2.0) / glim(2.0) - 1.0).abs() < 2e-3);
+        let (mu, th) = (10.0, 300.0);
+        let pois = mu * mu / (2.0 * (mu + th) * (mu + th));
+        assert!((nb_log_theta_fisher(mu, th) / pois - 1.0).abs() < 0.05);
+        assert_eq!(nb_log_theta_fisher(0.0, 1.0), 0.0);
+    }
+
+    /// The quadrature against the direct series θ² Σ_j P(Y > j)/(θ + j)² − θµ/(µ+θ)
+    /// in the region where the series is numerically safe.
+    #[test]
+    fn quadrature_matches_the_exact_series() {
+        fn series(mu: f64, theta: f64) -> f64 {
+            let s = mu + theta;
+            let ln_q = (mu / s).ln();
+            let mut ln_p = theta * (theta / s).ln();
+            let (mut cdf, mut acc) = (0.0f64, 0.0f64);
+            let max_j = (mu + 60.0 * (mu + mu * mu / theta).sqrt() + 100.0) as usize;
+            for j in 0..=max_j {
+                let jf = j as f64;
+                cdf += ln_p.exp();
+                let sf = (1.0 - cdf).max(0.0);
+                acc += sf / ((theta + jf) * (theta + jf));
+                if jf > mu && sf < 1e-14 {
+                    break;
+                }
+                ln_p += ((jf + theta) / (jf + 1.0)).ln() + ln_q;
+            }
+            theta * theta * acc - theta * mu / s
+        }
+        for &th in &[0.05f64, 0.3, 1.0, 3.0, 10.0, 50.0, 300.0] {
+            for &mu in &[0.1f64, 1.0, 3.0, 10.0, 30.0, 100.0, 1000.0, 4000.0] {
+                let ex = series(mu, th);
+                if ex < 1e-6 {
+                    continue; // the series cancels catastrophically there
+                }
+                let q = nb_log_theta_fisher(mu, th);
+                assert!((q / ex - 1.0).abs() < 1e-2, "µ={mu} θ={th}: quad {q} series {ex}");
+            }
+        }
+    }
+
+    /// Old files (no `hessian_mode`) keep the floored observed curvature.
+    #[test]
+    fn serde_default_is_observed() {
+        let mut v: serde_json::Value =
+            serde_json::to_value(NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll)).unwrap();
+        v.as_object_mut().unwrap().remove("hessian_mode");
+        let back: NegativeBinomial = serde_json::from_value(v).unwrap();
+        assert_eq!(back.hessian_mode(), HessianMode::Observed);
+    }
+}
+
+#[cfg(test)]
+mod hessian_mode_default_tests {
+    use super::*;
+
+    #[test]
+    fn constructors_default_to_damped() {
+        assert_eq!(NegativeBinomial::default().hessian_mode(), HessianMode::Damped);
+        assert_eq!(
+            NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Nll).hessian_mode(),
+            HessianMode::Damped
+        );
+    }
+}
+
+#[cfg(test)]
+mod location_start_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn location_start_sets_log_mean_only() {
+        let y = array![0.0, 4.0, 8.0];
+        let t = ResponseData::Univariate(&y.view());
+        assert!(NegativeBinomial::default().with_location_start(false).default_start_values(&t).is_none());
+        let sv = NegativeBinomial::default().default_start_values(&t).unwrap();
+        assert_eq!(sv.to_vec(), vec![4.0f64.ln(), 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod location_start_default_tests {
+    use super::*;
+
+    #[test]
+    fn serde_default_is_off_and_legacy_head_ignores_it() {
+        let mut v = serde_json::to_value(NegativeBinomial::default()).unwrap();
+        v.as_object_mut().unwrap().remove("location_start");
+        let back: NegativeBinomial = serde_json::from_value(v).unwrap();
+        assert!(!back.location_start());
+        let y = ndarray::array![1.0, 2.0];
+        let legacy = NegativeBinomial::default().with_parameterization(NbParameterization::TotalCountProbs);
+        assert!(legacy.default_start_values(&ResponseData::Univariate(&y.view())).is_none());
+    }
+
+    /// Proposals 029, 031: CRPS in (log µ, log θ). The gradient is the finite
+    /// difference of the loss through the joint transform and the Hessian is
+    /// 2 Σ_k (∂F(k)/∂η)² recomputed from finite differences of the CDF.
+    #[test]
+    fn crps_mean_dispersion_gradients_match_finite_differences() {
+        use crate::types::ResponseData;
+        let d = NegativeBinomial::new_mean_dispersion(Stabilization::None, LossFn::Crps);
+        assert_eq!(d.parameterization(), NbParameterization::MeanDispersion);
+        // (µ, θ, y): small and large counts, near-Poisson and overdispersed
+        let cases = [(9.5_f64, 40.0_f64, 12.0_f64), (3.0, 1.2, 0.0), (25.0, 4.0, 60.0), (190.0, 1.5, 420.0), (700.0, 6.0, 650.0), (9.0, 400.0, 4.0)];
+        let n = cases.len();
+        let mut raw = ndarray::Array2::zeros((n, 2));
+        let mut y = ndarray::Array1::zeros(n);
+        for (i, (mu, th, yi)) in cases.iter().enumerate() {
+            raw[[i, 0]] = mu.ln();
+            raw[[i, 1]] = th.ln();
+            y[i] = *yi;
+        }
+        let tr = d.transform_params(&raw.view());
+        let yv = y.view();
+        let (g, h) = d.analytical_gradients(&raw.view(), &tr.view(), &ResponseData::Univariate(&yv)).expect("analytic");
+        let crps = |f: f64, gg: f64, yi: f64| {
+            let (r, p) = NegativeBinomial::mean_dispersion_to_r_probs(f, gg);
+            d.analytic_crps(&[r, p], &[yi]).unwrap()
+        };
+        let cdf = |f: f64, gg: f64, top: usize| -> Vec<f64> {
+            let (r, p) = NegativeBinomial::mean_dispersion_to_r_probs(f, gg);
+            let mut acc = 0.0;
+            (0..=top).map(|k| { acc += d.log_prob_scalar(&[r, p], k as f64).exp(); acc }).collect()
+        };
+        let eps = 1e-5;
+        for (i, (mu, th, yi)) in cases.iter().enumerate() {
+            let (f, gg) = (mu.ln(), th.ln());
+            let fd = [
+                (crps(f + eps, gg, *yi) - crps(f - eps, gg, *yi)) / (2.0 * eps),
+                (crps(f, gg + eps, *yi) - crps(f, gg - eps, *yi)) / (2.0 * eps),
+            ];
+            let sd = (mu + mu * mu / th).sqrt();
+            let top = (yi.max(*mu) + 12.0 * sd).ceil() as usize;
+            let (c0, c_f, c_g) = (cdf(f, gg, top), [cdf(f + eps, gg, top), cdf(f - eps, gg, top)], [cdf(f, gg + eps, top), cdf(f, gg - eps, top)]);
+            let curv = |c: &[Vec<f64>; 2]| 2.0 * (0..c0.len()).map(|k| ((c[0][k] - c[1][k]) / (2.0 * eps)).powi(2)).sum::<f64>();
+            let want_h = [curv(&c_f), curv(&c_g)];
+            for j in 0..2 {
+                // the loss stops at 4 sd, the gradient table at 6 sd (see the test above)
+                assert!((g[[i, j]] - fd[j]).abs() <= 2e-2 * fd[j].abs().max(1e-2), "row {i} param {j}: analytic {} vs fd {}", g[[i, j]], fd[j]);
+                let want = want_h[j].max(0.05);
+                assert!((h[[i, j]] - want).abs() <= 1e-2 * want, "row {i} param {j}: hessian {} vs {}", h[[i, j]], want);
+            }
+        }
+        // a coordinate outside its clamp has no gradient
+        let mut far = raw.clone();
+        far[[0, 0]] = NB_LOG_MU_CLAMP.1 + 1.0;
+        far[[1, 1]] = NB_LOG_THETA_CLAMP.0 - 1.0;
+        let tr = d.transform_params(&far.view());
+        let (g, _) = d.analytical_gradients(&far.view(), &tr.view(), &ResponseData::Univariate(&yv)).unwrap();
+        assert_eq!(g[[0, 0]], 0.0);
+        assert_eq!(g[[1, 1]], 0.0);
+    }
+}

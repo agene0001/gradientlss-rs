@@ -21,6 +21,13 @@ fn nan_last(nll: f64) -> f64 {
 /// to the target data to find the optimal unconditional parameters, and then
 /// ranks them based on the resulting negative log-likelihood (NLL).
 ///
+/// The ranking is by the unconditional fit to the labels
+/// ([`Distribution::marginal_fit`]). It does not see the features: on 9
+/// datasets the family it ranked first had the best test NLL of the trained
+/// models in about half the cells (research proposal 018). Use it to
+/// shortlist, then compare the shortlisted families' trained models on a
+/// validation set.
+///
 /// # Arguments
 ///
 /// * `target` - A 1D array of target values.
@@ -47,7 +54,7 @@ pub fn dist_select<'a>(
             // parameter names collides for e.g. Gaussian/Laplace/Cauchy/Gumbel/
             // Logistic, which all share "loc"/"scale".
             let dist_name = dist.name().to_string();
-            let result = dist.calculate_start_values(&response_data, max_iter);
+            let result = dist.marginal_fit(&response_data, max_iter);
             (dist_name, result)
         })
         .collect();
@@ -131,7 +138,7 @@ pub fn dist_select_with_params<'a>(
         .map(|dist| {
             // Distribution name, not joined param names — see `dist_select`.
             let dist_name = dist.name().to_string();
-            let result = dist.calculate_start_values(&response_data, max_iter);
+            let result = dist.marginal_fit(&response_data, max_iter);
             (dist_name, result, dist)
         })
         .collect();
@@ -268,6 +275,31 @@ mod tests {
         assert_eq!(result.len(), 2);
         // Check that the gaussian distribution is in the results
         assert!(result.iter().any(|(name, _)| name == "Gaussian"));
+    }
+
+    /// StudentT nests Gaussian, so on Gaussian labels its best fit cannot be
+    /// much worse than Gaussian's. Ranked at its training start (df capped at
+    /// 10) it was; `marginal_fit` ranks it at the free fit.
+    #[test]
+    fn student_t_is_ranked_at_its_free_fit_not_at_the_start_cap() {
+        use crate::types::ResponseData;
+        use rand::SeedableRng;
+        use rand_distr::{Distribution as _, Normal};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let normal = Normal::new(450.0, 17.0).unwrap();
+        let n = 4000;
+        let y = Array1::from_iter((0..n).map(|_| normal.sample(&mut rng)));
+        let yv = y.view();
+        let t = ResponseData::Univariate(&yv);
+        let st = StudentT::default();
+        let (free, _) = st.marginal_fit(&t, 100).unwrap();
+        let (capped, sv) = st.calculate_start_values(&t, 100).unwrap();
+        let (gauss, _) = Gaussian::default().marginal_fit(&t, 100).unwrap();
+        let per_row = |v: f64| v / n as f64;
+        eprintln!("free {} capped {} gauss {} capped start {sv:?}", per_row(free), per_row(capped), per_row(gauss));
+        assert!(free <= capped + 1e-9, "free fit {free} worse than the capped start {capped}");
+        assert!(per_row(free - gauss) < 0.002, "free StudentT {} vs Gaussian {}", per_row(free), per_row(gauss));
+        assert!(per_row(capped - free) > 0.003, "the cap should cost on Gaussian labels: {} vs {}", per_row(capped), per_row(free));
     }
 
     #[test]

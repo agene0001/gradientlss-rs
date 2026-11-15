@@ -1070,10 +1070,11 @@ impl Distribution for SplineFlow {
 
         let result = Executor::new(problem, solver)
             .configure(|state| {
+                // No target_cost: argmin stops once the best cost is <= target, and a total
+                // NLL is negative whenever the fitted density exceeds 1 (see `base.rs`).
                 state
                     .param(init_params.clone())
                     .max_iters(actual_max_iter as u64)
-                    .target_cost(0.0)
             })
             .run();
 
@@ -1312,6 +1313,31 @@ mod tests {
 
         // All samples should be non-negative for positive support
         assert!(samples.iter().all(|&x| x >= 0.0));
+    }
+
+    /// The start-value fit must run its iteration budget when the total NLL is
+    /// negative (density above 1). With `target_cost(0.0)` argmin stopped at
+    /// the first iterate whose cost was <= 0.
+    #[test]
+    fn start_values_keep_improving_below_zero_total_nll() {
+        // 400 labels packed into [0.45, 0.55] of the unit interval: density ~ 10
+        let y = Array1::from_iter((0..400).map(|i| 0.45 + 0.1 * (i as f64 + 0.5) / 400.0));
+        let yv = y.view();
+        let t = ResponseData::Univariate(&yv);
+        let dist = SplineFlow::new(
+            TargetSupport::UnitInterval,
+            8,
+            3.0,
+            SplineOrder::Linear,
+            Stabilization::None,
+            LossFn::Nll,
+            true,
+        );
+        let (cost, sv) = dist.calculate_start_values(&t, 50).unwrap();
+        eprintln!("spline start cost per row {}", cost / 400.0);
+        assert!(sv.iter().all(|v| v.is_finite()));
+        // with the 0.0 target the fit stopped at −0.61 per row; the full budget reaches −2.25
+        assert!(cost / 400.0 < -1.5, "start fit stopped early: per-row NLL {}", cost / 400.0);
     }
 
     /// Pseudo-random but deterministic parameter vector exercising uneven bins,

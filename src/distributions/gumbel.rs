@@ -1,6 +1,7 @@
 // Gumbel distribution implementation.
 
-use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use super::base::{Distribution, DistributionParam, HessianMode, LossFn, Stabilization};
+use super::location_scale::{self, LocationScaleStart, LsFamily};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -17,6 +18,27 @@ pub struct Gumbel {
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
+    /// Curvature handed to the booster. `Damped` by default since 2026-11-14; a model
+    /// saved before the field existed loads as `Observed`, what it was trained with.
+    #[serde(default = "crate::distributions::location_scale::legacy_hessian_mode")]
+    hessian_mode: HessianMode,
+    /// Start values used without `initialize`. `LocationScale` by default since
+    /// 2026-11-14; a model saved before the field existed loads as `Raw` (0.5, 0.5).
+    #[serde(default)]
+    start: LocationScaleStart,
+    /// Multiplier on the moment-matched start scale of `LocationScaleStart::LocationScale`.
+    /// [`GUMBEL_START_SCALE_FACTOR`] by default; 1.0 for a model saved before the field existed.
+    #[serde(default = "one")]
+    start_scale_factor: f64,
+}
+
+/// Default start-scale factor of [`Gumbel`]: the start scale is this many times the
+/// moment-matched one (research proposal 028: chosen on validation NLL over 1–100;
+/// naval −5.13 at 1 against −5.47 at 100, flat where the start does not matter).
+pub const GUMBEL_START_SCALE_FACTOR: f64 = 100.0;
+
+fn one() -> f64 {
+    1.0
 }
 
 impl Gumbel {
@@ -35,7 +57,50 @@ impl Gumbel {
             stabilization,
             loss_fn,
             initialize,
+            // Defaults since 2026-11-14 (research proposals 028, 031, Felix's decision): the
+            // observed curvature and the raw 0.5 start do not fit a target away from zero.
+            hessian_mode: HessianMode::Damped,
+            start: LocationScaleStart::LocationScale,
+            start_scale_factor: GUMBEL_START_SCALE_FACTOR,
         }
+    }
+
+    /// With `LocationScaleStart::LocationScale`, start the scale at `factor` times the
+    /// moment-matched value (default [`GUMBEL_START_SCALE_FACTOR`]). The lower tail of the
+    /// Gumbel density costs e^{-z}, so a start that is too narrow for some rows begins with
+    /// an NLL in the thousands; a start that is too wide costs only ln(factor) and makes
+    /// the first rounds a least-squares fit of the location.
+    pub fn with_start_scale_factor(mut self, factor: f64) -> Self {
+        assert!(factor.is_finite() && factor > 0.0, "start scale factor must be positive");
+        self.start_scale_factor = factor;
+        self
+    }
+
+    pub fn start_scale_factor(&self) -> f64 {
+        self.start_scale_factor
+    }
+
+    /// Curvature: `Damped` (the default) takes the row-wise maximum of the observed second
+    /// derivative and the expected information, `Fisher` the expected information alone,
+    /// `Observed` the behaviour before 2026-11-14.
+    pub fn with_hessian_mode(mut self, mode: HessianMode) -> Self {
+        self.hessian_mode = mode;
+        self
+    }
+
+    pub fn hessian_mode(&self) -> HessianMode {
+        self.hessian_mode
+    }
+
+    /// Closed-form start values used without `initialize` (see [`LocationScaleStart`]);
+    /// `LocationScale` by default, `Raw` restores the behaviour before 2026-11-14.
+    pub fn with_start(mut self, start: LocationScaleStart) -> Self {
+        self.start = start;
+        self
+    }
+
+    pub fn start(&self) -> LocationScaleStart {
+        self.start
     }
 
     pub fn default() -> Self {
@@ -85,6 +150,16 @@ impl Distribution for Gumbel {
 
     fn should_initialize(&self) -> bool {
         self.initialize
+    }
+
+    fn default_start_values(&self, target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        let scale_fn = &self.params[1].response_fn;
+        let mut v = location_scale::start_values(self.start, LsFamily::Gumbel, target, scale_fn)?;
+        if self.start == LocationScaleStart::LocationScale && self.start_scale_factor != 1.0 {
+            let wide = scale_fn.apply_scalar(v[1]) * self.start_scale_factor;
+            v[1] = super::student_t::invert_response(scale_fn, wide);
+        }
+        Some(v)
     }
 
     fn log_prob(&self, params: &[f64], target: &[f64]) -> f64 {
@@ -207,6 +282,14 @@ impl Distribution for Gumbel {
             }
         }
 
+        location_scale::apply_hessian_mode(
+            self.hessian_mode,
+            LsFamily::Gumbel,
+            &mut hessians,
+            &predictions.column(1),
+            &transformed.column(1),
+            scale_response_fn,
+        );
         Some((gradients, hessians))
     }
 
@@ -280,5 +363,36 @@ mod tests {
         let mean_1: f64 = samples.column(1).iter().sum::<f64>() / 1000.0;
         let expected_mean_1 = 2.0 + 3.0 * EULER_MASCHERONI; // loc + scale * euler_mascheroni
         assert_relative_eq!(mean_1, expected_mean_1, epsilon = 0.2);
+    }
+
+    /// Proposal 028: the start-scale factor widens the moment-matched scale only, follows
+    /// the label units, is inert for the other start rules, and old files load with 1.
+    #[test]
+    fn start_scale_factor_widens_only_the_matched_scale() {
+        let y: ndarray::Array1<f64> = (0..500).map(|i| 400.0 + 17.0 * ((i * 37 % 101) as f64 / 101.0 - 0.5)).collect();
+        let start = |d: &Gumbel, y: &ndarray::Array1<f64>| {
+            let v = y.view();
+            d.default_start_values(&ResponseData::Univariate(&v))
+        };
+        assert_eq!(Gumbel::default().start_scale_factor(), GUMBEL_START_SCALE_FACTOR);
+        assert_eq!(Gumbel::default().start(), LocationScaleStart::LocationScale);
+        let ls = Gumbel::default().with_start_scale_factor(1.0);
+        let (a, b) = (start(&ls, &y).unwrap(), start(&ls.clone().with_start_scale_factor(100.0), &y).unwrap());
+        assert_relative_eq!(b[0], a[0], epsilon = 1e-12);
+        assert_relative_eq!(b[1], a[1] + 100f64.ln(), epsilon = 1e-6); // Exp link (inverted numerically)
+        // labels in other units: location and scale follow
+        let y2 = y.mapv(|v| 1000.0 * v);
+        let c = start(&ls.clone().with_start_scale_factor(100.0), &y2).unwrap();
+        assert_relative_eq!(c[0], 1000.0 * b[0], max_relative = 1e-9);
+        assert_relative_eq!(c[1], b[1] + 1000f64.ln(), epsilon = 1e-6);
+        // inert without the LocationScale rule
+        assert!(start(&Gumbel::default().with_start(LocationScaleStart::Raw), &y).is_none());
+        let loc = Gumbel::default().with_start(LocationScaleStart::Location);
+        assert_eq!(start(&loc, &y), start(&loc.clone().with_start_scale_factor(100.0), &y));
+        // a model saved before the field existed
+        let mut v = serde_json::to_value(Gumbel::default().with_start_scale_factor(7.0)).unwrap();
+        v.as_object_mut().unwrap().remove("start_scale_factor");
+        let back: Gumbel = serde_json::from_value(v).unwrap();
+        assert_eq!(back.start_scale_factor(), 1.0);
     }
 }

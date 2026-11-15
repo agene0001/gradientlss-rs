@@ -49,6 +49,7 @@ fn train_once(collect: bool, rounds: usize) -> f64 {
         early_stopping_rounds: None, // identical round count both ways
         verbose: false,
         collect_train_metrics: collect,
+            param_freeze_rounds: None,
         seed: 42,
     };
 

@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         early_stopping_rounds: None,
         verbose: true,
         collect_train_metrics: false,
+            param_freeze_rounds: None,
         seed: 123,
     };
 

@@ -1,6 +1,6 @@
 //! Poisson distribution implementation.
 
-use super::base::{Distribution, DistributionParam, LossFn, Stabilization};
+use super::base::{Distribution, DistributionParam, HessianMode, LossFn, Stabilization};
 use crate::types::ResponseData;
 use crate::utils::ResponseFn;
 use ndarray::{Array2, ArrayView2};
@@ -18,9 +18,43 @@ pub struct Poisson {
     stabilization: Stabilization,
     loss_fn: LossFn,
     initialize: bool,
+    /// Curvature for the NLL Newton step (see [`HessianMode`]). Under the
+    /// `Exp` link observed = Fisher = λ exactly; under `Relu` the observed
+    /// k/λ² vanishes on zero counts while the Fisher value is 1/λ. Models
+    /// saved before the field existed load as `Observed`.
+    #[serde(default = "Poisson::legacy_hessian_mode")]
+    hessian_mode: HessianMode,
+    /// Without `initialize`: start the rate at ȳ (through the inverse
+    /// response) instead of the raw 0.5. Only affects training.
+    #[serde(default)]
+    location_start: bool,
 }
 
 impl Poisson {
+    fn legacy_hessian_mode() -> HessianMode {
+        HessianMode::Observed
+    }
+
+    /// See the `hessian_mode` field.
+    pub fn with_hessian_mode(mut self, mode: HessianMode) -> Self {
+        self.hessian_mode = mode;
+        self
+    }
+
+    pub fn hessian_mode(&self) -> HessianMode {
+        self.hessian_mode
+    }
+
+    /// See the `location_start` field.
+    pub fn with_location_start(mut self, on: bool) -> Self {
+        self.location_start = on;
+        self
+    }
+
+    pub fn location_start(&self) -> bool {
+        self.location_start
+    }
+
     pub fn new(
         stabilization: Stabilization,
         rate_response_fn: ResponseFn,
@@ -33,11 +67,22 @@ impl Poisson {
             stabilization,
             loss_fn,
             initialize,
+            hessian_mode: HessianMode::Damped,
+            // measured (cycle 11): ȳ start wins under Exp/Softplus, hurts under Relu
+            location_start: rate_response_fn != ResponseFn::Relu,
         }
     }
 
+    /// Log link (`Exp`, the canonical GLM link used by XGBoost's
+    /// `count:poisson`, LightGBM and GAMLSS), rate starting at ȳ, Damped
+    /// curvature. Until 2026-11-11 this was `Relu` with a raw 0.5 start: under
+    /// ReLU a row whose margin falls to ≤ 0 has zero gradient forever and zero
+    /// counts carry zero curvature. Measured on 5 count sets × 5 seeds the
+    /// new default is better everywhere (bike_cnt −2.68, bike_casual −1.23,
+    /// synth Poisson −0.054 nats; research/gradientlss/reports/012-cycle11-report.md).
+    /// `Poisson::new(.., ResponseFn::Relu, ..)` keeps the old link.
     pub fn default() -> Self {
-        Self::new(Stabilization::None, ResponseFn::Relu, LossFn::Nll, false)
+        Self::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false)
     }
 
     /// Helper method for scalar log probability (inlined formula, no statrs constructor)
@@ -57,6 +102,78 @@ impl Poisson {
         -rate + k * rate.ln()
             - crate::constants::ln_factorial(k).unwrap_or_else(|| ln_gamma(k + 1.0))
     }
+}
+
+/// The CRPS sums stopped at these many terms until 2026-11-13. A row whose
+/// sums fit under them still runs the original loops, bit for bit; a row
+/// that needs more goes through the windowed versions below. Before, such a
+/// row got a loss and a gradient from a CDF that had not reached 1: a model
+/// with mean counts above ~100 did not train at all (research proposal 023).
+const LEGACY_CRPS_TERMS: usize = 100;
+
+/// Summation window `[lo, hi]` for a Poisson(rate): the mean ± (10 sd + 10),
+/// outside which the pmf is below ~1e-20. At most `CRPS_MAX_TERMS` long.
+fn poisson_window(rate: f64) -> (usize, usize) {
+    let half = 10.0 * rate.sqrt() + 10.0;
+    let lo = (rate - half).floor().max(0.0) as usize;
+    let hi = (rate + half).ceil() as usize;
+    if hi - lo + 1 > super::util::CRPS_MAX_TERMS {
+        super::util::warn_crps_truncated("Poisson", rate);
+        let c = rate.round() as usize;
+        let h = super::util::CRPS_MAX_TERMS / 2;
+        return (c.saturating_sub(h), c + h);
+    }
+    (lo, hi)
+}
+
+#[inline]
+fn poisson_pmf_at(rate: f64, k: usize) -> f64 {
+    (-rate + k as f64 * rate.ln() - ln_gamma(k as f64 + 1.0)).exp()
+}
+
+/// CRPS = sum_k (F(k) - 1{k >= y})^2 over the window. Below it F = 0 and the
+/// term is 1{k >= y}; above it F = 1 and the term is 1{k < y}: both are
+/// counted in closed form.
+fn poisson_crps_windowed(rate: f64, y_int: usize) -> f64 {
+    let (lo, hi) = poisson_window(rate);
+    let mut pmf = poisson_pmf_at(rate, lo);
+    let mut cdf = 0.0;
+    let mut crps = lo.saturating_sub(y_int) as f64;
+    for k in lo..=hi {
+        if k > lo {
+            pmf *= rate / k as f64;
+        }
+        cdf += pmf;
+        let d = cdf.min(1.0) - if k >= y_int { 1.0 } else { 0.0 };
+        crps += d * d;
+    }
+    crps + y_int.saturating_sub(hi + 1) as f64
+}
+
+/// `(dCRPS/dlambda, d2CRPS/dlambda2, expected curvature)` over the window;
+/// outside it the pmf, and with it every term of the sums, vanishes.
+///
+/// The expected curvature is d2/dl'2 E_{y~Pois(l)}[CRPS(l', y)] at l' = l,
+/// which is 2 sum_k (dF(k)/dl)^2 = 2 sum_k pmf(k)^2: the CRPS counterpart of
+/// the Fisher information (positive, and the average of the observed
+/// curvature, whose other term has expectation zero).
+fn poisson_crps_grad_windowed(rate: f64, y_int: usize) -> (f64, f64, f64) {
+    let (lo, hi) = poisson_window(rate);
+    let mut pmf = poisson_pmf_at(rate, lo);
+    let mut cdf = 0.0;
+    let (mut g, mut h, mut e) = (0.0, 0.0, 0.0);
+    for k in lo..=hi {
+        if k > lo {
+            pmf *= rate / k as f64;
+        }
+        cdf += pmf;
+        let resid = cdf.min(1.0) - if k >= y_int { 1.0 } else { 0.0 };
+        g -= 2.0 * resid * pmf;
+        let dpmf = pmf * (k as f64 / rate - 1.0);
+        h += 2.0 * (pmf * pmf - resid * dpmf);
+        e += 2.0 * pmf * pmf;
+    }
+    (g, h, e)
 }
 
 /// NGBoost's CRPS metric for a single Poisson rate, ported from ngboost-rs
@@ -123,7 +240,9 @@ impl Poisson {
     /// With CRPS(lambda) = sum_k (F(k) - 1{k>=y})^2 and the classic identity
     /// dF(k)/dlambda = -pmf(k), the gradient is
     ///
-    ///     dCRPS/dlambda = sum_k 2 (F(k) - 1{k>=y}) * (-pmf(k))
+    /// ```text
+    ///  dCRPS/dlambda = sum_k 2 (F(k) - 1{k>=y}) * (-pmf(k))
+    /// ```
     ///
     /// computed in the SAME single pmf-recurrence pass as the loss itself —
     /// one pass per sample instead of the FD path's two full loss evaluations,
@@ -209,10 +328,9 @@ impl Poisson {
         };
         // Scratch tables for the metric expectation. One set per THREAD
         // (`for_each_init`) on the parallel path, one for the serial path.
-        // Capacity bounds the table like ngboost's cap: beyond it the metric
-        // degrades gracefully toward the floor (huge-rate rows also have ~zero
-        // gradient under the same truncation, so no amplification pairs with
-        // it).
+        // Rows whose sums fit in the original 100 terms use the ported metric
+        // (their rate is below ~67, well inside its 200-entry table); larger
+        // rows use the expected curvature and need no table.
         const METRIC_CAP: usize = 200;
         #[derive(Default)]
         struct Scratch {
@@ -242,24 +360,32 @@ impl Poisson {
                 return;
             }
             let y_int = yi.round().max(0.0) as usize;
-            let max_k = ((yi.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
-            let mut pmf = (-rate).exp();
-            let mut cdf = 0.0;
+            let max_k = (yi.max(rate) + 4.0 * rate.sqrt()).ceil() as usize;
             let mut g_lambda = 0.0;
             let mut h_lambda = 0.0;
-            for k in 0..=max_k {
-                if k > 0 {
-                    pmf *= rate / k as f64;
+            // expected CRPS curvature in lambda; set on the windowed path only
+            let mut e_lambda = None;
+            if max_k <= LEGACY_CRPS_TERMS {
+                let mut pmf = (-rate).exp();
+                let mut cdf = 0.0;
+                for k in 0..=max_k {
+                    if k > 0 {
+                        pmf *= rate / k as f64;
+                    }
+                    cdf += pmf;
+                    let indicator = if k >= y_int { 1.0 } else { 0.0 };
+                    let resid = cdf - indicator;
+                    g_lambda -= 2.0 * resid * pmf;
+                    let dpmf = pmf * (k as f64 / rate - 1.0);
+                    h_lambda += 2.0 * (pmf * pmf - resid * dpmf);
+                    if k >= y_int && 1.0 - cdf < 1e-9 {
+                        break;
+                    }
                 }
-                cdf += pmf;
-                let indicator = if k >= y_int { 1.0 } else { 0.0 };
-                let resid = cdf - indicator;
-                g_lambda -= 2.0 * resid * pmf;
-                let dpmf = pmf * (k as f64 / rate - 1.0);
-                h_lambda += 2.0 * (pmf * pmf - resid * dpmf);
-                if k >= y_int && 1.0 - cdf < 1e-9 {
-                    break;
-                }
+            } else {
+                let e;
+                (g_lambda, h_lambda, e) = poisson_crps_grad_windowed(rate, y_int);
+                e_lambda = Some(e);
             }
             let d = rd[i];
             gc[0] = g_lambda * d;
@@ -272,17 +398,23 @@ impl Poisson {
                     hc[0] = (h_lambda * d * d + g_lambda * sd).max(CRPS_MIN_HESS);
                 }
                 CrpsHess::Metric => {
-                    let m = poisson_crps_metric(
-                        rate,
-                        &mut sc.pmf,
-                        &mut sc.cdf,
-                        &mut sc.fp,
-                        &mut sc.suf,
-                    );
-                    // M is the log-rate-space metric; map to margin space:
-                    // h = M * (dlambda/dm / lambda)^2 (= M for Exp response).
-                    let scale = d / rate;
-                    hc[0] = (m * scale * scale).max(CRPS_MIN_METRIC);
+                    if let Some(e) = e_lambda {
+                        // Large counts (a row the 100-term loops could not hold).
+                        // The metric E[g^2] is in units of CRPS^2 and grows like
+                        // lambda^2 in the log rate, while the curvature of the
+                        // CRPS grows like lambda^1.5: preconditioning with it
+                        // shrinks the step by ~0.6 sqrt(lambda) (8x at 190, 16x at
+                        // 700; bike_cnt was still at 3x the NLL model's CRPS after
+                        // 2000 rounds). The expected curvature has the right
+                        // units at every rate. Margin space: e * (dlambda/dm)^2.
+                        hc[0] = (e * d * d).max(CRPS_MIN_METRIC);
+                    } else {
+                        let m = poisson_crps_metric(rate, &mut sc.pmf, &mut sc.cdf, &mut sc.fp, &mut sc.suf);
+                        // M is the log-rate-space metric; map to margin space:
+                        // h = M * (dlambda/dm / lambda)^2 (= M for Exp response).
+                        let scale = d / rate;
+                        hc[0] = (m * scale * scale).max(CRPS_MIN_METRIC);
+                    }
                 }
             }
         };
@@ -339,13 +471,35 @@ impl Distribution for Poisson {
         self.initialize
     }
 
+    fn default_start_values(&self, target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        if !self.location_start {
+            return None;
+        }
+        let ResponseData::Univariate(y) = target else { return None };
+        let v: Vec<f64> = y.iter().copied().filter(|x| x.is_finite() && *x >= 0.0).collect();
+        if v.is_empty() {
+            return None;
+        }
+        let mean = (v.iter().sum::<f64>() / v.len() as f64).max(1e-3);
+        Some(ndarray::Array1::from_vec(vec![super::student_t::invert_response(
+            &self.params[0].response_fn,
+            mean,
+        )]))
+    }
+
+    fn location_param_index(&self) -> Option<usize> {
+        Some(0)
+    }
+
     /// Sampling uses a discrete draw, which is not a
     /// smooth function of the parameters under a fixed seed — CRPS finite
     /// differences through it are meaningless (torch has no rsample here either).
-    /// Truncated CDF-sum CRPS: sum_k (F(k) - 1{k >= round(y)})^2 up to
-    /// K = max(y, lambda) + 4*sqrt(lambda), capped at 100 - term-for-term the
-    /// consumer's Poisson CRPS eval kernel, so the training loss and the
-    /// selection metric agree on what "CRPS" means. Smooth in lambda, which is
+    /// CDF-sum CRPS: sum_k (F(k) - 1{k >= round(y)})^2 up to
+    /// K = max(y, lambda) + 4*sqrt(lambda). While K <= 100 this is term for
+    /// term the consumer's Poisson CRPS eval kernel (which stops at 100), so
+    /// the training loss and the selection metric agree on what "CRPS" means;
+    /// above that the kernel's cap would cut the sum short, and the sum runs
+    /// over the window holding the distribution instead. Smooth in lambda, which is
     /// what makes the central-difference gradients valid where the sampled
     /// estimator's were not.
     fn analytic_crps(&self, params: &[f64], target: &[f64]) -> Option<f64> {
@@ -358,13 +512,16 @@ impl Distribution for Poisson {
             return Some(1e6);
         }
         let y_int = y.round().max(0.0) as usize;
-        let max_k = ((y.max(rate) + 4.0 * rate.sqrt()).ceil() as usize).min(100);
+        let max_k = (y.max(rate) + 4.0 * rate.sqrt()).ceil() as usize;
+        if max_k > LEGACY_CRPS_TERMS {
+            // More than the 100 terms of the original kernel: sum over the
+            // window that holds the distribution instead of stopping short.
+            return Some(poisson_crps_windowed(rate, y_int));
+        }
         // One exp + a multiply per term, via pmf(k) = pmf(k-1) * rate / k —
         // the previous form paid a full ln_gamma + exp PER TERM, which made
         // every FD gradient evaluation ~an order of magnitude dearer than it
-        // needed to be. Underflow at large rate is benign: the sum is capped
-        // at k <= 100, where the true pmf mass is ~0 anyway, so a pmf(0)
-        // underflowing to 0.0 yields the same capped sum the ln form did.
+        // needed to be. No underflow here: this branch has rate <= 100.
         let mut pmf = (-rate).exp();
         let mut cdf = 0.0;
         let mut crps = 0.0;
@@ -447,6 +604,7 @@ impl Distribution for Poisson {
         // Batch response-fn derivatives (auto-vectorized), shared by both paths.
         let (rd, rsd) = rate_response_fn.derivative_batches_from_transformed(&p_rate, &t_rate);
 
+        let hessian_mode = self.hessian_mode;
         let compute = |i: usize| -> (f64, f64) {
             let lambda = t_rate[i].max(1e-6);
             let k = y[i];
@@ -461,7 +619,14 @@ impl Distribution for Poisson {
             let d = rd[i];
             let sd = rsd[i];
             let g = grad_lambda * d;
-            let h = hess_lambda * d * d + grad_lambda * sd;
+            let observed = hess_lambda * d * d + grad_lambda * sd;
+            // Fisher information of λ is 1/λ; in margin space (1/λ)·λ'(m)².
+            let fisher = d * d / lambda;
+            let h = match hessian_mode {
+                HessianMode::Observed => observed,
+                HessianMode::Fisher => fisher,
+                HessianMode::Damped => observed.max(fisher),
+            };
             (g, h)
         };
 
@@ -551,6 +716,65 @@ mod tests {
                 want += (cdf - ind) * (cdf - ind);
             }
             assert_relative_eq!(got, want, max_relative = 1e-9);
+        }
+    }
+
+    /// Large counts (research proposal 023 / 026): the loss equals an
+    /// untruncated brute-force sum, the gradient its finite difference, and
+    /// the metric the legacy routine where both apply.
+    #[test]
+    fn crps_is_exact_for_counts_above_the_old_caps() {
+        let d = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Crps, false);
+        let brute = |lam: f64, y: f64| -> f64 {
+            let y_int = y.round() as usize;
+            let top = (y.max(lam) + 12.0 * lam.sqrt() + 30.0) as usize;
+            let (mut cdf, mut out) = (0.0, 0.0);
+            for k in 0..=top {
+                cdf += (-lam + k as f64 * lam.ln() - ln_gamma(k as f64 + 1.0)).exp();
+                let ind = if k >= y_int { 1.0 } else { 0.0 };
+                out += (cdf.min(1.0) - ind).powi(2);
+            }
+            out
+        };
+        for (lam, y) in [(190.0_f64, 200.0_f64), (700.0, 650.0), (700.0, 20.0), (90.0, 20.0), (2.0, 150.0), (3000.0, 3100.0), (1.0e5, 9.9e4)] {
+            let got = d.analytic_crps(&[lam], &[y]).unwrap();
+            assert_relative_eq!(got, brute(lam, y), max_relative = 1e-8);
+        }
+        // a well-specified forecast scores about 0.23 sd... and far better than a wrong one
+        assert!(d.analytic_crps(&[700.0], &[700.0]).unwrap() < d.analytic_crps(&[350.0], &[700.0]).unwrap() / 10.0);
+
+        let predictions = array![[190.0_f64.ln()], [700.0_f64.ln()], [700.0_f64.ln()], [3000.0_f64.ln()], [90.0_f64.ln()]];
+        let transformed = predictions.mapv(f64::exp);
+        let y = array![230.0_f64, 640.0, 20.0, 3100.0, 20.0];
+        let target = ResponseData::Univariate(&y.view());
+        let (g, h) = d.analytical_gradients(&predictions.view(), &transformed.view(), &target).unwrap();
+        for i in 0..y.len() {
+            let lam = transformed[[i, 0]];
+            let eps = 1e-4 * lam;
+            // margin-space derivative under Exp: lambda * dCRPS/dlambda
+            let fd = lam * (brute(lam + eps, y[i]) - brute(lam - eps, y[i])) / (2.0 * eps);
+            assert!((g[[i, 0]] - fd).abs() <= 1e-5 * fd.abs().max(1.0), "row {i}: analytic {} vs fd {fd}", g[[i, 0]]);
+            assert!(g[[i, 0]].abs() > 1e-3, "row {i}: gradient vanished");
+            // large-count rows carry the expected curvature, lambda^2 * 2 sum pmf^2
+            // ~ lambda^1.5 / sqrt(pi) in the log rate: neither the floor nor ~lambda^2/3
+            let want = lam.powf(1.5) / std::f64::consts::PI.sqrt();
+            assert!((h[[i, 0]] / want - 1.0).abs() < 0.02, "row {i}: hessian {} vs {want}", h[[i, 0]]);
+        }
+        // the expected curvature is the mean observed curvature: check by summing over y
+        for lam in [150.0_f64, 400.0] {
+            let (lo, hi) = poisson_window(lam);
+            let (mut mean_h, mut e_ref) = (0.0, 0.0);
+            for yy in lo..=hi {
+                let (_, hh, e) = poisson_crps_grad_windowed(lam, yy);
+                mean_h += hh * poisson_pmf_at(lam, yy);
+                e_ref = e;
+            }
+            assert_relative_eq!(mean_h, e_ref, max_relative = 1e-6);
+        }
+        // windowed loss and gradient agree with the original loops below the old cap
+        for (lam, y) in [(12.0_f64, 20usize), (40.0, 35), (60.0, 61)] {
+            let legacy = d.analytic_crps(&[lam], &[y as f64]).unwrap();
+            assert_relative_eq!(poisson_crps_windowed(lam, y), legacy, max_relative = 1e-8);
         }
     }
 
@@ -759,3 +983,59 @@ mod crps_par_tests {
     }
 }
 
+
+#[cfg(test)]
+mod cycle11_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// Fisher and observed agree under the canonical Exp link; under Relu
+    /// the observed curvature vanishes at k = 0 and Damped floors it at 1/λ.
+    #[test]
+    fn hessian_modes() {
+        let y = array![0.0, 3.0];
+        let t = ResponseData::Univariate(&y.view());
+        let m = array![[0.7], [0.7]];
+        for (link, tr) in [(ResponseFn::Exp, 0.7f64.exp()), (ResponseFn::Relu, 0.7 + 1e-6)] {
+            let tr = array![[tr], [tr]];
+            let h = |mode| {
+                Poisson::new(Stabilization::None, link, LossFn::Nll, false)
+                    .with_hessian_mode(mode)
+                    .analytical_gradients(&m.view(), &tr.view(), &t)
+                    .unwrap()
+                    .1
+            };
+            let (o, f, d) = (h(HessianMode::Observed), h(HessianMode::Fisher), h(HessianMode::Damped));
+            if link == ResponseFn::Exp {
+                assert!((&o - &f).iter().all(|v| v.abs() < 1e-5), "{o:?} {f:?}"); // the response adds ε = 1e-6
+            } else {
+                assert_eq!(o[[0, 0]], 0.0);
+                assert!((f[[0, 0]] - 1.0 / tr[[0, 0]]).abs() < 1e-9);
+                assert_eq!(d[[0, 0]], f[[0, 0]]);
+                assert_eq!(d[[1, 0]], o[[1, 0]].max(f[[1, 0]]));
+            }
+        }
+    }
+
+    #[test]
+    fn location_start_inverts_the_link() {
+        let y = array![1.0, 2.0, 6.0];
+        let t = ResponseData::Univariate(&y.view());
+        let e = Poisson::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, false).with_location_start(true);
+        assert!((e.default_start_values(&t).unwrap()[0] - 3.0f64.ln()).abs() < 1e-9);
+        let r = Poisson::new(Stabilization::None, ResponseFn::Relu, LossFn::Nll, false).with_location_start(true);
+        let sv = r.default_start_values(&t).unwrap()[0];
+        assert!((ResponseFn::Relu.apply_scalar(sv) - 3.0).abs() < 1e-6);
+        let relu = Poisson::new(Stabilization::None, ResponseFn::Relu, LossFn::Nll, false);
+        assert!(!relu.location_start() && relu.default_start_values(&t).is_none());
+        assert!(Poisson::default().location_start());
+    }
+
+    #[test]
+    fn serde_default_is_observed() {
+        let mut v = serde_json::to_value(Poisson::default()).unwrap();
+        v.as_object_mut().unwrap().remove("hessian_mode");
+        let back: Poisson = serde_json::from_value(v).unwrap();
+        assert_eq!(back.hessian_mode(), HessianMode::Observed);
+    }
+}

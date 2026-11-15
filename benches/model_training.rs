@@ -84,6 +84,7 @@ mod xgboost_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -124,6 +125,7 @@ mod xgboost_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -165,6 +167,7 @@ mod xgboost_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -207,6 +210,7 @@ mod xgboost_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -270,6 +274,7 @@ mod lightgbm_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -310,6 +315,7 @@ mod lightgbm_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -351,6 +357,7 @@ mod lightgbm_benchmarks {
                             early_stopping_rounds: None,
                             verbose: false,
                             collect_train_metrics: false,
+            param_freeze_rounds: None,
                             seed: 42,
                         };
                         model.train(
@@ -411,6 +418,7 @@ mod backend_comparison {
                         early_stopping_rounds: None,
                         verbose: false,
                         collect_train_metrics: false,
+            param_freeze_rounds: None,
                         seed: 42,
                     };
                     model.train(
@@ -440,6 +448,7 @@ mod backend_comparison {
                         early_stopping_rounds: None,
                         verbose: false,
                         collect_train_metrics: false,
+            param_freeze_rounds: None,
                         seed: 42,
                     };
                     model.train(

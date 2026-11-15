@@ -40,6 +40,33 @@ pub enum Stabilization {
     L2,
 }
 
+/// Which curvature a distribution hands the Newton step as its "Hessian".
+///
+/// Both backends build leaves as `−Σg / (Σh + λ)` and score splits by
+/// `Σg²/(Σh+λ)`, so `h` must be positive to act as curvature. The two
+/// choices differ only for families whose observed second derivative is
+/// unsigned (StudentT, LogNormal, Gamma, ...); gradients are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HessianMode {
+    /// The observed information: `∂²(−log f)/∂η²` at the current fit, what
+    /// torch autograd (and so XGBoostLSS/LightGBMLSS) produces. Can be
+    /// negative row by row.
+    Observed,
+    /// The expected (Fisher) information `E_y[∂²(−log f)/∂η²] = I_θθ·f′(η)²`,
+    /// strictly positive, the curvature NGBoost and GAMLSS use.
+    Fisher,
+    /// `max(Observed, Fisher)` per row and parameter: the Fisher value floors
+    /// the zero/negative observed curvature near the optimum, while far from
+    /// it the (larger) observed curvature keeps the Newton step bounded —
+    /// a Levenberg–Marquardt-style damping that needs no extra tuning knob.
+    /// The default since 2026-11-09: in 700 paired fits it never lost to the
+    /// previous defaults by more than 0.001 nats, won by 0.05–0.95 nats on
+    /// four of five real targets and never diverged
+    /// (research/gradientlss/reports/002-cycle1-report.md).
+    #[default]
+    Damped,
+}
+
 /// A distributional parameter with its response function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionParam {
@@ -202,6 +229,24 @@ pub trait Distribution: Send + Sync {
         true
     }
 
+    /// Optional per-parameter gradient multipliers `c_j` (see
+    /// `compute_gradients_and_hessians_with_transformed`): the Newton step of
+    /// parameter j is scaled by `c_j`, an effective per-parameter learning
+    /// rate. `None` means all ones.
+    fn param_gradient_scales(&self) -> Option<&[f64]> {
+        None
+    }
+
+    /// Optional per-ROW weights on gradients and Hessians, computed from the
+    /// current transformed parameters (β-NLL, Seitzer et al. 2022: weight
+    /// row i by σ̂_i^{2β} with the weight treated as a constant). Changes
+    /// which rows drive the splits — high-variance rows regain influence on
+    /// the location tree — without changing any leaf's Newton ratio. `None`
+    /// means all ones.
+    fn row_gradient_weights(&self, _transformed: &ArrayView2<f64>) -> Option<Array1<f64>> {
+        None
+    }
+
     /// Closed-form (deterministic truncated-sum) CRPS for ONE observation, on
     /// TRANSFORMED params. `None` = no closed form; the sampled estimator is
     /// used instead.
@@ -220,6 +265,30 @@ pub trait Distribution: Send + Sync {
     /// FD step's own truncation error - harmless.
     fn analytic_crps(&self, params: &[f64], target: &[f64]) -> Option<f64> {
         let _ = (params, target);
+        None
+    }
+
+    /// Column of the boosting margin that carries the location (used by the
+    /// location-only warm-up, `GradientLSS::with_warmup_rounds`). Default:
+    /// the parameter named "loc".
+    fn location_param_index(&self) -> Option<usize> {
+        self.params().iter().position(|p| p.name == "loc")
+    }
+
+    /// Start values used when `should_initialize()` is false; `None` (the
+    /// default) = raw 0.5 for every parameter, the historical behaviour.
+    /// Cheap closed forms only — the fitted (L-BFGS) start values are what
+    /// `initialize: true` is for.
+    fn default_start_values(&self, _target: &ResponseData) -> Option<ndarray::Array1<f64>> {
+        None
+    }
+
+    /// Parameters that per-parameter early stopping
+    /// (`model::ParamEarlyStoppingSetting::Auto`) watches by default when a
+    /// validation set is passed: the scale/shape/dispersion parameters of
+    /// families where the recipe was measured to be better or neutral.
+    /// `None` (default) = no per-parameter early stopping unless configured.
+    fn default_param_early_stopping_params(&self) -> Option<Vec<usize>> {
         None
     }
 
@@ -312,6 +381,34 @@ pub trait Distribution: Send + Sync {
 
         // Apply stabilization
         self.stabilize_derivatives(&mut gradients, &mut hessians);
+
+        // Per-parameter shrinkage: scale the GRADIENT column only, so the leaf
+        // value −Σg/(Σh+λ) — and with it the Newton step of that parameter —
+        // is multiplied by c_j while split gains and min_child_weight keep the
+        // Hessian scale. An effective per-parameter learning rate η·c_j, the
+        // step length ν_k of gamboostLSS. None = all ones (unchanged).
+        if let Some(scales) = self.param_gradient_scales() {
+            for (j, &c) in scales.iter().enumerate().take(gradients.ncols()) {
+                if c != 1.0 {
+                    gradients.column_mut(j).mapv_inplace(|g| g * c);
+                }
+            }
+        }
+
+        // Per-row weights (β-NLL style) on both g and h — see
+        // `row_gradient_weights`. Applied like sample weights.
+        if let Some(mut rw) = self.row_gradient_weights(transformed) {
+            // Normalise to mean 1: the raw σ̂^{2β} weights carry the target's
+            // scale (σ̂ ≈ 1e-3 would shrink every leaf by 1e-6 and freeze the
+            // fit), whereas only their RATIOS between rows are the point.
+            let mean = rw.iter().filter(|v| v.is_finite()).sum::<f64>() / rw.len().max(1) as f64;
+            if mean.is_finite() && mean > 0.0 {
+                rw.mapv_inplace(|w| if w.is_finite() { w / mean } else { 1.0 });
+                let rw_col = rw.view().insert_axis(ndarray::Axis(1));
+                gradients *= &rw_col;
+                hessians *= &rw_col;
+            }
+        }
 
         // Apply weights if provided — broadcast column vector across columns.
         // insert_axis on a reborrowed view: no per-round copy of the weights.
@@ -632,6 +729,18 @@ pub trait Distribution: Send + Sync {
         self.calculate_start_values_default(target, max_iter)
     }
 
+    /// The unconditional maximum-likelihood fit that `dist_select` ranks
+    /// families by: `(total NLL, raw parameters)`.
+    ///
+    /// Defaults to [`Self::calculate_start_values`]. A family whose training
+    /// start values deliberately differ from its maximum-likelihood fit
+    /// overrides this, so that it is ranked at its best fit and not at its
+    /// start (StudentT caps the start df at 10; ranked at the cap it lost to
+    /// Gaussian on near-Gaussian targets it fits at least as well).
+    fn marginal_fit(&self, target: &ResponseData, max_iter: usize) -> Result<(f64, Array1<f64>)> {
+        self.calculate_start_values(target, max_iter)
+    }
+
     /// The L-BFGS start-value search over the per-parameter response
     /// functions — the default body of [`Self::calculate_start_values`], kept
     /// callable so a distribution that overrides the start values for one of
@@ -659,17 +768,31 @@ pub trait Distribution: Send + Sync {
         let dist = self.clone_box();
 
         // Create the optimization problem using the actual distribution
-        let problem = StartValueProblem {
+        let mut problem = StartValueProblem {
             target_data,
             is_multivariate,
             n_targets,
             n_params,
             response_fns,
             dist,
+            min_finite_rows: 0,
         };
+        // Rows whose log-prob is finite at the initial point. The cost skips
+        // NaN rows (torch.nansum parity), so a point where EVERY row is NaN
+        // would score 0 — below any real minimum — and L-BFGS would keep it as
+        // "best" (seen with Gamma on y ≈ 450: start values (−4356, 6021)).
+        // A candidate with fewer finite rows than the start is rejected.
+        problem.min_finite_rows = problem.finite_row_count(&vec![0.5; n_params]);
 
-        // Initial guess
-        let init_params: Vec<f64> = vec![0.5; n_params];
+        // Initial guess, then a damped diagonal-Newton pre-phase. L-BFGS +
+        // MoreThuente's first trial step along −g has length ‖g‖, which for a
+        // target not already O(1) (e.g. y ≈ 450, ‖g‖ ≈ 7e8) is NaN/Inf; the
+        // line search then aborts and argmin hands back the INITIAL point as
+        // "best" — raw 0.5 for every parameter, silently. The pre-phase takes
+        // per-coordinate Newton steps (the same step boosting itself takes,
+        // so it is well-scaled by construction) with Armijo backtracking until
+        // the gradient is small or a step is rejected, and L-BFGS polishes.
+        let init_params = diagonal_newton_prephase(&problem, vec![0.5; n_params]);
 
         // Set up L-BFGS with More-Thuente line search (similar to PyTorch's strong_wolfe)
         let linesearch = MoreThuenteLineSearch::new();
@@ -973,12 +1096,196 @@ fn stabilize_l2(arr: &mut Array2<f64>) {
 /// Uses the actual distribution's log_prob method for computing the cost,
 /// matching Python's loss_fn_start_values which calls self.distribution(*params).log_prob(target).
 struct StartValueProblem {
+    /// Finite-row count at the initial point; a candidate below it costs f64::MAX.
+    min_finite_rows: usize,
     target_data: Vec<f64>,
     is_multivariate: bool,
     n_targets: usize,
     n_params: usize,
     response_fns: Vec<ResponseFn>,
     dist: Box<dyn Distribution>,
+}
+
+/// Damped diagonal-Newton descent on the start-value problem from `x`.
+///
+/// Per iteration: central-difference gradient `g` and diagonal second
+/// difference `h` (the `cost(x ± εe_i)` evaluations are shared), direction
+/// `d_i = −g_i / (|h_i| + 1e-8)` (negative curvature → use |h|, zero → a
+/// gradient step), Armijo backtracking (ρ = ½, c₁ = 1e-4, non-finite cost is
+/// a rejection). Stops after `MAX_ITERS`, when ‖g‖ < 1e-6, or when no step
+/// length is accepted. Returns the best point seen — never worse than `x`.
+fn diagonal_newton_prephase(problem: &StartValueProblem, mut x: Vec<f64>) -> Vec<f64> {
+    // Budget: each iteration is (1 + 2p) cost passes plus ≤ 2 finite-row
+    // passes per trial step — small next to the 600-iteration L-BFGS budget
+    // that follows. 100 iterations let the trust radius grow from 2 to 2^k
+    // past a location offset of 1e6 even with a few backtracks on the way.
+    const MAX_ITERS: usize = 100;
+    const EPS: f64 = 1e-4;
+    let cost = |p: &Vec<f64>| problem.cost(p).unwrap_or(f64::MAX);
+    let n = x.len();
+    let mut c = cost(&x);
+    if !c.is_finite() {
+        return x;
+    }
+    // The cost skips rows whose log-prob is NaN (torch.nansum parity), so a
+    // parameter vector that breaks EVERY row (e.g. an overflowed `Exp`
+    // response, ν = ∞) scores 0 and would look like a huge improvement along
+    // a flat likelihood direction. A step may not lose finite rows.
+    let finite_rows_at_start = problem.finite_row_count(&x);
+    // Trust radius on the raw-space step (∞-norm). Where the curvature is ≈ 0
+    // (a flat df direction, a saturated response) the Newton step is
+    // arbitrarily long and Armijo would still accept it if it lowers the
+    // (initially terrible) cost a little — landing in a dead zone such as the
+    // ExpDf floor ν = 2, where e^η ≈ 0 kills the gradient for good. Doubled
+    // on every full-step acceptance, so a location 450 units away is still
+    // reached in ~8 iterations.
+    let mut radius: f64 = 2.0;
+    for _ in 0..MAX_ITERS {
+        let mut g = vec![0.0; n];
+        let mut d = vec![0.0; n];
+        match problem.analytic_diag(&x) {
+            Some((ga, ha)) => {
+                // Curvature per coordinate = max(|analytic h|, FD second
+                // difference). |analytic h| keeps the exact step where the
+                // curvature is tiny but real (a saturated t location far from
+                // the data, below FD noise); the FD value is the OBSERVED
+                // total curvature and takes over where the analytic one is
+                // smaller — StudentT's df under Fisher curvature, which
+                // otherwise out-ran σ into the ν = 2 dead zone of `ExpDf` and
+                // made the start values depend on the training HessianMode.
+                // A negative observed curvature still points the Newton step
+                // toward the data, hence the |·|.
+                for i in 0..n {
+                    g[i] = if ga[i].is_finite() { ga[i] } else { 0.0 };
+                    let h_an = if ha[i].is_finite() { ha[i].abs() } else { 0.0 };
+                    let mut plus = x.clone();
+                    let mut minus = x.clone();
+                    plus[i] += EPS;
+                    minus[i] -= EPS;
+                    let h_fd = (cost(&plus) - 2.0 * c + cost(&minus)) / (EPS * EPS);
+                    let h_fd = if h_fd.is_finite() { h_fd.max(0.0) } else { 0.0 };
+                    d[i] = -g[i] / (h_an.max(h_fd) + 1e-12);
+                }
+            }
+            None => {
+                for i in 0..n {
+                    let mut plus = x.clone();
+                    let mut minus = x.clone();
+                    plus[i] += EPS;
+                    minus[i] -= EPS;
+                    let (cp, cm) = (cost(&plus), cost(&minus));
+                    g[i] = (cp - cm) / (2.0 * EPS);
+                    let h = (cp - 2.0 * c + cm) / (EPS * EPS);
+                    if !g[i].is_finite() {
+                        g[i] = 0.0;
+                    }
+                    let h = if h.is_finite() { h.abs() } else { 0.0 };
+                    d[i] = -g[i] / (h + 1e-8);
+                }
+            }
+        }
+        let gnorm = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if gnorm < 1e-6 {
+            break;
+        }
+        let step_inf = d.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        if step_inf > radius {
+            let shrink = radius / step_inf;
+            d.iter_mut().for_each(|v| *v *= shrink);
+        }
+        let slope: f64 = g.iter().zip(&d).map(|(g, d)| g * d).sum();
+        let c_prev = c;
+        let mut alpha = 1.0;
+        let mut accepted = false;
+        for _ in 0..40 {
+            let xn: Vec<f64> = x.iter().zip(&d).map(|(x, d)| x + alpha * d).collect();
+            let cn = cost(&xn);
+            if cn.is_finite()
+                && cn <= c + 1e-4 * alpha * slope
+                && problem.transformed_are_finite(&xn)
+                && problem.finite_row_count(&xn) >= finite_rows_at_start
+            {
+                x = xn;
+                c = cn;
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+        // Stalled: the accepted step no longer changes the cost measurably.
+        if (c_prev - c).abs() <= 1e-12 * c.abs().max(1.0) {
+            break;
+        }
+        if alpha == 1.0 {
+            radius = (radius * 2.0).min(1e6);
+        } else {
+            radius = (alpha * step_inf.min(radius)).max(1e-3);
+        }
+    }
+    x
+}
+
+impl StartValueProblem {
+    fn transformed(&self, params: &[f64]) -> Vec<f64> {
+        params
+            .iter()
+            .zip(self.response_fns.iter())
+            .map(|(&p, response_fn)| response_fn.apply_scalar(if p.is_finite() { p } else { 0.5 }))
+            .collect()
+    }
+
+    fn transformed_are_finite(&self, params: &[f64]) -> bool {
+        self.transformed(params).iter().all(|v| v.is_finite())
+    }
+
+    /// Exact summed gradient and diagonal Hessian in raw space from the
+    /// distribution's analytical per-row derivatives, when it has them and
+    /// the target is univariate. Finite differences cannot resolve a tiny
+    /// true curvature (e.g. a location with n/σ² ≈ 1e-8 once σ has been
+    /// inflated) against rounding noise in a cost of size 1e4; the analytic
+    /// path has no such floor.
+    fn analytic_diag(&self, params: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
+        if self.is_multivariate {
+            return None;
+        }
+        let n_obs = self.target_data.len();
+        let predictions = Array2::from_shape_fn((n_obs, self.n_params), |(_, j)| params[j]);
+        let transformed = self.dist.transform_params(&predictions.view());
+        let y = ndarray::ArrayView1::from(&self.target_data[..]);
+        let target = ResponseData::Univariate(&y);
+        let (g, h) = self
+            .dist
+            .analytical_gradients(&predictions.view(), &transformed.view(), &target)?;
+        let sum_finite = |col: ndarray::ArrayView1<f64>| col.iter().filter(|v| v.is_finite()).sum::<f64>();
+        let gs: Vec<f64> = (0..self.n_params).map(|j| sum_finite(g.column(j))).collect();
+        let hs: Vec<f64> = (0..self.n_params).map(|j| sum_finite(h.column(j))).collect();
+        Some((gs, hs))
+    }
+
+    /// Number of observations whose log-prob is finite at `params`.
+    fn finite_row_count(&self, params: &[f64]) -> usize {
+        let transformed = self.transformed(params);
+        if self.is_multivariate {
+            let n_obs = self.target_data.len() / self.n_targets;
+            (0..n_obs)
+                .into_par_iter()
+                .filter(|&i| {
+                    let start = i * self.n_targets;
+                    self.dist
+                        .log_prob(&transformed, &self.target_data[start..start + self.n_targets])
+                        .is_finite()
+                })
+                .count()
+        } else {
+            self.target_data
+                .par_iter()
+                .filter(|&&y| self.dist.log_prob(&transformed, &[y]).is_finite())
+                .count()
+        }
+    }
 }
 
 impl CostFunction for StartValueProblem {
@@ -1022,6 +1329,12 @@ impl CostFunction for StartValueProblem {
         };
 
         if loss.is_finite() {
+            // Reject points that lost finite rows relative to the start (see
+            // `min_finite_rows`); only re-count when the sum looks suspiciously
+            // low to keep the common path at one pass.
+            if self.min_finite_rows > 0 && self.finite_row_count(&safe_params) < self.min_finite_rows {
+                return Ok(f64::MAX);
+            }
             Ok(loss)
         } else {
             Ok(f64::MAX)
@@ -1152,5 +1465,121 @@ mod tests {
 
         assert!(score >= 0.0);
         assert!(score.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod start_value_prephase_tests {
+    /// Start values are a property of the data and the family, not of the
+    /// training curvature: all three HessianModes must agree. (Before the
+    /// relative curvature floor, Fisher's tiny df curvature sent ν into the
+    /// ExpDf dead zone at 2 while Damped/Observed went to ν → ∞.)
+    #[test]
+    fn student_t_start_values_do_not_depend_on_hessian_mode() {
+        use crate::distributions::StudentT;
+        use super::HessianMode;
+        // heavy-ish tails: Gaussian core plus a few wide rows
+        let mut y = sample(3000, 7.0, 6.0);
+        for i in (0..3000).step_by(37) {
+            y[i] = 7.0 + 40.0 * if i % 2 == 0 { 1.0 } else { -1.0 } * ((i % 5) as f64 + 1.0) / 5.0;
+        }
+        let target = ResponseData::Univariate(&y.view());
+        let mut results = Vec::new();
+        for mode in [HessianMode::Observed, HessianMode::Fisher, HessianMode::Damped] {
+            let dist = StudentT::new(Stabilization::None, ResponseFn::ExpDf, ResponseFn::Exp, LossFn::Nll, true)
+                .with_hessian_mode(mode)
+                .without_max_start_df();
+            let (loss, sv) = dist.calculate_start_values(&target, 50).unwrap();
+            results.push((mode, loss, sv));
+        }
+        let (_, l0, s0) = &results[0];
+        for (mode, l, sv) in &results[1..] {
+            assert!((l - l0).abs() <= 1e-6 * l0.abs().max(1.0), "{mode:?}: loss {l} vs {l0}");
+            // loc and log-scale agree tightly; df may sit on the flat tail so compare its transformed value loosely
+            assert!((sv[1] - s0[1]).abs() < 1e-4 && (sv[2] - s0[2]).abs() < 1e-4, "{mode:?}: {sv:?} vs {s0:?}");
+        }
+        // and none of them is in the ν = 2 dead zone
+        for (mode, _, sv) in &results {
+            assert!(sv[0] > -5.0, "{mode:?}: df raw {} is in the ExpDf dead zone", sv[0]);
+        }
+    }
+
+    /// StudentT on near-Gaussian data: the likelihood is flat in ν for large ν
+    /// and the ExpDf response overflows past η ≈ 710, where every row's
+    /// log-prob is NaN and the nansum cost is 0. The pre-phase must never
+    /// accept such a point: transformed params finite, cost ≤ cost at 0.5.
+    #[test]
+    fn student_t_start_values_stay_finite_on_light_tailed_data() {
+        use crate::distributions::StudentT;
+        for &(mean, sd) in &[(0.7, 0.26), (454.0, 17.0), (4.5e5, 1.7e4)] {
+            let y = sample(3000, mean, sd);
+            // no start cap here: this test checks the pre-phase, so the fitted ν must be free
+            let dist = StudentT::new(Stabilization::None, ResponseFn::ExpDf, ResponseFn::Exp, LossFn::Nll, true)
+                .without_max_start_df();
+            let target = ResponseData::Univariate(&y.view());
+            let (loss, sv) = dist.calculate_start_values(&target, 50).unwrap();
+            let transformed: Vec<f64> = sv.iter().zip(dist.params()).map(|(&p, dp)| dp.response_fn.apply_scalar(p)).collect();
+            assert!(transformed.iter().all(|v| v.is_finite()), "scale {sd}: {transformed:?}");
+            let loss_at_half = dist.compute_total_loss(
+                &[ResponseFn::ExpDf.apply_scalar(0.5), 0.5, ResponseFn::Exp.apply_scalar(0.5)],
+                &target,
+            );
+            assert!(loss.is_finite() && loss <= loss_at_half, "scale {sd}: {loss} vs {loss_at_half}");
+            // location and scale recovered; ν large (Gaussian-like) but finite
+            assert!((sv[1] - y.mean().unwrap()).abs() <= 1e-2 * sd, "scale {sd}: loc {}", sv[1]);
+            assert!((sv[2] - y.std(0.0).ln()).abs() <= 0.1, "scale {sd}: log scale {}", sv[2]);
+            assert!(transformed[0] > 20.0, "scale {sd}: ν {} should be large on Gaussian data", transformed[0]);
+        }
+    }
+
+    use super::*;
+    use crate::distributions::Gaussian;
+    use crate::types::ResponseData;
+    use crate::utils::ResponseFn;
+
+    /// Deterministic pseudo-normal sample (sum of 12 LCG uniforms).
+    fn sample(n: usize, mean: f64, sd: f64) -> Array1<f64> {
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        Array1::from_iter((0..n).map(|_| {
+            let z: f64 = (0..12).map(|_| next()).sum::<f64>() - 6.0;
+            mean + sd * z
+        }))
+    }
+
+    /// The fitted Gaussian start values must equal (ȳ, ln s_y) regardless of
+    /// the target's scale — the exact case that used to return raw 0.5 for
+    /// anything not already O(1).
+    #[test]
+    fn gaussian_start_values_are_scale_invariant() {
+        for &(mean, sd) in &[(0.7, 0.26), (10.0, 2.8), (454.0, 17.0), (4.5e5, 1.7e4), (7e-4, 2.6e-4)] {
+            let y = sample(4000, mean, sd);
+            let ybar = y.mean().unwrap();
+            let s_y = y.std(0.0);
+            let dist = Gaussian::new(Stabilization::None, ResponseFn::Exp, LossFn::Nll, true);
+            let (loss, sv) = dist
+                .calculate_start_values(&ResponseData::Univariate(&y.view()), 50)
+                .unwrap();
+            let loss_at_half = dist.compute_total_loss(
+                &[0.5, ResponseFn::Exp.apply_scalar(0.5)],
+                &ResponseData::Univariate(&y.view()),
+            );
+            assert!(loss <= loss_at_half, "scale {sd}: {loss} > {loss_at_half}");
+            assert!(
+                (sv[0] - ybar).abs() <= 1e-4 * sd.max(1e-9) + 1e-9,
+                "scale {sd}: loc {} vs {ybar}",
+                sv[0]
+            );
+            // Exp response is σ = e^η + 1e-6, so the ML raw value is ln(s_y − 1e-6).
+            let expected = (s_y - 1e-6).ln();
+            assert!(
+                (sv[1] - expected).abs() <= 1e-3,
+                "scale {sd}: log scale {} vs {expected}",
+                sv[1]
+            );
+        }
     }
 }

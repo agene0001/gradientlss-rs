@@ -403,6 +403,7 @@ mod xgboost_tests {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 7,
         };
 
@@ -1875,6 +1876,7 @@ mod save_load_tests {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
@@ -2620,6 +2622,7 @@ mod training_callback_integration_tests {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
@@ -2681,6 +2684,7 @@ mod training_callback_integration_tests {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
@@ -2744,6 +2748,7 @@ mod training_callback_integration_tests {
             early_stopping_rounds: None, // Rely on callback instead
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
@@ -2801,6 +2806,7 @@ mod xgboost_callback_integration_tests {
             early_stopping_rounds: None,
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
@@ -2841,6 +2847,7 @@ mod xgboost_callback_integration_tests {
             early_stopping_rounds: None, // Use callback
             verbose: false,
             collect_train_metrics: false,
+            param_freeze_rounds: None,
             seed: 42,
         };
 
