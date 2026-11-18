@@ -163,6 +163,76 @@ impl Mixture {
         out
     }
 
+    /// Σ_{k≠j} v_k: `1 − v_j` for a probability vector, without the
+    /// subtraction that rounds to 0 once v_j rounds to 1.
+    #[inline]
+    fn sum_except(v: &[f64], j: usize) -> f64 {
+        let mut s = 0.0;
+        for (k, &x) in v.iter().enumerate() {
+            if k != j {
+                s += x;
+            }
+        }
+        s
+    }
+
+    /// `out_j = w_j − π_j` (responsibility minus mixing weight) for one row,
+    /// computed in log space so it is exactly 0 when the components agree.
+    ///
+    /// Softmax cancellation (Barron, Gnanapragasam & Tschannen 2026, "A Fix
+    /// for Softmax and Cross-Entropy", arXiv 2610.31642, Eq. 9): w and π are
+    /// two softmaxes formed by different operation sequences, and `π − w`
+    /// subtracts nearly equal rounded numbers. When every component has the
+    /// same likelihood, w = π exactly in exact arithmetic but the subtraction
+    /// leaves rounding noise (sometimes with the wrong sign) as the logit
+    /// gradient. Here w_j/π_j = φ_j / S, so with δ_j = ln φ_j:
+    ///   d_j = δ_j − Σ_i π_i δ_i,   s_j = d_j − ln1p(Σ_i π_i expm1(d_i)) = ln(w_j/π_j),
+    ///   u_j = π_j expm1(s_j)  (|s_j| < 1; else w_j − π_j directly),
+    ///   out_j = u_j − w_j Σ_i u_i   (keeps Σ_j out_j = 0).
+    /// A non-finite step (an underflowed π, an overflowing expm1) falls back
+    /// to the direct difference for the row — the old behaviour.
+    fn responsibility_minus_prior(locs_scales: &[f64], y: f64, pi: &[f64], w: &[f64], out: &mut [f64]) {
+        let m = pi.len();
+        // δ_j = ln φ_j into `out` as scratch, re-referenced to the largest
+        // (s_j is shift-invariant) so that equal likelihoods give d_j = 0
+        // EXACTLY even when Σ π rounds off 1.
+        let mut top = f64::NEG_INFINITY;
+        for j in 0..m {
+            let sig = locs_scales[m + j];
+            let zeta = (y - locs_scales[j]) / sig;
+            out[j] = -0.5 * zeta * zeta - 0.5 * LOG_2PI - sig.ln();
+            top = top.max(out[j]);
+        }
+        let mut mean_delta = 0.0;
+        for j in 0..m {
+            out[j] -= top;
+            mean_delta += pi[j] * out[j];
+        }
+        let mut acc = 0.0;
+        for j in 0..m {
+            out[j] -= mean_delta; // d_j
+            acc += pi[j] * out[j].exp_m1();
+        }
+        let log_norm = acc.ln_1p();
+        let mut sum_u = 0.0;
+        for j in 0..m {
+            let s_j = out[j] - log_norm;
+            let u = if s_j.abs() < 1.0 { pi[j] * s_j.exp_m1() } else { w[j] - pi[j] };
+            out[j] = u;
+            sum_u += u;
+        }
+        let mut finite = sum_u.is_finite();
+        for j in 0..m {
+            out[j] -= w[j] * sum_u;
+            finite &= out[j].is_finite();
+        }
+        if !finite {
+            for j in 0..m {
+                out[j] = w[j] - pi[j];
+            }
+        }
+    }
+
     /// Apply softmax function with temperature.
     fn softmax(logits: &[f64], temperature: f64) -> Vec<f64> {
         // Subtract max for numerical stability
@@ -331,14 +401,15 @@ impl Distribution for Mixture {
             .as_slice_mut()
             .expect("freshly-allocated Array2 is contiguous");
 
-        // Per-row fill. Scratch: (row copy, π buffer, log-weight buffer).
+        // Per-row fill. Scratch: (row copy, π buffer, log-weight buffer,
+        // w − π buffer).
         // A NaN target/margin propagates to NaN outputs, which stabilization
         // replaces — identical to the numerical path's behavior.
-        let fill = |scratch: &mut (Vec<f64>, Vec<f64>, Vec<f64>),
+        let fill = |scratch: &mut (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>),
                     i: usize,
                     gc: &mut [f64],
                     hc: &mut [f64]| {
-            let (row_buf, pi, lw) = scratch;
+            let (row_buf, pi, lw, du) = scratch;
             for (k, &v) in transformed.row(i).iter().enumerate() {
                 row_buf[k] = v;
             }
@@ -359,32 +430,45 @@ impl Distribution for Mixture {
                 *v = (*v - a).exp();
                 sum_w += *v;
             }
+            // lw now holds the unnormalised responsibilities; normalise in place.
+            for v in lw.iter_mut() {
+                *v /= sum_w;
+            }
+            // w − π in log space (softmax cancellation, see `responsibility_minus_prior`).
+            Self::responsibility_minus_prior(&row_buf[..2 * m], yi, pi, lw, du);
 
             for j in 0..m {
-                let w = lw[j] / sum_w;
+                let w = lw[j];
+                // 1 − w and 1 − π as the other components' sums: a dominant
+                // component's w (or π) rounds to 1.0 and `1 − w` to 0 while
+                // the others stay positive (softmax collapse).
+                let w_rest = Self::sum_except(lw, j);
+                let p_rest = Self::sum_except(pi, j);
                 let sig = row_buf[m + j];
                 let sig_sq = sig * sig;
                 let diff = yi - row_buf[j];
                 let zeta = diff / sig;
                 let a_j = diff / sig_sq;
                 gc[j] = -w * a_j;
-                hc[j] = w / sig_sq - w * (1.0 - w) * a_j * a_j;
+                hc[j] = w / sig_sq - w * w_rest * a_j * a_j;
 
                 let b_j = (zeta * zeta - 1.0) / sig;
                 let sp = sigma_prime[[i, j]];
                 gc[m + j] = -w * b_j * sp;
-                hc[m + j] = -((w * (1.0 - w) * b_j * b_j + w * (1.0 - 3.0 * zeta * zeta) / sig_sq)
+                hc[m + j] = -((w * w_rest * b_j * b_j + w * (1.0 - 3.0 * zeta * zeta) / sig_sq)
                     * sp
                     * sp
                     + w * b_j * sp);
 
-                let p = pi[j];
-                gc[2 * m + j] = (p - w) / tau;
-                hc[2 * m + j] = (p * (1.0 - p) - w * (1.0 - w)) / (tau * tau);
+                gc[2 * m + j] = -du[j] / tau;
+                // π(1−π) − w(1−w) = (π − w)(1 − π − w) = −(w − π)(Σ_{k≠j} π_k − w):
+                // a difference of two near-equal variances, factored through
+                // the accurate w − π instead (exactly 0 when the components agree).
+                hc[2 * m + j] = -du[j] * (p_rest - w) / (tau * tau);
             }
         };
 
-        let make_scratch = || (vec![0.0; n_params], vec![0.0; m], vec![0.0; m]);
+        let make_scratch = || (vec![0.0; n_params], vec![0.0; m], vec![0.0; m], vec![0.0; m]);
 
         // Threshold matches the other analytical paths (256).
         const PAR_MIN: usize = 256;
@@ -660,6 +744,46 @@ mod tests {
                         (a - nref).abs() <= 1e-4 + 1e-3 * nref.abs(),
                         "hess mismatch m={m} tau={tau} [{i},{j}]: analytical={a}, numerical={nref}"
                     );
+                }
+            }
+        }
+    }
+
+    /// Softmax cancellation (arXiv 2610.31642): when every component has the
+    /// same likelihood the responsibilities equal the mixing weights and the
+    /// logit gradient (π − w)/τ is exactly 0. Subtracting the two separately
+    /// rounded softmaxes left rounding noise there (sometimes with the wrong
+    /// sign); the log-space form returns 0 exactly.
+    #[test]
+    fn test_mixture_identical_components_give_zero_logit_gradient() {
+        for &(m, tau) in &[(2usize, 1.0f64), (3, 0.7), (5, 2.5)] {
+            let dist = Mixture::new(m, tau, Stabilization::None, LossFn::Nll, false);
+            let n_params = dist.n_params();
+            let n = 25usize;
+            let mut preds = Array2::zeros((n, n_params));
+            let mut y = ndarray::Array1::zeros(n);
+            for i in 0..n {
+                let loc = 0.37 * i as f64 - 4.0;
+                let log_scale = 0.11 * i as f64 - 1.3;
+                for j in 0..m {
+                    preds[[i, j]] = loc;
+                    preds[[i, m + j]] = log_scale;
+                    // unequal, awkward mixing logits
+                    preds[[i, 2 * m + j]] = (j as f64 * 1.7 + i as f64 * 0.3).sin() * 3.1;
+                }
+                y[i] = 0.9 * i as f64 - 7.0;
+            }
+            let transformed = dist.transform_params(&preds.view());
+            let yv = y.view();
+            let target = ResponseData::Univariate(&yv);
+            let (g, h) = dist
+                .analytical_gradients(&preds.view(), &transformed.view(), &target)
+                .expect("analytical gradients available for NLL");
+            for i in 0..n {
+                for j in 0..m {
+                    assert_eq!(g[[i, 2 * m + j]], 0.0, "logit grad m={m} row {i} comp {j}");
+                    // π(1−π) − w(1−w) with w = π: exactly 0 too
+                    assert_eq!(h[[i, 2 * m + j]], 0.0, "logit hess m={m} row {i} comp {j}");
                 }
             }
         }
